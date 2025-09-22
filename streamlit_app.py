@@ -213,15 +213,12 @@ def draw_world(world: World, highlight_nodes: Optional[Set[str]] = None, highlig
     for pname, proc in world.processes.items():
         label = pname
         if proc.holds_object:
-            label += "
-[OBJECT]"
+            label += "[OBJECT]"
         if proc.proxies:
-            label += "
-Proxies: " + ", ".join(proc.proxies)
+            label += "Proxies: " + ", ".join(proc.proxies)
         if proc.skeletons:
             # Show only count to keep nodes compact; details are in log/legend
-            label += f"
-Skeletons: {len(proc.skeletons)}"
+            label += f"Skeletons: {len(proc.skeletons)}"
         G.add_node(pname, label=label)
 
     # Edges: proxies to their known skeleton process
