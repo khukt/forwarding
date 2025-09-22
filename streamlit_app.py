@@ -52,7 +52,7 @@ SCENES = [
  "title": "Forwarding Pointers I — Basic RPC view",
  "explain": "Two client processes (P1, P2) hold proxies p and p′. Both refer to the same skeleton in P3. Interprocess communication connects P1/P2 to P3. Skeleton performs a local invocation to the object in P4.",
  "forward": {},
- "invocations": [("P1_proxy","P3_skel"), ("P2_proxy","P3_skel"), ("P3_local","P4_obj")],
+ "invocations": [("P1_proxy","P3_skel_left"), ("P2_proxy","P3_skel_left"), ("P3_local","P4_obj")],
  "labels": {
      "P1_proxy": ("P1", ( -1.55, -0.15), "right", "Proxy p", (0.0, -0.02)),
      "P2_proxy": ("P2", ( -1.55,  1.35), "right", "Proxy p′", (0.0, -0.02)),
