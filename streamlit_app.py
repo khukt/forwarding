@@ -213,12 +213,15 @@ def draw_world(world: World, highlight_nodes: Optional[Set[str]] = None, highlig
     for pname, proc in world.processes.items():
         label = pname
         if proc.holds_object:
-            label += "[OBJECT]"
+            label += "
+[OBJECT]"
         if proc.proxies:
-            label += "Proxies: " + ", ".join(proc.proxies)
+            label += "
+Proxies: " + ", ".join(proc.proxies)
         if proc.skeletons:
             # Show only count to keep nodes compact; details are in log/legend
-            label += f"Skeletons: {len(proc.skeletons)}"
+            label += f"
+Skeletons: {len(proc.skeletons)}"
         G.add_node(pname, label=label)
 
     # Edges: proxies to their known skeleton process
@@ -443,8 +446,79 @@ with st.sidebar:
     )
 
 # -------------------------------
-# Tabs: Tutorial (Animated) • Simulator (Playground)
+# Banking Example Helpers
 # -------------------------------
+
+def init_banking_world() -> World:
+    """Map P1..P4 to banking roles for narration.
+    P1=ATM, P2=MobileApp, P3=API Gateway (skeleton), P4=Account Service (object).
+    """
+    w = init_default_world(identical_proxy_count=2)
+    # Ensure skeleton at P3 forwards to object at P4 initially
+    for s in w.skeletons.values():
+        if s.host_process == "P3":
+            s.forwards_to = "P4"
+    # Overwrite event log with role labels
+    w.log = []
+    w.log_event("Banking world: ATM(P1), MobileApp(P2), API Gateway(P3), Account Service(P4).")
+    return w
+
+
+def banking_step(step: int) -> Tuple[World, str, List[Tuple[str, str]]]:
+    """Return (world, caption, highlight_edges) for the banking tutorial step."""
+    w = init_banking_world()
+    hilite: List[Tuple[str, str]] = []
+
+    if step == 1:
+        cap = "**Actors**: P1=ATM, P2=MobileApp, P3=API Gateway (skeleton host), P4=Account Service (object)."
+        return w, cap, hilite
+
+    if step == 2:
+        cap = "**Login**: ATM & MobileApp hold **identical proxies** to call the API Gateway at P3."
+        hilite = [("P1", "P3"), ("P2", "P3")]
+        return w, cap, hilite
+
+    if step == 3:
+        cap = "**Balance**: Gateway's **skeleton** unmarshals request and invokes **Account Service** at P4."
+        hilite = [("P3", "P4")]
+        return w, cap, hilite
+
+    if step == 4:
+        cap = "**Withdraw**: Full IPC path ATM→Gateway→Service."
+        hilite = [("P1", "P3"), ("P3", "P4")]
+        return w, cap, hilite
+
+    if step == 5:
+        # add an identical skeleton (replica) at P3 logically
+        if "S2@P3" not in w.skeletons:
+            w.skeletons["S2@P3"] = SkeletonRef(id="S2@P3", host_process="P3", forwards_to="P4")
+            w.processes["P3"].skeletons.append("S2@P3")
+        cap = "**Scale‑out**: multiple **identical skeletons** at Gateway for throughput & resilience."
+        hilite = [("P1", "P3"), ("P2", "P3")]
+        return w, cap, hilite
+
+    if step == 6:
+        # migrate service to P2 (simulate cluster move)
+        move_object(w, dst_process="P2", create_new_skeleton=True, keep_forwarding=True)
+        cap = "**Migration**: Account Service moves to P2; old skeletons at P3 install **forwarding pointers** → P2."
+        # show forwarding edge
+        hilite = [("P3", "P2")]
+        return w, cap, hilite
+
+    if step == 7:
+        # after first call, proxies learn new location (shortcut)
+        for pid in list(w.proxies.keys()):
+            invoke(w, pid, shortcut_after_first=True)
+        cap = "**Shortcutting**: Clients learn new location; future ATM/MobileApp calls go **direct to P2** via updated proxies."
+        hilite = [("P1", "P2"), ("P2", "P2")]
+        return w, cap, hilite
+
+    return w, "", hilite
+
+# -------------------------------
+# Tabs: Tutorial (Animated) • Simulator (Playground) • Banking Example
+# -------------------------------
+
 
 def safe_rerun():
     try:
@@ -465,6 +539,17 @@ TUTORIAL_STEPS = [
     (10, "Shortcutting & Cleanup"),
 ]
 
+# Banking example steps (ATM/MobileApp → API Gateway → Account Service)
+BANKING_STEPS = [
+    (1, "Actors"),
+    (2, "Login (Proxies)"),
+    (3, "Balance (Skeleton Dispatch)"),
+    (4, "Withdraw (IPC Path)"),
+    (5, "Scale-out (Identical Skeletons)"),
+    (6, "Migration (Forwarding Pointer)"),
+    (7, "Shortcutting to New Node"),
+]
+
 if 'world' not in st.session_state:
     st.session_state.world = init_default_world(identical_proxy_count=2)
 if 't_step' not in st.session_state:
@@ -474,7 +559,7 @@ if 't_play' not in st.session_state:
 
 st.title("Forwarding Pointers • Proxy • Skeleton — Animated Tutorial & Simulator")
 
-_tabs = st.tabs(["🎓 Tutorial (Animated)", "🧪 Playground Simulator"])
+_tabs = st.tabs(["🎓 Tutorial (Animated)", "🧪 Playground Simulator", "🏦 Banking Example"])
 
 # -------------------------------
 # Tab 1 — Animated Tutorial
@@ -565,10 +650,52 @@ with _tabs[1]:
         else:
             st.info("No events yet. Use the controls to move the object or invoke via a proxy.")
 
-st.markdown("""
----
-**How this maps to your slides**
-- *Forwarding Pointers I (mobile entities)* → Step 8–10 (migration, forwarding, shortcutting)
+# -------------------------------
+# Tab 3 — Banking Example (Real App Mapping)
+# -------------------------------
+with _tabs[2]:
+    st.subheader("Banking — Real App Walkthrough")
+    st.caption("P1=ATM, P2=MobileApp, P3=API Gateway (skeleton host), P4=Account Service (object)")
+
+    if 'bank_step' not in st.session_state:
+        st.session_state.bank_step = 1
+    if 'bank_play' not in st.session_state:
+        st.session_state.bank_play = False
+
+    leftB, rightB = st.columns([3, 2])
+    with rightB:
+        st.markdown("**Steps**: " + " → ".join([f"{i}. {name}" for i, name in BANKING_STEPS]))
+        st.slider("Banking Step", 1, len(BANKING_STEPS), key="bank_step")
+        speedB = st.select_slider("Animation speed", options=["slow", "normal", "fast"], value="normal")
+        delayB = {"slow": 1.2, "normal": 0.8, "fast": 0.4}[speedB]
+        colbp = st.columns(3)
+        with colbp[0]:
+            if st.button("◀ Prev "):
+                st.session_state.bank_step = max(1, st.session_state.bank_step - 1)
+        with colbp[1]:
+            if st.button("▶ Play " if not st.session_state.bank_play else "⏸ Pause"):
+                st.session_state.bank_play = not st.session_state.bank_play
+        with colbp[2]:
+            if st.button("Next ▶ "):
+                st.session_state.bank_step = min(len(BANKING_STEPS), st.session_state.bank_step + 1)
+
+    # Build world & highlights for this banking step
+    wbank, capB, edgesB = banking_step(st.session_state.bank_step)
+
+    with leftB:
+        draw_world(wbank, highlight_edges=edgesB, title=f"Banking Step {st.session_state.bank_step}: {BANKING_STEPS[st.session_state.bank_step-1][1]}")
+
+    with rightB:
+        st.subheader("Explanation")
+        st.markdown(capB)
+        st.caption("Edges highlight the current flow (proxy IPC, skeleton forwarding, or service call).")
+
+    if st.session_state.bank_play:
+        time.sleep(delayB)
+        st.session_state.bank_step = 1 + (st.session_state.bank_step % len(BANKING_STEPS))
+        safe_rerun()
+
+st.markdown("""warding, shortcutting)
 - *Forwarding Pointers II–IV (proxies & skeletons)* → Steps 2–7
 - *IPC vs Local* → Steps 4–5
 """)
