@@ -1,23 +1,26 @@
-# banking_interactive_graph_app.py
-# Interactive banking demo where the GRAPH explains the whole story.
-# - Hover nodes: role + details (proxy/skeleton/object, sessions, ledger)
-# - Hover edges: step explanations (proxy call / forwarding / serve)
-# - Run real flows (login/balance/deposit/withdraw): route is highlighted with steps ① ② ③
-# - Toggle "Local Invocation": see proxy+skeleton co-located (no network hop)
+# banking_omnet_style_app.py
+# OMNeT++-style, traceable animation of proxy → skeleton → (forwarding)* → object
+# - Animated frames with Plotly (play/pause + scrub slider)
+# - Everything is explained on the GRAPH (hover tooltips + step annotations)
+# - Real flows: login / balance / deposit / withdraw
+# - Local invocation demo, migration + forwarding pointers, shortcutting after success
 #
 # Run:
-#   pip install streamlit pyvis networkx
-#   streamlit run banking_interactive_graph_app.py
+#   pip install streamlit plotly networkx pandas
+#   streamlit run banking_omnet_style_app.py
 
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple, Set
-
+import math
+import pandas as pd
 import streamlit as st
 import networkx as nx
-from pyvis.network import Network
-from streamlit.components.v1 import html
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="🏦 Banking — Interactive Graph (Proxy • Skeleton • Forwarding)", layout="wide")
+st.set_page_config(
+    page_title="🏦 OMNeT++-style Banking — Proxy • Skeleton • Forwarding",
+    layout="wide"
+)
 
 # -------------------------------
 # Data model
@@ -28,7 +31,7 @@ class Process:
     label: str
     proxies: List[str] = field(default_factory=list)
     skeletons: List[str] = field(default_factory=list)
-    holds_object: bool = False  # whether the Account Service (object) is here
+    holds_object: bool = False  # Account Service here?
 
 @dataclass
 class ProxyRef:
@@ -54,10 +57,24 @@ class World:
         "alice": {"pin": "1234", "accounts": ["A-100"], "require_2fa": False},
         "bob":   {"pin": "4321", "accounts": ["B-200"], "require_2fa": True},
     })
-    sessions: Dict[str, Dict[str, object]] = field(default_factory=dict)  # key: client proxy id → {"user":..., "2fa":bool}
+    sessions: Dict[str, Dict[str, object]] = field(default_factory=dict)  # client proxy id → {"user":..., "2fa":bool}
+    log: List[Dict[str, object]] = field(default_factory=list)  # event trace
 
 # -------------------------------
-# World setup & helpers
+# Colors
+# -------------------------------
+C = {
+    "node_obj": "#fff6d5",
+    "node_proc": "#e8f4fa",
+    "edge_proxy": "#1f77b4",    # blue
+    "edge_forward": "#ff7f0e",  # orange
+    "edge_serve": "#7f7f7f",    # gray
+    "edge_hl": "#d62728",       # red
+    "token": "#d62728",         # red
+}
+
+# -------------------------------
+# World helpers
 # -------------------------------
 def init_world() -> World:
     # P1=ATM, P2=MobileApp, P3=API Gateway (Skeleton Host), P4=Account Service (Object)
@@ -100,20 +117,39 @@ def move_object(world: World, dst: str, create_new_skeleton=True, keep_forwardin
         if s.host_process != dst:
             s.forwards_to = dst if keep_forwarding else None
 
+def node_title(world: World, pname: str, local_hint: Optional[str] = None) -> str:
+    proc = world.processes[pname]
+    parts = [f"<b>{pname}</b>: {proc.label}"]
+    if proc.proxies:
+        parts.append(f"🧩 Proxies: {', '.join(proc.proxies)}")
+    if proc.skeletons:
+        parts.append(f"🧱 Skeletons: {len(proc.skeletons)}")
+    if proc.holds_object:
+        ledger = ", ".join([f"{a}={b}" for a, b in world.accounts.items()])
+        parts.append(f"🗄️ <b>Object host</b> (Account Service)<br/>Ledger: {ledger}")
+    if local_hint and pname in ("P1", "P2"):
+        parts.append(local_hint)
+    return "<br/>".join(parts)
+
 # -------------------------------
 # Routing (proxy → skeleton → [forwarding]* → object)
 # -------------------------------
-def compute_route(world: World, proxy_id: str) -> Tuple[bool, List[Tuple[str, str, str]]]:
+def compute_route(world: World, proxy_id: str) -> Tuple[bool, List[Tuple[str, str, str]], List[str]]:
     """
-    Returns (ok, steps) where steps = list of (src, dst, kind)
-      kind ∈ {"proxy","forward","serve"}
+    Returns (ok, steps, step_labels)
+      steps = list of (src, dst, kind), kind ∈ {"proxy","forward","serve"}
+      step_labels = human-readable labels for animation (e.g., "Proxy call (px_atm): P1→P3 (IPC)")
     """
     if proxy_id not in world.proxies:
-        return False, []
+        return False, [], []
     pr = world.proxies[proxy_id]
     steps: List[Tuple[str, str, str]] = []
+    labels: List[str] = []
+
     # proxy hop
+    hop_type = "LOCAL" if pr.owner_process == pr.known_skeleton_process else "IPC"
     steps.append((pr.owner_process, pr.known_skeleton_process, "proxy"))
+    labels.append(f"Proxy call ({pr.id}): {pr.owner_process}→{pr.known_skeleton_process} ({hop_type})")
 
     # identify skeleton at known location
     target = None
@@ -122,7 +158,7 @@ def compute_route(world: World, proxy_id: str) -> Tuple[bool, List[Tuple[str, st
             target = s
             break
     if not target:
-        return False, steps
+        return False, steps, labels
 
     # follow forwarding chain
     current = target
@@ -130,6 +166,7 @@ def compute_route(world: World, proxy_id: str) -> Tuple[bool, List[Tuple[str, st
     while current.forwards_to and current.forwards_to not in seen:
         seen.add(current.host_process)
         steps.append((current.host_process, current.forwards_to, "forward"))
+        labels.append(f"Forwarding pointer: {current.host_process}→{current.forwards_to}")
         nxt = None
         for s in world.skeletons.values():
             if s.host_process == current.forwards_to:
@@ -140,22 +177,20 @@ def compute_route(world: World, proxy_id: str) -> Tuple[bool, List[Tuple[str, st
         current = nxt
 
     # final service hop to where object actually lives (conceptual)
-    if current.host_process != world.object_process:
-        steps.append((current.host_process, world.object_process, "serve"))
-    else:
-        # still record a serve hop to make the object target explicit
-        steps.append((current.host_process, world.object_process, "serve"))
-    return True, steps
+    steps.append((current.host_process, world.object_process, "serve"))
+    labels.append(f"Skeleton dispatch: {current.host_process}→{world.object_process} (object)")
+
+    return True, steps, labels
 
 def shortcut_after_success(world: World, proxy_id: str):
-    """After a successful call, make the proxy point to the skeleton near the object (if exists)."""
     pr = world.proxies[proxy_id]
     obj_host = world.object_process
     skel_id = f"S@{obj_host}"
-    pr.known_skeleton_process = obj_host if skel_id in world.skeletons else pr.known_skeleton_process
+    if skel_id in world.skeletons:
+        pr.known_skeleton_process = obj_host
 
 # -------------------------------
-# Banking ops (executed by the object at world.object_process)
+# Banking operations (executed by the object)
 # -------------------------------
 def op_login(world: World, client_proxy: str, username: str, pin: str, twofa_passed: bool) -> str:
     u = world.users.get(username)
@@ -203,122 +238,215 @@ def op_withdraw(world: World, client_proxy: str, account: str, amount: int, dail
     return f"✅ withdraw {amount} → {account} = {world.accounts[account]}"
 
 # -------------------------------
-# Interactive graph (PyVis)
+# Layout + drawing helpers (Plotly)
 # -------------------------------
-COLORS = {
-    "proxy":   "#1f77b4",  # blue
-    "forward": "#ff7f0e",  # orange
-    "serve":   "#7f7f7f",  # gray
-    "highlight": "#d62728" # red
-}
+def fixed_layout_pos() -> Dict[str, Tuple[float, float]]:
+    # Hand-tuned layout for clarity (stable across runs)
+    # You can tweak coordinates to taste.
+    return {
+        "P1": (-1.2,  0.6),   # ATM
+        "P2": (-1.2, -0.6),   # Mobile
+        "P3": ( 0.2,  0.0),   # Gateway
+        "P4": ( 1.6,  0.0),   # Account Service
+        "L":  (-2.0, -1.6),   # Legend anchor (off to the side)
+    }
 
-def _legend_edges(net: Network):
-    # Tiny legend subgraph (fixed positions for clarity)
-    net.add_node("L", label="Legend", x=-600, y=-260, fixed=True, physics=False, color="#eeeeee", shape="box")
-    net.add_node("L1", label="proxy", x=-750, y=-200, fixed=True, physics=False, color="#ddeeff")
-    net.add_node("L2", label="forward", x=-750, y=-140, fixed=True, physics=False, color="#ffe4cc")
-    net.add_node("L3", label="serve", x=-750, y=-80,  fixed=True, physics=False, color="#eeeeee")
-    net.add_node("L4", label="highlighted step", x=-750, y=-20, fixed=True, physics=False, color="#ffdada")
+def interpolate(p1, p2, t: float) -> Tuple[float, float]:
+    return (p1[0] * (1-t) + p2[0] * t, p1[1] * (1-t) + p2[1] * t)
 
-    net.add_edge("L1", "L", color=COLORS["proxy"],   width=3, arrows="to", smooth=True, title="Proxy call (client → skeleton)")
-    net.add_edge("L2", "L", color=COLORS["forward"], width=3, dashes=True, arrows="to", smooth=True, title="Forwarding pointer (old skeleton → new location)")
-    net.add_edge("L3", "L", color=COLORS["serve"],   width=2, arrows="to", smooth=True, title="Skeleton dispatch to object")
-    net.add_edge("L4", "L", color=COLORS["highlight"], width=5, arrows="to", smooth=True, title="Route step highlight (① ② ③ …)")
+def edge_line(x1,y1,x2,y2, color, width, dash=None, name=None, hover=None):
+    return go.Scatter(
+        x=[x1, x2], y=[y1, y2],
+        mode="lines",
+        line=dict(color=color, width=width, dash=dash if dash else "solid"),
+        hoverinfo="text", text=hover, name=name if name else "",
+        showlegend=False
+    )
 
-def build_graph_html(world: World,
-                     route: List[Tuple[str, str, str]],
-                     explain_steps: bool = True,
-                     local_invocation_hint: Optional[str] = None) -> str:
-    """
-    Build interactive HTML for Streamlit via PyVis.
-    - route: list of (src, dst, kind)
-    - explain_steps: add numeric labels ①, ②, ③ to edges in the route with rich tooltips
-    - local_invocation_hint: optional note shown in the ATM or MobileApp node tooltip when co-located
-    """
-    net = Network(height="680px", width="100%", directed=True, cdn_resources="in_line", bgcolor="#ffffff")
-    net.set_options("""{
-      "physics": {"stabilization": true, "barnesHut": {"gravitationalConstant": -2000, "springLength": 180}},
-      "edges": {"smooth": {"type": "dynamic"}}
-    }""")
+def arrow_annot(x1,y1,x2,y2, text:str, color:str):
+    # Place arrow head near destination; ax/ay are tail offsets
+    ax = (x1 - x2) * 60
+    ay = (y1 - y2) * 60
+    return dict(
+        x=x2, y=y2, ax=x2+ax, ay=y2+ay,
+        xref="x", yref="y", axref="x", ayref="y",
+        text=text, showarrow=True, arrowhead=3, arrowsize=1.3, arrowwidth=2, arrowcolor=color,
+        font=dict(color=color, size=14), bgcolor="rgba(255,255,255,0.6)"
+    )
 
-    # Pre-calc node tooltips
-    def node_title(pname: str) -> str:
-        proc = world.processes[pname]
-        parts = [f"<b>{pname}</b>: {proc.label}"]
-        if proc.proxies:
-            parts.append(f"🧩 Proxies here: {', '.join(proc.proxies)}")
-        if proc.skeletons:
-            parts.append(f"🧱 Skeletons here: {len(proc.skeletons)}")
-        if proc.holds_object:
-            # Show compact ledger in the object node
-            ledger = ", ".join([f"{a}={b}" for a, b in world.accounts.items()])
-            parts.append(f"🗄️ <b>Object host</b> (Account Service)<br/>Ledger: {ledger}")
-        if local_invocation_hint and pname in ("P1", "P2"):
-            parts.append(local_invocation_hint)
-        return "<br/>".join(parts)
-
-    # Add nodes
+def build_static_traces(world: World, pos: Dict[str, Tuple[float, float]]):
+    # Nodes
+    x_nodes, y_nodes, text_nodes, colors = [], [], [], []
     for pname, proc in world.processes.items():
-        color = "#fff6d5" if proc.holds_object else "#e8f4fa"
-        shape = "box"
-        net.add_node(pname, label=f"{pname}\n{proc.label}", title=node_title(pname),
-                     color=color, shape=shape)
+        x, y = pos[pname]
+        x_nodes.append(x); y_nodes.append(y)
+        label = f"{pname}<br>{proc.label}"
+        if proc.holds_object:
+            label += "<br>[OBJECT]"
+        if proc.proxies:
+            label += "<br>Proxies: " + ", ".join(proc.proxies)
+        if proc.skeletons:
+            label += f"<br>Skeletons: {len(proc.skeletons)}"
+        # ledger & sessions on object node
+        if proc.holds_object:
+            ledger = ", ".join([f"{a}={b}" for a, b in world.accounts.items()])
+            label += f"<br><b>Ledger:</b> {ledger}"
+        text_nodes.append(label)
+        colors.append(C["node_obj"] if proc.holds_object else C["node_proc"])
+    nodes = go.Scatter(
+        x=x_nodes, y=y_nodes, mode="markers+text",
+        text=[p for p in world.processes.keys()],
+        textposition="bottom center",
+        hovertext=text_nodes, hoverinfo="text",
+        marker=dict(size=36, color=colors, line=dict(color="#1d3557", width=2)),
+        showlegend=False
+    )
 
-    # Build full edge set: proxy, forward, serve
-    all_edges: List[Tuple[str, str, str]] = []
-
-    # Proxy edges (from every proxy's owner → known skeleton process)
+    # All base edges (thin, semantic hover)
+    base_edges = []
+    # proxy edges
     for pid, pr in world.proxies.items():
-        title = (f"① Proxy call (client → skeleton)<br/>"
-                 f"<b>Proxy:</b> {pid}<br/><b>Owner:</b> {pr.owner_process}<br/><b>Thinks skeleton at:</b> {pr.known_skeleton_process}")
-        all_edges.append((pr.owner_process, pr.known_skeleton_process, "proxy"))
-        net.add_edge(pr.owner_process, pr.known_skeleton_process,
-                     color=COLORS["proxy"], width=3, arrows="to", title=title)
+        x1,y1 = pos[pr.owner_process]; x2,y2 = pos[pr.known_skeleton_process]
+        base_edges.append(edge_line(x1,y1,x2,y2, C["edge_proxy"], 2,
+                                    name="proxy", hover=f"Proxy call ({pid}): {pr.owner_process}→{pr.known_skeleton_process}"))
 
-    # Forwarding pointer edges (skeleton host → forwards_to)
+    # forwarding edges
     for s in world.skeletons.values():
         if s.forwards_to:
-            title = ("Forwarding pointer (old skeleton → new location)<br/>"
-                     f"<b>From:</b> {s.host_process} <b>to:</b> {s.forwards_to}")
-            all_edges.append((s.host_process, s.forwards_to, "forward"))
-            net.add_edge(s.host_process, s.forwards_to,
-                         color=COLORS["forward"], width=3, arrows="to", dashes=True, title=title)
+            x1,y1 = pos[s.host_process]; x2,y2 = pos[s.forwards_to]
+            base_edges.append(edge_line(x1,y1,x2,y2, C["edge_forward"], 2, dash="dash",
+                                        name="forward", hover=f"Forwarding: {s.host_process}→{s.forwards_to}"))
 
-    # Serve edges (skeleton host → object)
+    # serve edges
     for s in world.skeletons.values():
-        title = ("Skeleton dispatch to Object<br/>"
-                 f"<b>Skeleton at:</b> {s.host_process} <b>→ Object at:</b> {world.object_process}")
-        all_edges.append((s.host_process, world.object_process, "serve"))
-        net.add_edge(s.host_process, world.object_process,
-                     color=COLORS["serve"], width=2, arrows="to", title=title)
+        x1,y1 = pos[s.host_process]; x2,y2 = pos[world.object_process]
+        base_edges.append(edge_line(x1,y1,x2,y2, C["edge_serve"], 1.5, dash="dot",
+                                    name="serve", hover=f"Serve: {s.host_process}→{world.object_process} (object)"))
 
-    # Highlight the actual route with step numbers
-    if route and explain_steps:
-        circ_nums = ["①","②","③","④","⑤","⑥","⑦","⑧","⑨"]
-        for idx, (src, dst, kind) in enumerate(route):
-            label = circ_nums[idx] if idx < len(circ_nums) else str(idx+1)
-            kind_text = {"proxy":"Proxy call (client → skeleton)",
-                         "forward":"Forwarding pointer (old skeleton → new location)",
-                         "serve":"Skeleton dispatch to Object"}[kind]
-            # Add a duplicate "highlight" edge on top (thicker + label)
-            net.add_edge(src, dst, color=COLORS["highlight"], width=5, arrows="to",
-                         title=f"<b>{label}</b> {kind_text}", label=label, font={"align":"top"})
+    return nodes, base_edges
 
-    # Legend
-    _legend_edges(net)
+def build_animation(world: World,
+                    route: List[Tuple[str,str,str]],
+                    labels: List[str],
+                    pos: Dict[str, Tuple[float,float]],
+                    frames_per_hop: int = 12):
+    """Return (fig, frames, slider_steps) Plotly objects."""
+    nodes, base_edges = build_static_traces(world, pos)
 
-    return net.generate_html()
+    # Base figure
+    fig = go.Figure(data=[*base_edges, nodes])
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=36, b=10),
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        dragmode="pan", hovermode="closest",
+        title="Animated Route — Hover nodes/edges for details; use Play ▶ or slider to scrub"
+    )
+
+    # If no route (not run yet), return static fig
+    if not route:
+        return fig, [], []
+
+    # Frames: moving token + highlighted edge + annotation with step text
+    frames = []
+    slider_steps = []
+    circ = ["①","②","③","④","⑤","⑥","⑦","⑧","⑨"]
+
+    # We'll add token as the LAST trace per frame so it hovers nicely
+    for h, (src, dst, kind) in enumerate(route):
+        x1,y1 = pos[src]; x2,y2 = pos[dst]
+        label = circ[h] if h < len(circ) else str(h+1)
+        desc = labels[h] if h < len(labels) else f"Step {h+1}: {src}→{dst}"
+
+        for k in range(frames_per_hop):
+            t = (k+1)/frames_per_hop
+            xt, yt = interpolate((x1,y1), (x2,y2), t)
+            # highlighted edge
+            hl_edge = edge_line(x1,y1,x2,y2, C["edge_hl"], 5)
+            # token
+            token = go.Scatter(
+                x=[xt], y=[yt], mode="markers+text",
+                marker=dict(size=18, color=C["token"], symbol="diamond"),
+                text=[label], textposition="top center",
+                hoverinfo="text", textfont=dict(size=14, color=C["edge_hl"]),
+                showlegend=False
+            )
+            # annotation arrow with explanation
+            ann = [arrow_annot(x1,y1,x2,y2, f"{label} {desc}", C["edge_hl"])]
+
+            frames.append(go.Frame(
+                name=f"f{h}_{k}",
+                data=[*base_edges, nodes, hl_edge, token],
+                layout=go.Layout(annotations=ann)
+            ))
+
+        slider_steps.append(dict(
+            label=label, method="animate",
+            args=[[f"f{h}_0"], {"frame": {"duration": 1, "redraw": True}, "mode": "immediate"}]
+        ))
+
+    fig.update(frames=frames)
+
+    # Animation controls
+    fig.update_layout(
+        updatemenus=[{
+            "type": "buttons",
+            "direction": "left",
+            "x": 0.0, "y": 1.12,
+            "pad": {"r": 8, "t": 8},
+            "buttons": [
+                {"label": "▶ Play", "method": "animate",
+                 "args": [None, {"frame": {"duration": 80, "redraw": True}, "fromcurrent": True} ]},
+                {"label": "⏸ Pause", "method": "animate",
+                 "args": [[None], {"frame": {"duration": 0}, "mode": "immediate"}]},
+            ],
+        }],
+        sliders=[{
+            "active": 0,
+            "y": 1.06,
+            "pad": {"t": 30},
+            "steps": [
+                # create a step for every frame, not just hop start, for fine scrubbing
+                *[{
+                    "label": f if i % frames_per_hop else (circ[i//frames_per_hop] if i//frames_per_hop < len(circ) else str(i//frames_per_hop+1)),
+                    "method": "animate",
+                    "args": [[f], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}]
+                } for i, f in enumerate([fr.name for fr in frames])]
+            ]
+        }]
+    )
+    return fig, frames, slider_steps
 
 # -------------------------------
-# UI (graph-only explanations; controls are in the sidebar)
+# Trace recording
+# -------------------------------
+def record_trace(world: World, route: List[Tuple[str,str,str]], labels: List[str], op_result: str):
+    # Simple time = frame index (discrete). One row per hop (end of hop).
+    rows = []
+    t = 0
+    for i, (src, dst, kind) in enumerate(route):
+        rows.append({"t": t, "step": i+1, "src": src, "dst": dst, "kind": kind, "desc": labels[i]})
+        t += 1
+    if op_result:
+        rows.append({"t": t, "step": "result", "src": "-", "dst": "-", "kind": "result", "desc": op_result})
+    world.log.extend(rows)
+
+def trace_df(world: World) -> pd.DataFrame:
+    if not world.log:
+        return pd.DataFrame(columns=["t","step","src","dst","kind","desc"])
+    return pd.DataFrame(world.log)
+
+# -------------------------------
+# Streamlit state
 # -------------------------------
 if "world" not in st.session_state:
     st.session_state.world = init_world()
-
 world = st.session_state.world
 
+# -------------------------------
+# Sidebar controls (like a simulator config)
+# -------------------------------
 with st.sidebar:
-    st.header("Controls")
+    st.header("Simulation Controls")
 
     st.markdown("**Client & Operation**")
     client = st.selectbox("Client proxy", ["px_atm", "px_mob"], index=0)
@@ -335,20 +463,28 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**Topology**")
-    local_demo = st.checkbox("Co-locate skeleton at ATM (Local Invocation demo)", value=False)
+    local_demo = st.checkbox("Local Invocation demo (co-locate skeleton at ATM)", value=False)
     migrate_to = st.selectbox("Move Object to:", ["(no move)","P1","P2","P3","P4"], index=0)
     keep_forwarding = st.checkbox("Keep forwarding pointers after move", value=True)
 
-    colb1, colb2 = st.columns(2)
+    st.markdown("**Animation**")
+    frames_per_hop = st.slider("Frames per hop (smoothness)", 4, 30, 12)
+
+    colb1, colb2, colb3 = st.columns(3)
     with colb1:
         run_btn = st.button("▶ Run")
     with colb2:
-        reset_btn = st.button("⟲ Reset")
+        reset_btn = st.button("⟲ Reset world")
+    with colb3:
+        clear_trace_btn = st.button("🧹 Clear trace")
 
-# Apply topology changes (before computing route)
+# Apply topology changes
 if reset_btn:
     st.session_state.world = init_world()
     world = st.session_state.world
+
+if clear_trace_btn:
+    world.log.clear()
 
 # Local invocation: co-locate a skeleton at ATM and point ATM proxy there
 if local_demo:
@@ -359,13 +495,12 @@ if local_demo:
 if migrate_to != "(no move)":
     move_object(world, migrate_to, create_new_skeleton=True, keep_forwarding=keep_forwarding)
 
-# Execute selected operation through routing, and update tooltips only (no separate text panel)
-route_steps: List[Tuple[str, str, str]] = []
+# -------------------------------
+# Compute route & execute operation (if Run)
+# -------------------------------
+ok, route, labels = compute_route(world, client)
 op_result = ""
-
-ok, route_steps = compute_route(world, client)
 if run_btn and ok:
-    # Perform the operation at the object (after routing)
     if op == "login":
         op_result = op_login(world, client, user, pin, twofa_passed=twofa)
     elif op == "balance":
@@ -374,23 +509,41 @@ if run_btn and ok:
         op_result = op_deposit(world, client, account, int(amount))
     elif op == "withdraw":
         op_result = op_withdraw(world, client, account, int(amount))
-    # Shortcut the proxy to the object's skeleton if present
+    # OMNeT++-style: record the trace of this transaction
+    record_trace(world, route, labels, op_result)
+    # Shortcut after success (proxy learns object's skeleton)
     shortcut_after_success(world, client)
 elif run_btn and not ok:
     op_result = "❌ Routing failed — no skeleton at known location."
+    record_trace(world, route, labels, op_result)
 
-# Hint for local invocation (adds to node tooltip)
-local_hint = None
-if local_demo:
-    local_hint = "🟢 <b>Local invocation</b>: proxy and skeleton are co-located here → no network hop."
+# -------------------------------
+# Build animated figure (graph explains itself)
+# -------------------------------
+pos = fixed_layout_pos()
+fig, frames, _ = build_animation(world, route if ok else [], labels if ok else [], pos, frames_per_hop=frames_per_hop)
 
-# After operation, rebuild graph with live state embedded in tooltips and highlighted route
-graph_html = build_graph_html(world, route_steps, explain_steps=True, local_invocation_hint=local_hint)
+left, right = st.columns([3, 2], vertical_alignment="top")
+with left:
+    st.plotly_chart(fig, use_container_width=True)
 
-# Add an operation badge into the graph by putting it in the title of the object node (already done),
-# and also show a tiny status chip above the graph (non-intrusive)
-if run_btn and op_result:
-    st.caption(f"Status: {op_result}")
+with right:
+    st.subheader("Trace (like OMNeT++)")
+    df = trace_df(world)
+    if df.empty:
+        st.info("No events yet. Press ▶ Run to execute a flow and record its route.")
+    else:
+        st.dataframe(df, use_container_width=True)
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download trace CSV", data=csv, file_name="bank_trace.csv", mime="text/csv")
+    if op_result:
+        st.caption(f"Status: {op_result}")
 
-# Render graph (all explanations live in hover tooltips & edge labels)
-html(graph_html, height=720)
+    st.markdown("---")
+    st.markdown("**Legend**  \n"
+                f"• **Proxy** edge = {C['edge_proxy']}  \n"
+                f"• **Forwarding** edge = {C['edge_forward']}  \n"
+                f"• **Serve** edge = {C['edge_serve']}  \n"
+                f"• **Highlight** = {C['edge_hl']}  \n"
+                f"• Token = moving red diamond (step label ① ② ③ …)")
+
