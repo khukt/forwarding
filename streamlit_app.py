@@ -1,223 +1,272 @@
-# kid_bank_app.py
-# "Bank City" — a kid-friendly animation of Proxy • Skeleton • Forwarding • Shortcut
-# Uses big emoji houses and a moving courier.
-# Run:
-#   pip install streamlit plotly
-#   streamlit run kid_bank_app.py
 
 import streamlit as st
-import plotly.graph_objects as go
+import networkx as nx
+import matplotlib.pyplot as plt
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple
 
-st.set_page_config(page_title="🏙️ Bank City (Kid Mode) — Proxy • Skeleton • Forwarding", layout="wide")
+# ------------------------
+# Educational Streamlit App
+# ------------------------
 
-# -------------------------------
-# Simple, fixed map coordinates
-# -------------------------------
-POS = {
-    "ATM": (-1.2,  0.6),   # 🏧 ATM House
-    "APP": (-1.2, -0.6),   # 📱 Mobile app house (for later ideas)
-    "HELPER": (0.2,  0.0), # 🧑‍💼 Helper Station (Skeleton)
-    "BANK_R1": (1.6,  0.0),# 🏦 Bank House (location 1)
-    "BANK_R2": (-0.2, -0.6)# 🏦 Bank moves here (near APP) for migration demo
-}
+st.set_page_config(page_title="Distributed Systems: Proxies, Skeletons & Forwarding Pointers", layout="wide")
 
-COLOR = {
-    "road_proxy":  "#1f77b4",  # blue
-    "road_forward":"#ff7f0e",  # orange (forwarding)
-    "road_serve":  "#7f7f7f",  # gray (helper→bank)
-    "highlight":   "#d62728",  # red (animation token + highlight)
-}
+# ---------- Models ----------
 
-EMOJI = {
-    "ATM": "🏧 ATM House",
-    "HELPER": "🧑‍💼 Helper Station (Skeleton)",
-    "BANK": "🏦 Bank House (Object)"
-}
+@dataclass
+class ProcessNode:
+    name: str
+    kind: str  # 'client' or 'server'
+    notes: str = ""
 
-def lerp(a, b, t):
-    return (a[0]*(1-t)+b[0]*t, a[1]*(1-t)+b[1]*t)
+@dataclass
+class ObjectImpl:
+    name: str = "FileService"
+    process: str = "P3"  # where the object currently lives
 
-def node(label, x, y, selected=False):
-    return go.Scatter(
-        x=[x], y=[y],
-        mode="text+markers",
-        text=[label],
-        textposition="top center",
-        marker=dict(
-            size=50 if selected else 42,
-            color="#fff6d5" if "🏦" in label else "#e8f4fa",
-            line=dict(color="#1d3557", width=2)
-        ),
-        hoverinfo="skip",
-        showlegend=False
-    )
+@dataclass
+class ProxyState:
+    process: str = "P1"     # where the proxy lives (client process)
+    target_skeleton: str = "P3" # which server's skeleton it thinks to call
+    shortcut_installed: bool = True  # direct to current skeleton if True
 
-def road(x1,y1,x2,y2,color,width=4, dash=None, hover=None):
-    return go.Scatter(
-        x=[x1,x2], y=[y1,y2],
-        mode="lines",
-        line=dict(color=color, width=width, dash=dash if dash else "solid"),
-        hoverinfo="text", text=hover or "",
-        showlegend=False
-    )
+@dataclass
+class ForwardingState:
+    # map from old_skeleton_process -> new_skeleton_process (forward pointers)
+    pointers: Dict[str, str] = field(default_factory=dict)
 
-def arrow(x1,y1,x2,y2, text, color):
-    ax = (x1-x2)*60
-    ay = (y1-y2)*60
-    return dict(
-        x=x2, y=y2, ax=x2+ax, ay=y2+ay,
-        xref="x", yref="y", axref="x", ayref="y",
-        text=text, showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=2, arrowcolor=color,
-        font=dict(color=color, size=16), bgcolor="rgba(255,255,255,0.7)"
-    )
+@dataclass
+class WorldState:
+    processes: Dict[str, ProcessNode] = field(default_factory=dict)
+    object_impl: ObjectImpl = field(default_factory=ObjectImpl)
+    proxy: ProxyState = field(default_factory=ProxyState)
+    forwards: ForwardingState = field(default_factory=ForwardingState)
+    log: List[str] = field(default_factory=list)
 
-def build_scene(step, story, frames_per_segment=18, speed="normal"):
+def init_world() -> WorldState:
+    processes = {
+        "P1": ProcessNode("P1", "client", "Student laptop / client app"),
+        "P2": ProcessNode("P2", "server", "Server A (skeleton)"),
+        "P3": ProcessNode("P3", "server", "Server B (skeleton)"),
+        "P4": ProcessNode("P4", "server", "Server C (skeleton + object)"),
+    }
+    obj = ObjectImpl(name="CloudFile", process="P4")
+    proxy = ProxyState(process="P1", target_skeleton="P4", shortcut_installed=True)
+    forwards = ForwardingState(pointers={})
+    return WorldState(processes, obj, proxy, forwards, log=[])
+
+# ---------- Helpers ----------
+
+def add_log(state: WorldState, msg: str):
+    state.log.append(msg)
+
+def migrate_object(state: WorldState, to_process: str):
+    frm = state.object_impl.process
+    if frm == to_process:
+        add_log(state, f"Object already at {to_process}. No migration.")
+        return
+    # leave a forwarding pointer from the old skeleton to the new one
+    state.forwards.pointers[frm] = to_process
+    state.object_impl.process = to_process
+    # shortcut becomes invalid (temporarily)
+    state.proxy.shortcut_installed = False
+    add_log(state, f"Object migrated from {frm} -> {to_process}. Forwarding pointer left behind.")
+
+def resolve_path(state: WorldState) -> Tuple[List[str], bool]:
     """
-    Returns a Plotly Figure with animation frames for the given step.
-    Steps:
-      1) ATM → Helper (proxy road)
-      2) Helper → Bank at R1 (serve road)
-      3) Bank MOVES to R2; ATM → Helper (proxy), Helper → Bank at R2 (forward road)
-      4) Shortcut: ATM → Bank at R2 directly (proxy road)
+    Returns the path taken for an invocation from proxy.process to the object's skeleton.
+    Also returns whether a forwarding hop occurred.
     """
-    # Speed to milliseconds (lower = faster)
-    frame_ms = {"slow": 140, "normal": 90, "fast": 45}[speed]
+    path = []
+    forwarding_hop = False
+    # proxy calls what it believes is the skeleton
+    current = state.proxy.target_skeleton
+    path.append(state.proxy.process)
+    path.append(current)
 
-    # Choose where the bank currently lives for this step
-    bank_here = "BANK_R1" if step in (1,2) else "BANK_R2"
+    # follow forwarding pointers until we reach the actual object location
+    while current in state.forwards.pointers:
+        forwarding_hop = True
+        nxt = state.forwards.pointers[current]
+        path.append(nxt)
+        current = nxt
 
-    # Base map (nodes)
-    nodes = [
-        node("🏧 ATM", *POS["ATM"], selected=(step==1)),
-        node("🧑‍💼 Helper", *POS["HELPER"], selected=(step==2 or step==3)),
-        node("🏦 Bank", *POS[bank_here], selected=(step in (2,3,4)))
-    ]
+    # final hop to the object (same process as current skeleton)
+    obj_proc = state.object_impl.process
+    if current != obj_proc:
+        # If inconsistent, assume skeleton lives where object is
+        current = obj_proc
+        path.append(current)
 
-    # Roads always visible (thin), so kids see the "city plan"
-    base_roads = []
-    # Proxy road ATM→HELPER
-    base_roads.append(road(*POS["ATM"], *POS["HELPER"], COLOR["road_proxy"], 3,
-                           hover="Proxy road: ATM sends letter to Helper"))
-    # Serve road HELPER→BANK (both bank places)
-    base_roads.append(road(*POS["HELPER"], *POS["BANK_R1"], COLOR["road_serve"], 2, dash="dot",
-                           hover="Helper delivers to Bank"))
-    base_roads.append(road(*POS["HELPER"], *POS["BANK_R2"], COLOR["road_serve"], 2, dash="dot",
-                           hover="Helper delivers to Bank (if moved)"))
-    # Forwarding road HELPER→BANK_R2 (same line, but orange)
-    base_roads.append(road(*POS["HELPER"], *POS["BANK_R2"], COLOR["road_forward"], 3, dash="dash",
-                           hover="Forwarding road: old place forwards to new place"))
+    # path now ends at object's process
+    return path, forwarding_hop
 
-    # Which segments animate in each step
-    if step == 1:
-        segments = [("ATM","HELPER","① Proxy road")]
-    elif step == 2:
-        segments = [("HELPER","BANK_R1","② Helper → Bank")]
-    elif step == 3:
-        segments = [("ATM","HELPER","① Proxy road"),
-                    ("HELPER","BANK_R2","② Forwarding road (Bank moved!)")]
-    else:  # step == 4
-        segments = [("ATM","BANK_R2","① Shortcut (learned path)")]
+def invoke(state: WorldState):
+    path, fwd = resolve_path(state)
+    add_log(state, f"Invocation request: {' → '.join(path)} (forwarded={fwd})")
+    # After a successful invocation, install a shortcut directly to current skeleton
+    current_obj_proc = state.object_impl.process
+    state.proxy.target_skeleton = current_obj_proc
+    state.proxy.shortcut_installed = True
+    # cleanup: remove obsolete chains that are no longer referenced (simple heuristic)
+    # Here, because the proxy now points to the latest process, we can drop all pointers that lead to it.
+    obsolete = [k for k, v in state.forwards.pointers.items() if v == current_obj_proc]
+    for k in obsolete:
+        state.forwards.pointers.pop(k, None)
+    if fwd and obsolete:
+        add_log(state, f"Shortcut installed: proxy now calls {current_obj_proc} directly. Removed obsolete pointer(s): {obsolete}")
+    elif fwd:
+        add_log(state, f"Shortcut installed: proxy now calls {current_obj_proc} directly.")
 
-    # Token label uses the story choice
-    story_word = {"Login":"Login letter","Balance":"Balance letter","Deposit":"Deposit letter","Withdraw":"Withdraw letter"}[story]
+# ---------- Visualization ----------
 
-    # Build the base figure
-    fig = go.Figure(data=[*base_roads, *nodes])
-    fig.update_layout(
-        margin=dict(l=10,r=10,t=50,b=10),
-        xaxis=dict(visible=False, range=[-1.9, 1.9]),
-        yaxis=dict(visible=False, range=[-1.6, 1.2]),
-        dragmode="pan",
-        title=f"Step {step}: " + {
-            1: "ATM sends a letter via the Proxy road",
-            2: "Helper brings the letter to the Bank",
-            3: "Bank MOVES! Helper forwards the letter to the new place",
-            4: "Shortcut learned: ATM goes straight to the Bank",
-        }[step],
-    )
+def draw_world(state: WorldState):
+    G = nx.DiGraph()
+    # add nodes
+    for pid, p in state.processes.items():
+        label = f"{pid}\n({p.kind})"
+        G.add_node(pid, label=label)
 
-    # Legend (simple)
-    legend = [
-        arrow(-1.85,-1.45,-1.65,-1.45,"Proxy road", COLOR["road_proxy"]),
-        arrow(-1.85,-1.25,-1.65,-1.25,"Forward road", COLOR["road_forward"]),
-        arrow(-1.85,-1.05,-1.65,-1.05,"Serve road", COLOR["road_serve"]),
-    ]
-    fig.update_layout(annotations=legend)
+    # base layout: fixed positions for clarity
+    pos = {
+        "P1": (-1.2, 0.0),
+        "P2": (0.0, 0.8),
+        "P3": (0.0, 0.0),
+        "P4": (0.0, -0.8),
+    }
 
-    # Build frames: token moves along each segment
-    frames = []
-    circ = ["①","②","③","④"]
-    for idx, (src, dst, label) in enumerate(segments):
-        x1,y1 = POS[src]; x2,y2 = POS[dst]
-        # Overlay a thick highlight for the active road segment
-        highlight = road(x1,y1,x2,y2, COLOR["highlight"], 7)
-        for k in range(frames_per_segment):
-            t = (k+1) / frames_per_segment
-            xt, yt = lerp((x1,y1),(x2,y2), t)
-            token = go.Scatter(
-                x=[xt], y=[yt],
-                mode="markers+text",
-                marker=dict(size=22, color=COLOR["highlight"], symbol="diamond"),
-                text=[f"{circ[idx]} {story_word}"], textposition="top center",
-                textfont=dict(size=16, color=COLOR["highlight"]),
-                hoverinfo="skip",
-                showlegend=False
-            )
-            ann = [arrow(x1,y1,x2,y2, label, COLOR["highlight"])]
-            frames.append(go.Frame(
-                name=f"s{step}_{idx}_{k}",
-                data=[*base_roads, *nodes, highlight, token],
-                layout=go.Layout(annotations=legend+ann)
-            ))
+    # add edges for possible IPC
+    for pid, p in state.processes.items():
+        if p.kind == "server":
+            G.add_edge("P1", pid)
 
-    fig.update(frames=frames)
+    # Now highlight the actual invocation path
+    path, fwd = resolve_path(state)
 
-    # Animation controls
-    fig.update_layout(
-        updatemenus=[{
-            "type":"buttons","direction":"left","x":0.0,"y":1.15,
-            "pad":{"r":8,"t":8},
-            "buttons":[
-                {"label":"▶ Play","method":"animate","args":[None,{"frame":{"duration":frame_ms,"redraw":True},"fromcurrent":True}]},
-                {"label":"⏸ Pause","method":"animate","args":[[None],{"frame":{"duration":0},"mode":"immediate"}]},
-            ],
-        }],
-        sliders=[{
-            "active":0,"y":1.09,"pad":{"t":28},
-            "steps":[{
-                "label":f"{i+1}",
-                "method":"animate",
-                "args":[[fr.name],{"frame":{"duration":0,"redraw":True},"mode":"immediate"}]
-            } for i, fr in enumerate(frames)]
-        }]
-    )
-    return fig
+    fig, ax = plt.subplots(figsize=(7, 5))
+    nx.draw_networkx_nodes(G, pos, node_size=1800, ax=ax)
+    nx.draw_networkx_labels(G, pos, labels={n: G.nodes[n]["label"] for n in G.nodes()}, ax=ax)
 
-# -------------------------------
-# Sidebar (super simple)
-# -------------------------------
-st.sidebar.header("Pick a Story")
-story = st.sidebar.selectbox("Letter type", ["Login","Balance","Deposit","Withdraw"], index=0, key="kid_story")
+    # draw all light edges
+    nx.draw_networkx_edges(G, pos, alpha=0.2, arrows=True, ax=ax)
 
-st.sidebar.header("Step")
-step = st.sidebar.select_slider("Scene", options=[1,2,3,4], value=1, key="kid_step")
+    # draw forwarding pointers as dashed arrows
+    for k, v in state.forwards.pointers.items():
+        nx.draw_networkx_edges(
+            G, pos, edgelist=[(k, v)], style="dashed", width=2.0, arrows=True, ax=ax
+        )
 
-st.sidebar.header("Speed")
-speed = st.sidebar.select_slider("Animation speed", options=["slow","normal","fast"], value="normal", key="kid_speed")
+    # draw current invocation path as thicker arrows
+    if len(path) >= 2:
+        path_edges = list(zip(path[:-1], path[1:]))
+        nx.draw_networkx_edges(G, pos, edgelist=path_edges, width=3.0, arrows=True, ax=ax)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**What’s happening?**")
-st.sidebar.markdown(
-"""
-- **Step 1**: 🏧 ATM uses the **Proxy road** to reach the 🧑‍💼 Helper.
-- **Step 2**: The Helper follows the **Serve road** to the 🏦 Bank.
-- **Step 3**: The 🏦 Bank **moves**! The Helper follows the **Forward road** to the new place.
-- **Step 4**: The 🏧 ATM **learns a shortcut** to the new Bank location.
-"""
-)
+    # annotate object & proxy
+    # object
+    obj_p = state.object_impl.process
+    ax.text(pos[obj_p][0]+0.25, pos[obj_p][1]-0.15, f"Object: {state.object_impl.name}", fontsize=10)
+    # proxy
+    ax.text(pos["P1"][0]-0.1, pos["P1"][1]+0.15, "Proxy (client)", fontsize=10)
 
-# -------------------------------
-# Draw the current step (kids can press ▶ Play on the graph)
-# -------------------------------
-fig = build_scene(step, story, frames_per_segment=18, speed=speed)
-st.plotly_chart(fig, width='stretch')
+    ax.set_axis_off()
+    st.pyplot(fig)
+
+# ---------- UI ----------
+
+if "world" not in st.session_state:
+    st.session_state.world = init_world()
+
+state: WorldState = st.session_state.world
+
+st.title("Distributed Systems Tutor: Proxies, Skeletons & Forwarding Pointers")
+
+with st.sidebar:
+    st.header("Controls")
+    st.markdown("**Object Location**: " + state.object_impl.process)
+    st.markdown("**Proxy Target Skeleton**: " + state.proxy.target_skeleton)
+    st.markdown("**Shortcut Installed**: " + ("Yes" if state.proxy.shortcut_installed else "No"))
+    st.divider()
+    colA, colB = st.columns(2)
+    with colA:
+        to_proc = st.selectbox("Migrate object to:", ["P2", "P3", "P4"], index=["P2","P3","P4"].index(state.object_impl.process))
+    with colB:
+        if st.button("🔁 Migrate Object"):
+            migrate_object(state, to_proc)
+    if st.button("⚡ Invoke (RPC call)"):
+        invoke(state)
+    if st.button("♻️ Reset world"):
+        st.session_state.world = init_world()
+        state = st.session_state.world
+
+    st.divider()
+    st.subheader("Forward Pointers (current)")
+    if not state.forwards.pointers:
+        st.caption("No forwarding pointers at the moment.")
+    else:
+        for k, v in state.forwards.pointers.items():
+            st.code(f"{k} ⟶ {v}")
+
+    st.divider()
+    st.subheader("Event Log")
+    if state.log:
+        for line in reversed(state.log[-14:]):
+            st.write("• " + line)
+    else:
+        st.caption("Interact with the buttons to see events.")
+
+# Main content
+tab1, tab2, tab3 = st.tabs(["Simulator", "Concepts", "Exercises"])
+
+with tab1:
+    st.subheader("Invocation Path & Topology")
+    draw_world(state)
+    st.markdown("""
+**How to use**
+1. Click **Invoke** to perform an RPC call from the client proxy to the object's skeleton.
+2. Click **Migrate Object** to move the object between servers (P2/P3/P4). A forwarding pointer is left at the old location.
+3. Invoke again: the call will **follow** the forwarding pointer chain the first time, **then install a shortcut**.
+    """)
+
+with tab2:
+    st.subheader("Key Concepts (Distributed Objects / RPC)")
+    with st.expander("Process"):
+        st.write("An executing program with its own address space. In this app: P1 is a client; P2–P4 are servers.")
+    with st.expander("Proxy (client-side stub)"):
+        st.write("A local object that exposes the same interface as a remote object, turning method calls into RPC messages.")
+    with st.expander("Skeleton (server-side stub)"):
+        st.write("Receives RPC requests, unmarshals data, and calls the actual object implementation.")
+    with st.expander("Object (service implementation)"):
+        st.write("The actual service code and state. Here it migrates across P2/P3/P4.")
+    with st.expander("Interprocess Communication (IPC)"):
+        st.write("Network communication between processes. In RPC this is often TCP+protobuf (gRPC) or HTTP+JSON.")
+    with st.expander("Invocation request"):
+        st.write("The client's method call (e.g., read(), write()) that travels proxy → skeleton → object.")
+    with st.expander("Forwarding pointer"):
+        st.write("A reference left at the previous location when an object migrates, used to forward requests to the new location. Prevents broken references.")
+    with st.expander("Identical proxy"):
+        st.write("Different clients each get their own proxy instances that behave the same (identical interface/semantics).")
+
+with tab3:
+    st.subheader("Quick Exercises")
+    st.markdown("**Q1.** After migrating the object from P4 to P2, what happens to the first invocation from the proxy?")
+    a1 = st.radio("Choose one", [
+        "It fails because the proxy still points to P4.",
+        "It succeeds by being forwarded from P4 to P2, then installs a shortcut.",
+        "It always goes directly to P2 even before learning the new location."], index=1)
+    if a1:
+        st.success("Expected: It succeeds via forwarding, then the proxy installs a shortcut.")
+
+    st.markdown("---")
+    st.markdown("**Q2.** Why do systems remove forwarding chains (pointer compression)?")
+    a2 = st.checkbox("To reduce latency and avoid long chains of indirection.")
+    if a2:
+        st.info("Correct. Shortcutting keeps calls fast and resource usage low.")
+
+    st.markdown("---")
+    st.markdown("**Q3.** Map each term to the app:")
+    cols = st.columns(3)
+    with cols[0]: st.write("- Proxy"); st.write("- Skeleton"); st.write("- Object")
+    with cols[1]: st.write("= Client-side stub"); st.write("= Server-side stub"); st.write("= Service implementation")
+    with cols[2]: st.write("✅")
+
+st.caption("Tip: Run locally with `streamlit run app.py`. This app uses only matplotlib and networkx for visuals.")
