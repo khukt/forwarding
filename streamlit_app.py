@@ -83,6 +83,7 @@ if "scene" not in st.session_state:
     st.session_state.scene = 0
 
 # ---------------- Draw ----------------
+
 def draw_scene(idx):
     S = SCENES[idx]
     fig, ax = plt.subplots(figsize=(11, 6))
@@ -91,64 +92,52 @@ def draw_scene(idx):
     process_box(ax, "P2")
     process_box(ax, "P1")
     process_box(ax, "P3")
-    process_box(ax, "P4", extra_label="Object" if idx==0 else "Object" if idx==2 else "")
+    process_box(ax, "P4", extra_label="Object")
 
     # Stubs
-    p1_anchor = stub(ax, "P1", side="right", name=S["notes"].get("P1_proxy",""))
-    if S.get("show_p2", False):
-        stub(ax, "P2", side="right", name=S["notes"].get("P2_proxy",""))
-    p3_anchor = stub(ax, "P3", side="left", name=S["notes"].get("P3_skel",""))
-    # object is drawn as a stub on the left side of P4 for arrow consistency
-    x4, y4 = POS["P4"]
-    obj_anchor = (x4, y4 + BOX_H*0.5)  # left edge center
-    ax.text(x4 + BOX_W + 0.2, y4 + BOX_H*0.5, S["notes"].get("P4_obj",""), fontsize=12, ha="left", va="center")
+    p1_anchor = stub(ax, "P1", side="right", name="")  # we'll place label outside
+    p3_anchor = stub(ax, "P3", side="left", name="")   # external label "Skeleton"
+    # P2 proxy p′ inside P2 at right edge
+    p2_anchor = stub(ax, "P2", side="right", name="")
 
-    # Background IPC (thin lines) from P1/P2 to P3
+    # External labels (clean, outside boxes)
+    ax.text(POS["P1"][0]+0.2, POS["P1"][1]-0.25, S["notes"].get("P1_proxy","Proxy p"), fontsize=12, ha="left", va="top")
+    ax.text(POS["P2"][0]+0.2, POS["P2"][1]+BOX_H+0.15, S["notes"].get("P2_proxy","Proxy p′"), fontsize=12, ha="left", va="bottom")
+    ax.text(POS["P3"][0]-0.25, POS["P3"][1]+BOX_H*0.5+0.22, S["notes"].get("P3_skel","Skeleton"), fontsize=12, ha="right", va="center")
+    ax.text(POS["P4"][0]+BOX_W+0.2, POS["P4"][1]+BOX_H*0.5, S["notes"].get("P4_obj","Object"), fontsize=12, ha="left", va="center")
+
+    # Background IPC (thin) P1->P3 and P2->P3
     arrow(ax, p1_anchor, p3_anchor, style="ipc")
-    if S.get("show_p2", False):
-        p2_anchor = (POS["P2"][0] + BOX_W, POS["P2"][1] + BOX_H*0.5)
-        arrow(ax, p2_anchor, p3_anchor, style="ipc")
+    # slight upward offset for P2 to avoid overlap: move start y by +0.12
+    p2_offset = (p2_anchor[0], p2_anchor[1]+0.12)
+    arrow(ax, p2_offset, p3_anchor, style="ipc")
 
-    # Active path for this step
-    # Map logical keys to actual anchor coordinates
+    # Anchors map
     anchors = {
         "P1_proxy": p1_anchor,
-        "P2_proxy": (POS["P2"][0] + BOX_W, POS["P2"][1] + BOX_H*0.5),
+        "P2_proxy": p2_anchor,
         "P3_skel":  p3_anchor,
-        "P4_obj":   obj_anchor,
+        "P4_obj":   (POS["P4"][0], POS["P4"][1] + BOX_H*0.5),
     }
 
+    # Active path
     for (a,b) in S["active"]:
-        arrow(ax, anchors[a], anchors[b], style="active")
+        # apply same y-offset for P2 active path to keep separation
+        a_pt = anchors[a]
+        if a == "P2_proxy":
+            a_pt = (a_pt[0], a_pt[1]+0.12)
+        arrow(ax, a_pt, anchors[b], style="active")
 
-    # Forwarding pointer (dashed bold)
+    # Forwarding pointer
     for (a,b) in S["forward"]:
         arrow(ax, anchors[a], anchors[b], style="forward")
 
     ax.set_xlim(-3.6, 4.0)
-    ax.set_ylim(-1.6, 2.4)
+    ax.set_ylim(-1.8, 2.6)
     ax.axis("off")
     st.pyplot(fig)
     st.markdown(f"**{S['title']}**")
     st.write(S["explain"])
 
-# ---------------- UI ----------------
-st.title("Classic Representation — Proxies, Skeletons & Forwarding Pointers")
-
-c1, c2, c3, c4 = st.columns([1,1,1,3])
-if c1.button("⏮ Reset"):
-    st.session_state.scene = 0
-if c2.button("◀ Prev", disabled=st.session_state.scene==0):
-    st.session_state.scene = max(0, st.session_state.scene-1)
-if c3.button("Next ▶", disabled=st.session_state.scene==len(SCENES)-1):
-    st.session_state.scene = min(len(SCENES)-1, st.session_state.scene+1)
-auto = c4.checkbox("▶ Auto-advance")
-
-draw_scene(st.session_state.scene)
-
-if auto:
-    time.sleep(1.0)
-    st.session_state.scene = (st.session_state.scene + 1) % len(SCENES)
-    st.experimental_rerun()
 
 st.caption("Legend: thin arrows = background IPC, thick solid = active invocation, thick dashed = forwarding pointer.")
