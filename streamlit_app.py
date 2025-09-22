@@ -213,12 +213,15 @@ def draw_world(world: World, highlight_nodes: Optional[Set[str]] = None, highlig
     for pname, proc in world.processes.items():
         label = pname
         if proc.holds_object:
-            label += "[OBJECT]"
+            label += "
+[OBJECT]"
         if proc.proxies:
-            label += "Proxies: " + ", ".join(proc.proxies)
+            label += "
+Proxies: " + ", ".join(proc.proxies)
         if proc.skeletons:
             # Show only count to keep nodes compact; details are in log/legend
-            label += f"Skeletons: {len(proc.skeletons)}"
+            label += f"
+Skeletons: {len(proc.skeletons)}"
         G.add_node(pname, label=label)
 
     # Edges: proxies to their known skeleton process
@@ -257,7 +260,7 @@ def draw_world(world: World, highlight_nodes: Optional[Set[str]] = None, highlig
 
     plt.title(title or "")
     plt.axis('off')
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width='stretch')
 
 # -------------------------------
 # Tutorial (Animated)
@@ -568,7 +571,7 @@ with _tabs[0]:
         st.write("Follow each step to see definitions and a small animation.")
         st.markdown("**Steps**: " + " → ".join([f"{i}. {name}" for i, name in TUTORIAL_STEPS]))
         st.slider("Tutorial Step", min_value=1, max_value=len(TUTORIAL_STEPS), key="t_step")
-        speed = st.select_slider("Animation speed", options=["slow", "normal", "fast"], value="normal")
+        speed = st.select_slider("Animation speed", options=["slow", "normal", "fast"], value="normal", key="anim_speed")
         delay = {"slow": 1.2, "normal": 0.8, "fast": 0.4}[speed]
 
         colp = st.columns(3)
@@ -663,7 +666,7 @@ with _tabs[2]:
     with rightB:
         st.markdown("**Steps**: " + " → ".join([f"{i}. {name}" for i, name in BANKING_STEPS]))
         st.slider("Banking Step", 1, len(BANKING_STEPS), key="bank_step")
-        speedB = st.select_slider("Animation speed", options=["slow", "normal", "fast"], value="normal")
+        speedB = st.select_slider("Animation speed", options=["slow", "normal", "fast"], value="normal", key="anim_speed_bank")
         delayB = {"slow": 1.2, "normal": 0.8, "fast": 0.4}[speedB]
         colbp = st.columns(3)
         with colbp[0]:
@@ -692,7 +695,10 @@ with _tabs[2]:
         st.session_state.bank_step = 1 + (st.session_state.bank_step % len(BANKING_STEPS))
         safe_rerun()
 
-st.markdown("""warding, shortcutting)
+st.markdown("""
+---
+**How this maps to your slides**
+- *Forwarding Pointers I (mobile entities)* → Step 8–10 (migration, forwarding, shortcutting)
 - *Forwarding Pointers II–IV (proxies & skeletons)* → Steps 2–7
 - *IPC vs Local* → Steps 4–5
 """)
