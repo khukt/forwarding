@@ -4,149 +4,129 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Polygon
 import time
 
-st.set_page_config(page_title="Forwarding Pointers — Classic Representation", layout="wide")
+st.set_page_config(page_title="Classic Representation — Proxies, Skeletons & Forwarding Pointers", layout="wide")
 
-# ---------------- Positions that match the textbook-like figure -----------------
+# ---------------- Layout matching the textbook style ----------------
 POS = {
-    "P1": (-1.8, -0.6),
-    "P2": (-1.8,  0.9),
-    "P3": ( 0.0,  0.2),
-    "P4": ( 1.8, -0.2),
+    "P1": (-2.2, -0.8),
+    "P2": (-2.2,  0.8),
+    "P3": ( 0.0,  0.0),
+    "P4": ( 2.2,  0.0),
 }
 
-def process_box(ax, pid, label_extra=""):
+BOX_W, BOX_H = 2.0, 1.6
+
+def process_box(ax, pid, extra_label=None):
     x, y = POS[pid]
-    w, h = 1.8, 1.4
-    ax.add_patch(Rectangle((x, y), w, h, fill=False, linewidth=2))
-    ax.text(x+0.1, y+h-0.15, f"Process {pid}", fontsize=13, ha="left", va="top")
-    if label_extra:
-        ax.text(x+0.12, y+0.55, label_extra, fontsize=12, ha="left")
+    ax.add_patch(Rectangle((x, y), BOX_W, BOX_H, fill=False, linewidth=2))
+    ax.text(x+0.08, y+BOX_H-0.12, f"Process {pid}", fontsize=13, ha="left", va="top")
+    if extra_label:
+        ax.text(x+BOX_W+0.2, y+BOX_H*0.5, extra_label, fontsize=12, ha="left", va="center")
 
-    return (x, y, w, h)
-
-def stub(ax, x, y, facing="right", label=None, label_offset=(0,0)):
-    # Draws the proxy/skeleton pentagon used in the classic figure
-    # facing 'right' or 'left'
-    w, h = 0.28, 0.22
-    if facing == "right":
-        pts = [(x, y), (x+w*0.55, y), (x+w, y+h*0.5), (x+w*0.55, y+h), (x, y+h)]
-    else:
-        pts = [(x, y+h*0.5), (x+w*0.45, y+h), (x+w, y+h), (x+w, y), (x+w*0.45, y)]
+def stub(ax, pid, side="right", name=""):
+    # Draw the classic pentagon stub flush with the box edge
+    x, y = POS[pid]
+    w, h = 0.32, 0.24
+    if side == "right":
+        sx, sy = x + BOX_W - 0.46, y + BOX_H*0.5 - h/2
+        pts = [(sx,sy),(sx+w*0.55,sy),(sx+w,sy+h*0.5),(sx+w*0.55,sy+h),(sx,sy+h)]
+        text_xy = (x+BOX_W+0.12, y+BOX_H*0.5)
+        ha = "left"
+    else:  # left side (for a symmetric look if needed)
+        sx, sy = x + 0.14, y + BOX_H*0.5 - h/2
+        pts = [(sx+w,sy),(sx+w*0.45,sy),(sx,sy+h*0.5),(sx+w*0.45,sy+h),(sx+w,sy+h)]
+        text_xy = (x-0.15, y+BOX_H*0.5)
+        ha = "right"
     ax.add_patch(Polygon(pts, closed=True, fill=False, linewidth=2))
-    if label:
-        ax.text(x+label_offset[0], y+h+label_offset[1], label, fontsize=12, ha="left", va="bottom")
+    if name:
+        ax.text(*text_xy, name, fontsize=12, ha=ha, va="center")
+    # Return anchor where arrows should connect
+    anchor = (sx+w if side=="right" else sx, y + BOX_H*0.5)
+    return anchor
 
-def arrow(ax, src, dst, thick=False, dashed=False):
-    x1, y1 = src; x2, y2 = dst
-    ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
-                arrowprops=dict(arrowstyle="->", lw=3 if thick else 1.6,
-                                linestyle="--" if dashed else "-"))
+def arrow(ax, src, dst, style="active"):
+    lw = 3 if style=="active" else 1.2
+    ls = "-" if style!="forward" else "--"
+    ax.annotate("", xy=dst, xytext=src,
+                arrowprops=dict(arrowstyle="->", lw=lw, linestyle=ls))
 
-def line(ax, src, dst):
-    ax.plot([src[0], dst[0]], [src[1], dst[1]], color="black", linewidth=1.2)
-
-# ---------------- Scenes (match the 3 textbook slides) -----------------
+# ---------------- Scenes: single clean path per step ----------------
+# Keys in `points`: P1_proxy, P2_proxy, P3_skel, P4_obj
 SCENES = [
-# I: Basic with two clients and one server skeleton forwarding to object
-{
- "title": "Forwarding Pointers I — Basic RPC view",
- "explain": "Two client processes (P1, P2) hold proxies p and p′. Both refer to the same skeleton in P3. Interprocess communication connects P1/P2 to P3. Skeleton performs a local invocation to the object in P4.",
- "forward": {},
- "invocations": [("P1_proxy","P3_skel_left"), ("P2_proxy","P3_skel_left"), ("P3_local","P4_obj")],
- "labels": {
-     "P1_proxy": ("P1", ( -1.55, -0.15), "right", "Proxy p", (0.0, -0.02)),
-     "P2_proxy": ("P2", ( -1.55,  1.35), "right", "Proxy p′", (0.0, -0.02)),
-     "P3_skel_left": ("P3", (  0.10,  0.45), "right", "", (0,0)),
-     "P3_skel_right":("P3", (  0.58,  0.45), "left",  "Identical proxy", (0.05, 0.1)),
-     "P3_local":     ("P3", (  0.52,  0.36), "right", "Local invocation\nIdentical skeleton", (0.2, -0.48)),
-     "P4_obj":       ("P4", (  2.15,  0.32), "left",  "Object", (0.0, 0.0)),
- },
- "ipc": [("P1_proxy","P3_skel_left"), ("P2_proxy","P3_skel_left")],
-},
-# II: Migration — object moves, forwarding pointer left from old place to new
-{
- "title": "Forwarding Pointers II — Object migration with forwarding pointer",
- "explain": "Object moves to P3. The skeleton at P3 now hosts the object; the previous path from proxies remains valid. (If object had moved elsewhere, a forward pointer would be left behind.)",
- "forward": {},
- "invocations": [("P1_proxy","P3_skel_left"), ("P2_proxy","P3_skel_left")],
- "labels": {
-     "P1_proxy": ("P1", ( -1.55, -0.15), "right", "Proxy p", (0.0, -0.02)),
-     "P2_proxy": ("P2", ( -1.55,  1.35), "right", "Proxy p′", (0.0, -0.02)),
-     "P3_skel_left": ("P3", (  0.10,  0.45), "right", "Skeleton / Object", (0.0, 0.0)),
-     "P3_skel_right":("P3", (  0.58,  0.45), "left",  "", (0,0)),
-     "P4_obj":       ("P4", (  2.15,  0.32), "left",  "", (0.0, 0.0)),
- },
- "ipc": [("P1_proxy","P3_skel_left"), ("P2_proxy","P3_skel_left")],
-},
-# III: Shortcutting — proxy learns new location, sets direct path, intermediate pointers can be GC'd
-{
- "title": "Forwarding Pointers III — Shortcutting after first forwarded call",
- "explain": "When the object migrates, the first call may be forwarded. After that, clients set a shortcut to the current location, eliminating extra hops. The intermediate skeleton not referenced by any proxy can be reclaimed.",
- "forward": {("P4_obj","P3_skel_left")},
- "invocations": [("P1_proxy","P3_skel_left"), ("P2_proxy","P3_skel_left")],
- "labels": {
-     "P1_proxy": ("P1", ( -1.55, -0.15), "right", "Proxy p", (0.0, -0.02)),
-     "P2_proxy": ("P2", ( -1.55,  1.35), "right", "Proxy p′", (0.0, -0.02)),
-     "P3_skel_left": ("P3", (  0.10,  0.45), "right", "Skeleton", (0.0, 0.0)),
-     "P3_skel_right":("P3", (  0.58,  0.45), "left",  "Identical proxy", (0.05, 0.1)),
-     "P4_obj":       ("P4", (  2.15,  0.32), "left",  "Object", (0.0, 0.0)),
- },
- "ipc": [("P1_proxy","P3_skel_left"), ("P2_proxy","P3_skel_left")],
-},
+    {
+        "title": "I. Basic RPC view",
+        "explain": "One active invocation highlighted: Proxy p in P1 calls the Skeleton in P3, which in turn performs a local invocation to the Object in P4.",
+        "active": [("P1_proxy","P3_skel"), ("P3_skel","P4_obj")],
+        "forward": [],
+        "notes": {"P1_proxy":"Proxy p", "P2_proxy":"Proxy p′", "P3_skel":"Skeleton", "P4_obj":"Object"},
+        "show_p2": True
+    },
+    {
+        "title": "II. Migration with forwarding pointer",
+        "explain": "The object migrates to P3. First call still goes to P4; a forwarding pointer sends it to P3. (Here we highlight the forwarding pointer only.)",
+        "active": [("P1_proxy","P4_obj")],
+        "forward": [("P4_obj","P3_skel")],
+        "notes": {"P1_proxy":"Proxy p", "P2_proxy":"Proxy p′", "P3_skel":"Skeleton / Object", "P4_obj":"(old)"},
+        "show_p2": True
+    },
+    {
+        "title": "III. Shortcutting (after first forwarded call)",
+        "explain": "After learning the new location, Proxy p calls P3 directly. The forwarding chain can be removed.",
+        "active": [("P1_proxy","P3_skel")],
+        "forward": [],
+        "notes": {"P1_proxy":"Proxy p", "P2_proxy":"Proxy p′", "P3_skel":"Skeleton / Object", "P4_obj":""},
+        "show_p2": True
+    },
 ]
 
 if "scene" not in st.session_state:
     st.session_state.scene = 0
 
-# ---------------- drawing ----------------
-def draw_scene(scene_idx):
-    S = SCENES[scene_idx]
-    fig, ax = plt.subplots(figsize=(10, 6))
+# ---------------- Draw ----------------
+def draw_scene(idx):
+    S = SCENES[idx]
+    fig, ax = plt.subplots(figsize=(11, 6))
 
     # Process boxes
-    process_box(ax, "P1"); process_box(ax, "P2"); process_box(ax, "P3"); process_box(ax, "P4")
+    process_box(ax, "P2")
+    process_box(ax, "P1")
+    process_box(ax, "P3")
+    process_box(ax, "P4", extra_label="Object" if idx==0 else "Object" if idx==2 else "")
 
-    # Stubs and labels
-    for key, (pid, (sx, sy), facing, label, lo) in S["labels"].items():
-        # Convert local coords relative to process box origin
-        px, py = POS[pid]
-        stub(ax, px+sx, py+sy, facing=facing, label=label, label_offset=lo)
+    # Stubs
+    p1_anchor = stub(ax, "P1", side="right", name=S["notes"].get("P1_proxy",""))
+    if S.get("show_p2", False):
+        stub(ax, "P2", side="right", name=S["notes"].get("P2_proxy",""))
+    p3_anchor = stub(ax, "P3", side="left", name=S["notes"].get("P3_skel",""))
+    # object is drawn as a stub on the left side of P4 for arrow consistency
+    x4, y4 = POS["P4"]
+    obj_anchor = (x4, y4 + BOX_H*0.5)  # left edge center
+    ax.text(x4 + BOX_W + 0.2, y4 + BOX_H*0.5, S["notes"].get("P4_obj",""), fontsize=12, ha="left", va="center")
 
-    # Interprocess communication lines (thin)
-    for a_key, b_key in S.get("ipc", []):
-        ax.plot([], [])  # placeholder to avoid issues
-        # compute points roughly from stub centers
-        a_pid, (ax_rel, ay_rel), _, _, _ = S["labels"][a_key]
-        b_pid, (bx_rel, by_rel), _, _, _ = S["labels"][b_key]
-        x1 = POS[a_pid][0] + ax_rel + 0.28
-        y1 = POS[a_pid][1] + ay_rel + 0.11
-        x2 = POS[b_pid][0] + bx_rel + 0.02
-        y2 = POS[b_pid][1] + by_rel + 0.11
-        line(ax, (x1, y1), (x2, y2))
+    # Background IPC (thin lines) from P1/P2 to P3
+    arrow(ax, p1_anchor, p3_anchor, style="ipc")
+    if S.get("show_p2", False):
+        p2_anchor = (POS["P2"][0] + BOX_W, POS["P2"][1] + BOX_H*0.5)
+        arrow(ax, p2_anchor, p3_anchor, style="ipc")
 
-    # Invocation arrows (bold)
-    for inv in S["invocations"]:
-        points = []
-        for k in inv:
-            pid, (rx, ry), facing, _, _ = S["labels"][k]
-            cx = POS[pid][0] + rx + (0.28 if facing=="right" else 0.02)
-            cy = POS[pid][1] + ry + 0.11
-            points.append((cx, cy))
-        for i in range(len(points)-1):
-            arrow(ax, points[i], points[i+1], thick=True, dashed=False)
+    # Active path for this step
+    # Map logical keys to actual anchor coordinates
+    anchors = {
+        "P1_proxy": p1_anchor,
+        "P2_proxy": (POS["P2"][0] + BOX_W, POS["P2"][1] + BOX_H*0.5),
+        "P3_skel":  p3_anchor,
+        "P4_obj":   obj_anchor,
+    }
 
-    # Forwarding pointer arrows (dashed)
-    for a_key, b_key in S.get("forward", set()):
-        a_pid, (ax_rel, ay_rel), f1, _, _ = S["labels"][a_key]
-        b_pid, (bx_rel, by_rel), f2, _, _ = S["labels"][b_key]
-        x1 = POS[a_pid][0] + ax_rel + (0.28 if f1=="right" else 0.02)
-        y1 = POS[a_pid][1] + ay_rel + 0.18
-        x2 = POS[b_pid][0] + bx_rel + (0.02 if f2=="left" else 0.28)
-        y2 = POS[b_pid][1] + by_rel + 0.18
-        arrow(ax, (x1,y1), (x2,y2), thick=True, dashed=True)
+    for (a,b) in S["active"]:
+        arrow(ax, anchors[a], anchors[b], style="active")
 
-    ax.set_xlim(-3.0, 3.6)
-    ax.set_ylim(-1.2, 2.2)
+    # Forwarding pointer (dashed bold)
+    for (a,b) in S["forward"]:
+        arrow(ax, anchors[a], anchors[b], style="forward")
+
+    ax.set_xlim(-3.6, 4.0)
+    ax.set_ylim(-1.6, 2.4)
     ax.axis("off")
     st.pyplot(fig)
     st.markdown(f"**{S['title']}**")
@@ -155,22 +135,20 @@ def draw_scene(scene_idx):
 # ---------------- UI ----------------
 st.title("Classic Representation — Proxies, Skeletons & Forwarding Pointers")
 
-cols = st.columns([1,1,1,3])
-if cols[0].button("⏮ Reset"):
+c1, c2, c3, c4 = st.columns([1,1,1,3])
+if c1.button("⏮ Reset"):
     st.session_state.scene = 0
-if cols[1].button("◀ Prev", disabled=st.session_state.scene==0):
+if c2.button("◀ Prev", disabled=st.session_state.scene==0):
     st.session_state.scene = max(0, st.session_state.scene-1)
-if cols[2].button("Next ▶", disabled=st.session_state.scene==len(SCENES)-1):
+if c3.button("Next ▶", disabled=st.session_state.scene==len(SCENES)-1):
     st.session_state.scene = min(len(SCENES)-1, st.session_state.scene+1)
-
-autoplay = cols[3].checkbox("▶ Auto-advance")
+auto = c4.checkbox("▶ Auto-advance")
 
 draw_scene(st.session_state.scene)
 
-if autoplay:
-    time.sleep(0.9)
+if auto:
+    time.sleep(1.0)
     st.session_state.scene = (st.session_state.scene + 1) % len(SCENES)
     st.experimental_rerun()
 
-st.markdown("---")
-st.markdown("**Legend**: small pentagon = **proxy/skeleton icon**, thin lines = **interprocess communication**, bold arrows = **invocation request**, dashed bold = **forwarding pointer**.")
+st.caption("Legend: thin arrows = background IPC, thick solid = active invocation, thick dashed = forwarding pointer.")
