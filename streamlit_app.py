@@ -1,7 +1,8 @@
 # app_stepper.py
 # Chord DHT • Click-through Tutor: Key Space → Assign Nodes → Build Finger Table
 # -----------------------------------------------------------------------------
-# Streamlit Community Cloud ready.
+# This version highlights n (selected node) and the current start[i] on the ring
+# when you click "Next entry" during Step 3.
 
 import hashlib
 import math
@@ -31,9 +32,12 @@ def init_state():
         st.session_state.selected_node = None
     if "finger_k" not in st.session_state:
         st.session_state.finger_k = 0       # how many fingers revealed (0..m)
+    if "show_radial" not in st.session_state:
+        st.session_state.show_radial = True # show radial guide n -> start
 
 def reset_all():
-    for k in ["step", "m", "mode", "nodes_sorted", "node_map", "selected_node", "finger_k"]:
+    for k in ["step", "m", "mode", "nodes_sorted", "node_map",
+              "selected_node", "finger_k", "show_radial"]:
         if k in st.session_state:
             del st.session_state[k]
     init_state()
@@ -80,26 +84,33 @@ def node_xy(id_val: int, space: int, radius: float = 1.0) -> Tuple[float, float]
     theta = 2 * math.pi * (id_val / space)
     return radius * math.cos(theta), radius * math.sin(theta)
 
-def ring_figure(space: int,
-                nodes_sorted: List[int],
-                selected: int = None,
-                fingers_to_draw: List[FingerEntry] = None) -> go.Figure:
+def ring_figure(
+    space: int,
+    nodes_sorted: List[int],
+    selected: int = None,
+    fingers_to_draw: List[FingerEntry] = None,
+    highlight_start: int = None,
+    show_radial: bool = False
+) -> go.Figure:
+    """Draw ring, nodes, (optionally) some finger chords, and a highlight marker at start[i]."""
     R = 1.0
     circle_angles = np.linspace(0, 2*np.pi, 361)
 
     fig = go.Figure()
+    # Ring
     fig.add_trace(go.Scatter(x=np.cos(circle_angles), y=np.sin(circle_angles),
                              mode="lines", name="Hash ring", hoverinfo="skip"))
 
+    # Nodes
     xs, ys, labels, colors, sizes = [], [], [], [], []
     for nid in nodes_sorted:
         x, y = node_xy(nid, space, R)
         xs.append(x); ys.append(y)
         label = f"{nid}"
         if selected is not None and nid == selected:
-            colors.append("crimson"); sizes.append(14); label += " (selected)"
+            colors.append("crimson"); sizes.append(16); label += " (n)"
         else:
-            colors.append("royalblue"); sizes.append(10)
+            colors.append("royalblue"); sizes.append(11)
         labels.append(label)
 
     if nodes_sorted:
@@ -110,6 +121,7 @@ def ring_figure(space: int,
             hovertext=labels, hoverinfo="text", name="Nodes"
         ))
 
+    # Finger chords from selected node to successors
     if selected is not None and fingers_to_draw:
         sx, sy = node_xy(selected, space, R)
         for fe in fingers_to_draw:
@@ -118,8 +130,29 @@ def ring_figure(space: int,
                 x=[sx, tx], y=[sy, ty], mode="lines",
                 line=dict(width=2, dash="dot"),
                 name=f"finger[{fe.i}]→{fe.node}",
-                hovertext=f"finger[{fe.i}] start={fe.start} → {fe.node}",
+                hovertext=f"finger[{fe.i}] start={fe.start} → succ={fe.node}",
                 hoverinfo="text",
+                showlegend=False
+            ))
+
+    # Highlight start[i] as a diamond marker and optional radial guide from n
+    if highlight_start is not None and selected is not None:
+        hx, hy = node_xy(highlight_start, space, R)
+        fig.add_trace(go.Scatter(
+            x=[hx], y=[hy], mode="markers+text",
+            text=[f"start={highlight_start}"],
+            textposition="bottom center",
+            marker=dict(size=14, symbol="diamond", line=dict(width=1, color="black")),
+            name="start[i]",
+            hoverinfo="text"
+        ))
+        if show_radial:
+            sx, sy = node_xy(selected, space, R)
+            fig.add_trace(go.Scatter(
+                x=[sx, hx], y=[sy, hy], mode="lines",
+                line=dict(width=1, dash="dash"),
+                name="radial n→start",
+                hoverinfo="skip",
                 showlegend=False
             ))
 
@@ -128,7 +161,7 @@ def ring_figure(space: int,
         xaxis=dict(visible=False), yaxis=dict(visible=False),
         margin=dict(l=10, r=10, t=40, b=10),
         plot_bgcolor="white",
-        title="Chord • Ring • Nodes • Fingers (revealed)",
+        title="Chord • Ring • Nodes • Fingers • start[i]",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
     )
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
@@ -172,7 +205,6 @@ if st.session_state.step == 1:
     st.latex(rf"\text{{ID space size}} = 2^{m} = {space}")
     st.latex(rf"\text{{IDs}} \in \{{0,1,\dots,{space-1}\}}")
 
-    # Empty ring preview with tick labels every 2^(m-1)/something would be noisy; we just draw the circle.
     fig = ring_figure(space=space, nodes_sorted=[], selected=None, fingers_to_draw=None)
     st.plotly_chart(fig, use_container_width=True)
 
@@ -218,15 +250,12 @@ elif st.session_state.step == 2:
     if not nodes_sorted:
         st.warning("Add at least two nodes.")
     else:
-        # pick default selected node
         if st.session_state.selected_node not in nodes_sorted:
             st.session_state.selected_node = nodes_sorted[0]
 
-        # Show ring with nodes
         fig = ring_figure(space=space, nodes_sorted=nodes_sorted, selected=st.session_state.selected_node)
         st.plotly_chart(fig, use_container_width=True)
 
-        # Show a table
         if mode.startswith("Manual"):
             df_nodes = pd.DataFrame([{"node_id": n} for n in nodes_sorted])
         else:
@@ -259,7 +288,6 @@ elif st.session_state.step == 3:
                                                if st.session_state.selected_node in nodes_sorted else 0))
         st.session_state.selected_node = selected_node
 
-        # Compute full finger table
         all_entries = build_finger_table(selected_node, nodes_sorted, m)
 
         # How many entries are revealed?
@@ -269,8 +297,8 @@ elif st.session_state.step == 3:
             "(click **Next entry** to compute the next start & successor)."
         )
 
-        # Buttons to control reveal
-        c1, c2, c3, c4 = st.columns([1,1,1,6])
+        # Controls
+        c1, c2, c3, c4 = st.columns([1,1,2,6])
         with c1:
             st.button("Reset entries", on_click=lambda: st.session_state.update(finger_k=0))
         with c2:
@@ -281,13 +309,24 @@ elif st.session_state.step == 3:
             st.button("Reveal all", disabled=(k >= m),
                       on_click=lambda: st.session_state.update(finger_k=m))
 
-        # Build the list to draw/show
+        st.checkbox("Show radial guide n → start[i]", value=st.session_state.show_radial,
+                    key="show_radial")
+
+        # Entries to draw and highlight
         shown_entries = all_entries[:k]
-        fig = ring_figure(space=space, nodes_sorted=nodes_sorted, selected=selected_node,
-                          fingers_to_draw=shown_entries)
+        current_start = shown_entries[-1].start if k > 0 else None
+
+        fig = ring_figure(
+            space=space,
+            nodes_sorted=nodes_sorted,
+            selected=selected_node,
+            fingers_to_draw=shown_entries,
+            highlight_start=current_start,
+            show_radial=st.session_state.show_radial
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Table for shown entries
+        # Table of revealed entries
         st.subheader("📇 Finger table (revealed so far)")
         df_ft = pd.DataFrame(
             [{"i": fe.i, "start": fe.start, "successor": fe.node} for fe in shown_entries],
@@ -295,22 +334,34 @@ elif st.session_state.step == 3:
         )
         st.dataframe(df_ft, use_container_width=True, hide_index=True)
 
-        # Equations
+        # Global finger definition
         st.markdown("**Finger definition:**")
         st.latex(rf"\text{{start}}[i] = (n + 2^{{i-1}}) \bmod 2^{{{m}}}")
         st.latex(r"\text{finger}[i] = \operatorname{succ}(\text{start}[i])")
 
+        # If something is revealed, show the CURRENT step very clearly
         if k == 0:
             st.info("Click **Next entry** to compute finger[1].")
         else:
-            st.subheader("🧮 Equation updates (per revealed entry)")
-            for fe in shown_entries:
-                i = fe.i
-                st.latex(
-                    rf"\text{{finger}}[{i}]:\;"
-                    rf"\text{{start}}[{i}] = ({selected_node} + 2^{{{i-1}}}) \bmod 2^{{{m}}} = {fe.start},\;"
-                    rf"\text{{node}} = \operatorname{{succ}}({fe.start}) = {fe.node}"
-                )
+            fe = shown_entries[-1]
+            st.subheader("🧮 Current step")
+            st.latex(rf"n = {selected_node}")
+            st.latex(
+                rf"\text{{start}}[{fe.i}] = ({selected_node} + 2^{{{fe.i-1}}}) \bmod 2^{{{m}}} = {fe.start}"
+            )
+            st.latex(
+                rf"\text{{finger}}[{fe.i}] = \operatorname{{succ}}(\text{{start}}[{fe.i}]) "
+                rf"= \operatorname{{succ}}({fe.start}) = {fe.node}"
+            )
+
+            # Also show all revealed equations (history)
+            with st.expander("Show all revealed equation steps"):
+                for e in shown_entries:
+                    st.latex(
+                        rf"\text{{finger}}[{e.i}]:\;"
+                        rf"\text{{start}}[{e.i}] = ({selected_node} + 2^{{{e.i-1}}}) \bmod 2^{{{m}}} = {e.start},\;"
+                        rf"\text{{node}} = \operatorname{{succ}}({e.start}) = {e.node}"
+                    )
 
         # Full table (optional)
         with st.expander("Show full finger table (all m entries)"):
