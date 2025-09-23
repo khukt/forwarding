@@ -1,7 +1,6 @@
-# app_fixed32_students.py
-# Chord DHT — Student-friendly 3-step tutor for the fixed 0..31 ring (m=5)
-# Step 1: Assign nodes • Step 2: Build finger table • Step 3: Search/route
-# Client-side PNG export via Plotly modebar (no Kaleido/Chrome required)
+# app_fixed32_students_v2.py
+# Chord DHT — Student-friendly, bigger nodes, Step 1 allocation via hash, Step 2 multicolor sectors
+# Fixed ring 0..31 (m=5); client-side PNG export via Plotly modebar (no Kaleido/Chrome)
 
 import hashlib
 import math
@@ -20,8 +19,8 @@ PLOTLY_CONFIG = {
     "toImageButtonOptions": {
         "format": "png",
         "filename": "chord_ring",
-        "height": 800,
-        "width": 800,
+        "height": 900,
+        "width": 900,
         "scale": 2,
     },
 }
@@ -31,8 +30,14 @@ M = 5
 SPACE = 2 ** M
 ALL_POSITIONS = list(range(SPACE))
 
+# Colorblind-friendly palette (Tableau-ish) for per-sector coloring
+SECTOR_COLORS = [
+    "#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F",
+    "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#BAB0AC",
+]
+
 # ----------------- Page / Style -----------------
-st.set_page_config(page_title="Chord 0..31 • Student Tutor", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Chord 0..31 • Student Tutor (v2)", layout="wide", initial_sidebar_state="collapsed")
 st.markdown(
     """
     <style>
@@ -42,7 +47,6 @@ st.markdown(
     .step-chip.active { background:#dbeafe; color:#1e3a8a; }
     .hint { background:#f8fafc; border:1px solid #e2e8f0; padding:10px 12px; border-radius:10px; }
     .legend { font-size:0.9rem; color:#334155; }
-    .metric-card .stMetric { background: #fafafa; border-radius: 12px; padding: 0.4rem 0.6rem; }
     .quiz-card { background:#fffbeb; border:1px solid #fde68a; padding:10px; border-radius:10px; }
     </style>
     """,
@@ -52,8 +56,9 @@ st.markdown(
 # ----------------- State -----------------
 def init_state():
     if "step" not in st.session_state: st.session_state.step = 1
-    if "active_nodes" not in st.session_state: st.session_state.active_nodes = [1,4,9,11,14,18,20,21,28]
-    if "selected" not in st.session_state: st.session_state.selected = st.session_state.active_nodes[0]
+    # Start with NO active nodes so Step 1 shows all disabled initially
+    if "active_nodes" not in st.session_state: st.session_state.active_nodes: List[int] = []
+    if "selected" not in st.session_state: st.session_state.selected: Optional[int] = None
     if "k" not in st.session_state: st.session_state.k = 0  # fingers revealed
     if "key_id" not in st.session_state: st.session_state.key_id = 26
     if "route_path" not in st.session_state: st.session_state.route_path: List[int] = []
@@ -65,6 +70,7 @@ def init_state():
     if "projector" not in st.session_state: st.session_state.projector = False
     if "colorblind" not in st.session_state: st.session_state.colorblind = True
     if "show_sectors" not in st.session_state: st.session_state.show_sectors = True
+    if "multicolor_sectors" not in st.session_state: st.session_state.multicolor_sectors = True  # new toggle
 
 init_state()
 
@@ -177,8 +183,8 @@ def add_sector(fig: go.Figure, a: int, b: int, color: str, alpha: float = 0.08, 
     else:
         thetas = np.concatenate([np.linspace(start, 2*math.pi, steps//2),
                                  np.linspace(0, end, steps - steps//2)])
-    R_outer = 1.02
-    R_inner = 0.90
+    R_outer = 1.04
+    R_inner = 0.88
     xs = np.cos(thetas) * R_outer
     ys = np.sin(thetas) * R_outer
     xs2 = np.cos(thetas[::-1]) * R_inner
@@ -205,11 +211,12 @@ def ring_figure(
     route_hops_to_show: int = 0,
     route_texts: Optional[List[str]] = None,
     key: Optional[int] = None,
-    width: int = 700,
-    height: int = 700,
+    width: int = 760,
+    height: int = 760,
     projector: bool = False,
     colorblind: bool = True,
     show_sectors: bool = True,
+    multicolor_sectors: bool = True,
 ) -> go.Figure:
 
     COLORS = {
@@ -229,17 +236,21 @@ def ring_figure(
     fig = go.Figure()
 
     # Base ring
-    fig.add_trace(go.Scatter(x=np.cos(circle_angles), y=np.sin(circle_angles),
-                             mode="lines", line=dict(color=COLORS["ring"], width=2 if projector else 1.5),
-                             name="Ring", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(
+        x=np.cos(circle_angles), y=np.sin(circle_angles),
+        mode="lines",
+        line=dict(color=COLORS["ring"], width=2.5 if projector else 2),
+        name="Ring", hoverinfo="skip"
+    ))
 
     # Responsibility sectors
     if show_sectors and active_nodes:
         for idx, nid in enumerate(active_nodes):
             pred = active_nodes[idx - 1]
-            add_sector(fig, pred, nid, COLORS["sector"], alpha=0.12 if projector else 0.08)
+            color = SECTOR_COLORS[idx % len(SECTOR_COLORS)] if multicolor_sectors else COLORS["sector"]
+            add_sector(fig, pred, nid, color, alpha=0.15 if projector else 0.1)
 
-    # Disabled placeholders
+    # Disabled placeholders — larger markers
     disabled_positions = [i for i in ALL_POSITIONS if i not in set(active_nodes)]
     if disabled_positions:
         xs, ys = [], []
@@ -249,39 +260,40 @@ def ring_figure(
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="markers+text",
             text=[str(i) for i in disabled_positions], textposition="top center",
-            marker=dict(size=10 if projector else 9, symbol="circle-open",
-                        color=COLORS["disabled"], line=dict(width=1, color=COLORS["disabled"])),
-            name="Disabled", opacity=0.45, hoverinfo="skip"
+            marker=dict(size=12 if projector else 11, symbol="circle-open",
+                        color=COLORS["disabled"], line=dict(width=1.2, color=COLORS["disabled"])),
+            name="Disabled", opacity=0.55, hoverinfo="skip"
         ))
 
-    # Active nodes (selected red, succ(key) orange)
+    # Active nodes — bigger sizes
     succ_k = successor_of(key, active_nodes) if (key is not None and active_nodes) else None
     xs, ys, sizes, colors, labels = [], [], [], [], []
     for nid in active_nodes:
         x, y = node_xy(nid, SPACE, R)
         xs.append(x); ys.append(y)
         if selected == nid:
-            sizes.append(18 if projector else 16); colors.append(COLORS["selected"]); labels.append(f"{nid} (selected)")
+            sizes.append(22 if projector else 20); colors.append(COLORS["selected"]); labels.append(f"{nid} (selected)")
         elif succ_k is not None and succ_k == nid:
-            sizes.append(16 if projector else 14); colors.append(COLORS["succ"]); labels.append(f"{nid} (succ(key))")
+            sizes.append(20 if projector else 18); colors.append(COLORS["succ"]); labels.append(f"{nid} (succ(key))")
         else:
-            sizes.append(12 if projector else 11); colors.append(COLORS["active"]); labels.append(str(nid))
-    fig.add_trace(go.Scatter(
-        x=xs, y=ys, mode="markers+text",
-        text=[str(n) for n in active_nodes], textposition="top center",
-        hovertext=labels, hoverinfo="text",
-        marker=dict(size=sizes, color=colors, line=dict(width=1, color="white")),
-        name="Active nodes"
-    ))
+            sizes.append(18 if projector else 16); colors.append(COLORS["active"]); labels.append(str(nid))
+    if active_nodes:
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="markers+text",
+            text=[str(n) for n in active_nodes], textposition="top center",
+            hovertext=labels, hoverinfo="text",
+            marker=dict(size=sizes, color=colors, line=dict(width=1.3, color="white")),
+            name="Active nodes"
+        ))
 
-    # Finger chords
+    # Finger chords (thicker)
     if selected is not None and fingers:
         sx, sy = node_xy(selected, SPACE, R)
         for fe in fingers:
             tx, ty = node_xy(fe.node, SPACE, R)
             fig.add_trace(go.Scatter(
                 x=[sx, tx], y=[sy, ty], mode="lines",
-                line=dict(width=3 if projector else 2, dash="dot", color=COLORS["active"]),
+                line=dict(width=3.5 if projector else 3, dash="dot", color=COLORS["active"]),
                 name=f"finger[{fe.i}]→{fe.node}",
                 hovertext=f"start={fe.start} → succ={fe.node}",
                 hoverinfo="text", showlegend=False
@@ -293,15 +305,15 @@ def ring_figure(
         fig.add_trace(go.Scatter(
             x=[hx], y=[hy], mode="markers+text",
             text=[f"start={highlight_start}"], textposition="bottom center",
-            marker=dict(size=16 if projector else 13, symbol="diamond",
-                        line=dict(width=1, color="black"), color=COLORS["start"]),
+            marker=dict(size=20 if projector else 17, symbol="diamond",
+                        line=dict(width=1.2, color="black"), color=COLORS["start"]),
             name="start[i]", hoverinfo="text"
         ))
         if show_radial:
             sx, sy = node_xy(selected, SPACE, R)
             fig.add_trace(go.Scatter(
                 x=[sx, hx], y=[sy, hy], mode="lines",
-                line=dict(width=2 if projector else 1, dash="dash", color=COLORS["radial"]),
+                line=dict(width=2 if projector else 1.5, dash="dash", color=COLORS["radial"]),
                 name="n→start", hoverinfo="skip", showlegend=False
             ))
 
@@ -313,23 +325,22 @@ def ring_figure(
             tip = route_texts[i] if (route_texts and i < len(route_texts)) else f"hop {i+1}: {a} → {b}"
             fig.add_trace(go.Scatter(
                 x=[ax, bx], y=[ay, by], mode="lines+markers",
-                line=dict(width=4 if projector else 3, color=COLORS["hop"]),
-                marker=dict(size=8 if projector else 6, color=COLORS["hop"]),
+                line=dict(width=5 if projector else 4, color=COLORS["hop"]),
+                marker=dict(size=10 if projector else 8, color=COLORS["hop"]),
                 name=f"hop {i+1}", hovertext=tip, hoverinfo="text", showlegend=False
             ))
             fig.add_annotation(
-                x=bx, y=by, ax=ax, ay=ay,
-                xref="x", yref="y", axref="x", ayref="y",
-                showarrow=True, arrowhead=3, arrowsize=1.3 if projector else 1.15, arrowwidth=2, arrowcolor=COLORS["hop"]
+                x=bx, y=by, ax=ax, ay=ay, xref="x", yref="y", axref="x", ayref="y",
+                showarrow=True, arrowhead=3, arrowsize=1.25 if projector else 1.1, arrowwidth=2.2, arrowcolor=COLORS["hop"]
             )
 
     fig.update_layout(
         width=width, height=height,
         xaxis=dict(visible=False), yaxis=dict(visible=False),
-        margin=dict(l=6, r=6, t=34, b=6),
+        margin=dict(l=8, r=8, t=38, b=8),
         plot_bgcolor="white",
         title="Chord • Ring 0..31",
-        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="center", x=0.5, font=dict(size=11 if projector else 10)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="center", x=0.5, font=dict(size=12 if projector else 11)),
     )
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
     return fig
@@ -338,19 +349,21 @@ def ring_figure(
 l, r = st.columns([0.7, 0.3])
 with l:
     st.subheader("🔗 Chord DHT — Student Tutor (Fixed 0..31)")
-    st.caption("Step 1: Assign nodes → Step 2: Build finger table → Step 3: Search/route. Non-listed IDs are grey placeholders.")
+    st.caption("Step 1: Allocate via hash → Step 2: Build finger table → Step 3: Search/route. Initially, all nodes are disabled.")
 with r:
     st.session_state.projector = st.toggle("Projector mode", value=st.session_state.projector, help="Bigger fonts & thicker lines.")
     st.session_state.colorblind = st.toggle("Color-blind palette", value=st.session_state.colorblind, help="High-contrast colors.")
     st.session_state.show_sectors = st.toggle("Show sectors", value=st.session_state.show_sectors, help="Shade each node's responsibility interval.")
+    st.session_state.multicolor_sectors = st.toggle("Multicolor sectors", value=st.session_state.multicolor_sectors, help="Different color per node interval (Step 2 especially).")
 
 projector = st.session_state.projector
 colorblind = st.session_state.colorblind
 show_sectors = st.session_state.show_sectors
+multicolor_sectors = st.session_state.multicolor_sectors
 
 # Stepper chips
 chips = []
-for i, label in [(1, "1 Assign"), (2, "2 Fingers"), (3, "3 Search")]:
+for i, label in [(1, "1 Allocate"), (2, "2 Fingers"), (3, "3 Search")]:
     cls = "step-chip active" if st.session_state.step == i else "step-chip"
     chips.append(f'<span class="{cls}">{label}</span>')
 st.markdown(" ".join(chips), unsafe_allow_html=True)
@@ -373,6 +386,7 @@ with cnav3:
             path, reasons_latex, reasons_text = chord_lookup_full(28, 12, st.session_state.active_nodes, M)
             st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons_latex, reasons_text
             st.session_state.route_idx = len(path)-1
+            st.session_state.step = 3
     with cpb:
         if st.button("k=26 from 1", use_container_width=True):
             st.session_state.active_nodes = [1,4,9,11,14,18,20,21,28]
@@ -382,18 +396,22 @@ with cnav3:
             path, reasons_latex, reasons_text = chord_lookup_full(1, 26, st.session_state.active_nodes, M)
             st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons_latex, reasons_text
             st.session_state.route_idx = len(path)-1
+            st.session_state.step = 3
 
-# ----------------- STEP 1 — Assign nodes -----------------
+# ----------------- STEP 1 — Allocate via hash -----------------
 if st.session_state.step == 1:
     left, right = st.columns([0.56, 0.44])
+
     with left:
         fig = ring_figure(
             active_nodes=st.session_state.active_nodes,
-            width=680, height=680,
-            projector=projector, colorblind=colorblind, show_sectors=show_sectors
+            selected=st.session_state.selected,
+            width=760, height=760,
+            projector=projector, colorblind=colorblind,
+            show_sectors=False,  # sectors not useful before allocation
+            multicolor_sectors=multicolor_sectors
         )
         st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG)
-
         st.markdown(
             """
             <div class="legend">
@@ -406,39 +424,57 @@ if st.session_state.step == 1:
         )
 
     with right:
-        st.markdown("### Step 1 — Assign the nodes")
-        st.markdown('<div class="hint">Enter IDs (0–31). Others appear as disabled placeholders. Toggle <b>Show sectors</b> to visualize responsibility intervals.</div>', unsafe_allow_html=True)
-        ids_text = st.text_area(
-            "Active node IDs",
-            value=", ".join(str(n) for n in st.session_state.active_nodes),
-            help="Comma/space separated integers between 0 and 31."
-        )
-        raw = [t.strip() for t in ids_text.replace(",", " ").split()]
-        try:
-            active_nodes = sorted(set(int(x) % SPACE for x in raw if x != ""))
-        except ValueError:
-            active_nodes = st.session_state.active_nodes
-        st.session_state.active_nodes = active_nodes
+        st.markdown("### Step 1 — Allocate nodes by hashing labels")
+        st.markdown('<div class="hint">Initially, all IDs (0–31) are shown as disabled. Enter labels and click <b>Allocate</b> to place nodes at <code>SHA1(label) mod 32</code>.</div>', unsafe_allow_html=True)
 
-        st.markdown("**Optional: hash labels → IDs**")
-        labels_text = st.text_area("Node labels (one per line)", value="nodeA\nnodeB\nnodeC\nnodeD", height=100)
-        if st.button("Hash labels (SHA-1 mod 32)"):
-            node_map = {lbl.strip(): sha1_mod(lbl.strip(), SPACE) for lbl in labels_text.splitlines() if lbl.strip()}
-            st.session_state.active_nodes = sorted(set(node_map.values()))
+        labels_text = st.text_area(
+            "Node labels (one per line)",
+            value="nodeA\nnodeB\nnodeC\nnodeD",
+            height=140
+        )
+
+        ca, cb, cc = st.columns([1,1,1])
+        with ca:
+            if st.button("Allocate via SHA-1 mod 32"):
+                labels = [s.strip() for s in labels_text.splitlines() if s.strip()]
+                ids = [sha1_mod(lbl, SPACE) for lbl in labels]
+                st.session_state.active_nodes = sorted(set(ids))
+                st.session_state.selected = st.session_state.active_nodes[0] if st.session_state.active_nodes else None
+                st.session_state.k = 0  # reset finger reveal
+        with cb:
+            if st.button("Clear allocation"):
+                st.session_state.active_nodes = []
+                st.session_state.selected = None
+                st.session_state.k = 0
+        with cc:
+            # Optional direct numeric override for instructors
+            manual = st.text_input("Manual IDs (optional)", value="")
+            if st.button("Use manual IDs"):
+                raw = [t.strip() for t in manual.replace(",", " ").split()]
+                try:
+                    nodes = sorted(set(int(x) % SPACE for x in raw if x != ""))
+                    st.session_state.active_nodes = nodes
+                    st.session_state.selected = nodes[0] if nodes else None
+                    st.session_state.k = 0
+                except ValueError:
+                    st.warning("Manual IDs must be integers (0–31).")
+
+        st.markdown("**Hash Equation:**")
         st.latex(r"\text{node\_id} = \operatorname{SHA1}(\text{label}) \bmod 32")
 
-# ----------------- STEP 2 — Finger table -----------------
+# ----------------- STEP 2 — Finger table (with multicolor sectors) -----------------
 elif st.session_state.step == 2:
     if not st.session_state.active_nodes:
-        st.warning("Go to Step 1 to add active nodes.")
+        st.warning("Allocate nodes first in Step 1.")
     else:
-        top = st.columns([1.2, 1, 1, 6])
+        top = st.columns([1.4, 1, 1, 6])
         with top[0]:
-            st.session_state.selected = st.selectbox("Selected node n", options=st.session_state.active_nodes,
-                                                     index=min(
-                                                        len(st.session_state.active_nodes)-1,
-                                                        st.session_state.active_nodes.index(st.session_state.selected)
-                                                        if st.session_state.selected in st.session_state.active_nodes else 0))
+            st.session_state.selected = st.selectbox(
+                "Selected node n",
+                options=st.session_state.active_nodes,
+                index=0 if st.session_state.selected is None or st.session_state.selected not in st.session_state.active_nodes
+                else st.session_state.active_nodes.index(st.session_state.selected)
+            )
         with top[1]:
             if st.button("Reset fingers"): st.session_state.k = 0
         with top[2]:
@@ -453,16 +489,21 @@ elif st.session_state.step == 2:
         left, right = st.columns([0.56, 0.44])
         with left:
             fig = ring_figure(
-                active_nodes=st.session_state.active_nodes, selected=selected,
-                fingers=fingers_shown, highlight_start=current_start, show_radial=True,
-                width=680, height=680,
-                projector=projector, colorblind=colorblind, show_sectors=show_sectors
+                active_nodes=st.session_state.active_nodes,
+                selected=selected,
+                fingers=fingers_shown,
+                highlight_start=current_start,
+                show_radial=True,
+                width=760, height=760,
+                projector=projector, colorblind=colorblind,
+                show_sectors=True,            # show sectors now
+                multicolor_sectors=multicolor_sectors
             )
             st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG)
 
         with right:
             st.markdown("### Step 2 — Build the finger table")
-            st.markdown('<div class="hint">Click <b>Next finger</b> to reveal entries one by one.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="hint">Click <b>Next finger</b> to reveal entries one by one. Sectors show each node’s responsibility interval with different colors.</div>', unsafe_allow_html=True)
             st.latex(r"\text{start}[i] = (n + 2^{i-1}) \bmod 32")
             st.latex(r"\text{finger}[i] = \operatorname{succ}(\text{start}[i])")
             df_ft = pd.DataFrame([{"i": fe.i, "start": fe.start, "successor": fe.node} for fe in fingers_shown],
@@ -480,9 +521,9 @@ elif st.session_state.step == 2:
 # ----------------- STEP 3 — Search / route -----------------
 elif st.session_state.step == 3:
     if not st.session_state.active_nodes:
-        st.warning("Go to Step 1 to add active nodes.")
+        st.warning("Allocate nodes first in Step 1.")
     else:
-        ctr = st.columns([1.2, 1.1, 1, 1.2, 6])
+        ctr = st.columns([1.4, 1.1, 1, 1.2, 6])
         with ctr[0]:
             start_node = st.selectbox("Start node", options=st.session_state.active_nodes, index=0, key="start_node")
         with ctr[1]:
@@ -516,7 +557,7 @@ elif st.session_state.step == 3:
         left, right = st.columns([0.56, 0.44])
         with left:
             # keep fingers shown from Step 2 for continuity
-            selected = st.session_state.selected
+            selected = st.session_state.selected if st.session_state.selected in st.session_state.active_nodes else st.session_state.active_nodes[0]
             fingers_shown = build_finger_table(selected, st.session_state.active_nodes, M)[:st.session_state.k]
             current_start = fingers_shown[-1].start if st.session_state.k > 0 else None
             fig = ring_figure(
@@ -524,15 +565,15 @@ elif st.session_state.step == 3:
                 fingers=fingers_shown, highlight_start=current_start, show_radial=True,
                 route_path=route_path, route_hops_to_show=route_hops_to_show, route_texts=route_texts,
                 key=st.session_state.key_id,
-                width=680, height=680,
-                projector=projector, colorblind=colorblind, show_sectors=show_sectors
+                width=760, height=760,
+                projector=projector, colorblind=colorblind,
+                show_sectors=True, multicolor_sectors=multicolor_sectors
             )
             st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG)
 
         with right:
             st.markdown("### Step 3 — Search / Find the route")
-            st.markdown('<div class="hint">Use <b>Start lookup</b>, then click <b>Next hop</b> to step through the route. Hover a hop line for the interval equation.</div>',
-                        unsafe_allow_html=True)
+            st.markdown('<div class="hint">Use <b>Start lookup</b>, then click <b>Next hop</b> to step through the route. Hover hop lines to see the interval rule used.</div>', unsafe_allow_html=True)
             m1, m2, m3 = st.columns(3)
             m1.metric("Start node", start_node)
             m2.metric("Key k", st.session_state.key_id)
