@@ -1,645 +1,279 @@
-# app_chord_tutor_pro_v3.py
-# Chord DHT – Step-by-step Tutor (improved UX, reliable clicks, faster lookups)
 
-import math, time, json
+import json
+import math
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from functools import lru_cache
-from bisect import bisect_left
-
+from typing import List, Dict, Tuple
 import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from streamlit_plotly_events import plotly_events
 
-# ───────────────────────────── Streamlit & Plotly config ─────────────────────────────
-st.set_page_config(page_title="Chord DHT • Pro Tutor", layout="wide", initial_sidebar_state="collapsed")
-PLOTLY_CONFIG = {
-    "displaylogo": False,
-    "modeBarButtonsToRemove": [
-        "zoom2d","pan2d","select2d","lasso2d","zoomIn2d","zoomOut2d",
-        "autoScale2d","resetScale2d","toggleSpikelines"
-    ],
-    "toImageButtonOptions": {"format":"png","filename":"chord_ring","height":900,"width":900,"scale":2},
-}
+# ---------------------- App Config ----------------------
+st.set_page_config(page_title="Semantic Communication Demo (ENSURE‑6G)", layout="wide")
+st.title("Semantic Communication for Next‑Generation Networks — ENSURE‑6G")
+st.caption("Realistic winter rail scenario: Sundsvall ↔ Stockholm • Transmit meaning, not raw sensor floods")
 
-# ───────────────────────────── Constants & palettes ─────────────────────────────
-M = 5                           # keyspace bits
-SPACE = 2 ** M                  # 32 ids (0..31)
-ALL_POSITIONS = list(range(SPACE))
+# ---------------------- Domain Defaults ----------------------
+FS_ACCEL = 200           # Hz (bogie tri‑ax accelerometer)
+FS_FORCE = 500           # Hz (pantograph contact force)
+FS_TEMP  = 1             # Hz (bearing / ambient)
+FS_GNSS  = 1             # Hz
 
-SIZES = {
-    "disabled": 18, "active": 20, "succ": 22, "selected": 24, "diamond": 18
-}
+BITS_PER_SAMPLE = 16     # assume 16‑bit raw for numeric sensors
 
-PALETTE_NORMAL = {
-    "ring": "#334155", "disabled": "#9ca3af", "active": "#1f77b4", "allocated": "#22c55e",
-    "selected": "#d62728", "succ": "#ff7f0e", "start": "#9467bd", "radial": "#6b7280",
-    "hop": "#111827", "sector": "#3b82f6"
-}
-PALETTE_CBLIND = {
-    "ring": "#3B3B3B", "disabled": "#9c9c9c", "active": "#0072B2", "allocated": "#009E73",
-    "selected": "#D55E00", "succ": "#CC79A7", "start": "#9467bd", "radial": "#6b7280",
-    "hop": "#2b2b2b", "sector": "#56B4E9"
-}
-SECTOR_COLORS_A = ["#4E79A7","#F28E2B","#E15759","#76B7B2","#59A14F",
-                   "#EDC948","#B07AA1","#FF9DA7","#9C755F","#BAB0AC"]
-SECTOR_COLORS_B = ["#0072B2","#009E73","#E69F00","#56B4E9","#F0E442",
-                   "#D55E00","#CC79A7","#999999","#009E73","#0072B2"]
+ROUTE_SECTIONS = [
+    ("Sundsvall", "Hudiksvall", 120),
+    ("Hudiksvall", "Söderhamn", 50),
+    ("Söderhamn", "Gävle", 75),
+    ("Gävle", "Uppsala", 100),
+    ("Uppsala", "Stockholm", 70),
+]
 
-def COLORS():   return PALETTE_CBLIND if st.session_state.color_blind else PALETTE_NORMAL
-def SPAL():     return SECTOR_COLORS_B if st.session_state.color_blind else SECTOR_COLORS_A
+# ---------------------- Controls ----------------------
+with st.sidebar:
+    st.header("Simulation Controls")
+    duration_min = st.slider("Trip duration to simulate (minutes)", 10, 60, 20, step=5)
+    accel_hz = st.slider("Bogie accelerometer rate (Hz)", 100, 400, FS_ACCEL, step=50)
+    force_hz = st.slider("Pantograph force rate (Hz)", 200, 800, FS_FORCE, step=100)
+    temp_hz  = st.slider("Bearing temp rate (Hz)", 1, 5, FS_TEMP, step=1)
+    gnss_hz  = st.slider("GNSS rate (Hz)", 1, 5, FS_GNSS, step=1)
 
-# ───────────────────────────── Geometry & helpers ─────────────────────────────
-def sha1_mod(s: str, space: int) -> int:
-    import hashlib
-    return int(hashlib.sha1(s.encode("utf-8")).hexdigest(), 16) % space
+    st.markdown("---")
+    st.subheader("Winter Conditions")
+    outside_temp = st.slider("Ambient temperature (°C)", -30, 5, -12)
+    snow_intensity = st.select_slider("Snowfall", options=["none","light","moderate","heavy"], value="moderate")
+    icing_risk = st.select_slider("Icing risk", options=["low","medium","high"], value="high")
 
-def node_xy(i: int, r: float = 1.0) -> Tuple[float,float]:
-    t = 2*math.pi*i/SPACE
-    return r*math.cos(t), r*math.sin(t)
+    st.markdown("---")
+    st.subheader("Connectivity")
+    coverage_profile = st.selectbox("Rural 5G/6G coverage profile", ["Good", "Patchy (realistic)", "Poor"])
+    send_mode = st.radio("Transmit strategy", ["Raw streams", "Semantic events", "Adaptive (prefer Semantic)"], index=2)
 
-def mod_between(a: int, b: int, x: int, m: int, incl_right=False) -> bool:
-    if a == b: return incl_right
-    if a < b: return (a < x <= b) if incl_right else (a < x < b)
-    return ((a < x <= m-1) or (0 <= x <= b)) if incl_right else ((a < x < m) or (0 <= x < b))
+# ---------------------- Helpers ----------------------
+def bits_to_mb(bits: float) -> float:
+    return bits / (8 * 1024 * 1024)
 
-def successor_of(x: int, nodes_sorted: List[int]) -> int:
-    """O(log N) successor with bisect. nodes_sorted must be sorted."""
-    if not nodes_sorted: return x
-    pos = bisect_left(nodes_sorted, x)
-    return nodes_sorted[pos] if pos < len(nodes_sorted) else nodes_sorted[0]
+def section_by_time(t: float, total_s: int) -> str:
+    # map time to route segment name for nice labels
+    cum = 0
+    seg_len = [s[2] for s in ROUTE_SECTIONS]
+    total_len = sum(seg_len)
+    pos = (t / total_s) * total_len
+    c = 0
+    for (a,b,l) in ROUTE_SECTIONS:
+        if pos <= c + l:
+            return f"{a}→{b}"
+        c += l
+    return f"{ROUTE_SECTIONS[-1][0]}→{ROUTE_SECTIONS[-1][1]}"
 
-@dataclass(frozen=True)
-class Finger:
-    i: int
-    start: int
-    node: int
+# coverage mask over time (0..1 fraction of time steps available)
+def build_coverage_mask(n_steps: int, profile: str) -> np.ndarray:
+    rng = np.random.default_rng(42)
+    if profile == "Good":
+        # 90% availability
+        return (rng.random(n_steps) > 0.1).astype(np.uint8)
+    if profile == "Poor":
+        # 40% availability
+        return (rng.random(n_steps) > 0.6).astype(np.uint8)
+    # Patchy: long rural gaps + some micro‑fades
+    mask = np.ones(n_steps, dtype=np.uint8)
+    # long gaps
+    for start in [int(n_steps*0.2), int(n_steps*0.55)]:
+        gap = int(n_steps*0.08)
+        mask[start:start+gap] = 0
+    # microfades
+    for _ in range(int(n_steps*0.05)):
+        idx = rng.integers(0, n_steps)
+        mask[idx] = 0
+    return mask
 
-@lru_cache(maxsize=4096)
-def _build_fingers_cached(n: int, nodes_tuple: Tuple[int, ...], m: int) -> Tuple[Finger, ...]:
-    if not nodes_tuple: return tuple()
-    nodes = list(nodes_tuple)
-    out: List[Finger] = []
-    for i in range(1, m+1):
-        s = (n + 2**(i-1)) % (2**m)
-        out.append(Finger(i=i, start=s, node=successor_of(s, nodes)))
-    return tuple(out)
+@dataclass
+class Event:
+    t: int
+    intent: str
+    slots: Dict[str, object]
 
-def build_fingers(n: int, nodes: List[int], m: int) -> List[Finger]:
-    return list(_build_fingers_cached(n, tuple(nodes), m))
+def simulate(duration_min: int,
+             accel_hz: int, force_hz: int, temp_hz: int, gnss_hz: int,
+             outside_temp: float, snow_intensity: str, icing_risk: str,
+             coverage_profile: str, send_mode: str):
+    total_s = duration_min * 60
+    # --- RAW sizes (bits) if streamed continuously ---
+    accel_samples = total_s * accel_hz * 3  # tri‑ax
+    accel_bits = accel_samples * BITS_PER_SAMPLE
 
-def closest_preceding(n: int, fingers: List[int], target: int, m: int) -> int:
-    for f in reversed(fingers):
-        if f != n and mod_between(n, target, f, 2**m, incl_right=False):
-            return f
-    return n
+    force_samples = total_s * force_hz
+    force_bits = force_samples * BITS_PER_SAMPLE
 
-def chord_route(start: int, key: int, nodes: List[int], m: int, max_steps=64):
-    if not nodes: return [start], [r"\text{No active nodes.}"], ["No active nodes"]
-    path = [start]; latex=[]; texts=[]
-    succ_k = successor_of(key, nodes)
-    fmap: Dict[int,List[int]] = {n:[f.node for f in build_fingers(n, nodes, m)] for n in nodes}
-    while len(path) < max_steps:
-        curr = path[-1]
-        if curr == succ_k:
-            latex.append(rf"\mathbf{{Stop}}:\ {curr}=\operatorname{{succ}}({key})"); texts.append("Arrived.")
-            break
-        idx = nodes.index(curr); curr_succ = nodes[(idx+1) % len(nodes)]
-        if mod_between(curr, curr_succ, key, 2**m, incl_right=True):
-            latex.append(rf"{key}\in({curr},{curr_succ}] \Rightarrow \text{{next}}=\operatorname{{succ}}({curr})={curr_succ}")
-            texts.append(f"{key} in ({curr},{curr_succ}] ⇒ next = succ({curr}) = {curr_succ}")
-            path.append(curr_succ)
-            if curr_succ == succ_k: latex.append(rf"\mathbf{{Arrived}}\ \operatorname{{succ}}({key})={succ_k}")
-            continue
-        cpf = closest_preceding(curr, fmap[curr], key, m)
-        if cpf == curr:
-            latex.append(rf"\text{{No finger in }}({curr},{key}) \Rightarrow \text{{use succ}}({curr})={curr_succ}")
-            texts.append(f"No finger in ({curr},{key}) ⇒ succ({curr}) = {curr_succ}")
-            path.append(curr_succ)
+    temp_samples = total_s * temp_hz * 4  # suppose 4 bearings
+    temp_bits = temp_samples * BITS_PER_SAMPLE
+
+    gnss_samples = total_s * gnss_hz
+    # assume ~50 bytes per NMEA → 400 bits/sample
+    gnss_bits = gnss_samples * 400
+
+    raw_bits_total = accel_bits + force_bits + temp_bits + gnss_bits
+
+    # --- Event generation rates (semantic) ---
+    # Use winter settings to modulate expected anomalies
+    snow_factor = {"none":0.2,"light":0.5,"moderate":1.0,"heavy":1.5}[snow_intensity]
+    icing_factor = {"low":0.5,"medium":1.0,"high":1.5}[icing_risk]
+
+    # Expected counts over whole trip
+    ride_events = max(1, int(2 * snow_factor))           # ride_degradation events
+    adhesion_events = max(1, int(2 * snow_factor))       # low_adhesion_event
+    panto_events = int(1 * icing_factor)                 # pantograph_ice
+    bearing_events = 1 if outside_temp < -10 else 0      # bearing_overtemp (rare, still possible)
+    delay_events = 1                                     # delay_alert at a major station
+
+    rng = np.random.default_rng(0)
+    ev_times = np.clip(rng.integers(60, total_s-60, size=(ride_events+adhesion_events+panto_events+bearing_events+delay_events)), 0, total_s-1)
+    ev_times.sort()
+
+    events: List[Event] = []
+    for i, t in enumerate(ev_times):
+        seg = section_by_time(t, total_s)
+        if i < ride_events:
+            events.append(Event(t, "ride_degradation",
+                                {"segment": seg, "severity": rng.choice(["low","medium","high"], p=[0.4,0.5,0.1]),
+                                 "rms": round(float(rng.uniform(0.3, 0.8)), 2), "dwell_s": int(rng.integers(120, 420))}))
+        elif i < ride_events + adhesion_events:
+            km = round(float(rng.uniform(100, 300)), 1)
+            events.append(Event(t, "low_adhesion_event",
+                                {"km": km, "slip_ratio": round(float(rng.uniform(0.15, 0.35)), 2),
+                                 "duration_s": int(rng.integers(60, 180))}))
+        elif i < ride_events + adhesion_events + panto_events:
+            events.append(Event(t, "pantograph_ice",
+                                {"varN": int(rng.integers(60, 140)), "temp_c": outside_temp}))
+        elif i < ride_events + adhesion_events + panto_events + bearing_events:
+            axle = rng.choice(["1L","1R","2L","2R"])
+            events.append(Event(t, "bearing_overtemp",
+                                {"axle": axle, "peak_c": round(float(rng.uniform(80, 90)), 1), "dwell_s": int(rng.integers(180, 420))}))
         else:
-            latex.append(rf"\text{{Closest preceding finger of }}{curr}\ \text{{toward }}{key}: {cpf}\in({curr},{key})")
-            texts.append(f"Closest preceding finger toward {key}: {cpf} ∈ ({curr},{key})")
-            path.append(cpf)
-        if path[-1] == succ_k:
-            latex.append(rf"\mathbf{{Arrived}}\ \operatorname{{succ}}({key})={succ_k}")
-            break
-    return path, latex, texts
+            # delay at Gävle
+            events.append(Event(t, "delay_alert",
+                                {"station": "Gävle", "delay_min": int(rng.integers(3, 10))}))
 
-def add_sector(fig, a, b, color, alpha=0.10, steps=40):
-    """Sector polygons that do NOT capture hover/click (so node clicks pass through)."""
-    if a == b: return
-    start = a/SPACE*2*math.pi; end = b/SPACE*2*math.pi
-    th = np.linspace(start, end, steps) if a < b else np.concatenate([
-        np.linspace(start, 2*math.pi, steps//2), np.linspace(0, end, steps-steps//2)
-    ])
-    R1, R2 = 1.05, 0.88
-    xs = np.cos(th)*R1; ys = np.sin(th)*R1
-    xs2 = np.cos(th[::-1])*R2; ys2 = np.sin(th[::-1])*R2
-    fig.add_trace(go.Scatter(
-        x=np.r_[xs,xs2], y=np.r_[ys,ys2], fill="toself", mode="none",
-        fillcolor=color, opacity=alpha, hoverinfo="skip", showlegend=False
-    ))
+    # --- Calculate transmitted bytes under different strategies ---
+    coverage = build_coverage_mask(total_s, coverage_profile)
+    sent_bits_time = np.zeros(total_s, dtype=np.int64)
+    dropped_events = 0
+    delivered_events = 0
 
-# ───────────────────────────── URL state (new Streamlit API) ─────────────────────────────
-def read_state_from_url():
-    qp = dict(st.query_params)
-    if not qp: return
-    ss = st.session_state
-    try:
-        if "nodes" in qp and qp["nodes"]:
-            ss.active_nodes = sorted(set(int(x) % SPACE for x in json.loads(qp["nodes"])))
-        if "sel" in qp and qp["sel"] != "":
-            ss.selected = int(qp["sel"])
-        if "k" in qp and qp["k"] != "":
-            ss.key_id = int(qp["k"])
-        if "step" in qp and qp["step"] != "":
-            ss.step = int(qp["step"])
-    except Exception:
-        pass
+    # Raw: assume we try to stream continuously, but when coverage=0 nothing goes through.
+    if send_mode in ["Raw streams", "Adaptive (prefer Semantic)"]:
+        per_sec_bits_raw = int(raw_bits_total // total_s)
+        for t in range(total_s):
+            if coverage[t] == 1:
+                sent_bits_time[t] += per_sec_bits_raw
+        raw_bits_delivered = int(sent_bits_time.sum())
+    else:
+        raw_bits_delivered = 0
 
-def write_state_to_url():
-    st.query_params = {
-        "nodes": json.dumps(st.session_state.active_nodes),
-        "sel": "" if st.session_state.selected is None else str(st.session_state.selected),
-        "k": str(st.session_state.key_id),
-        "step": str(st.session_state.step),
+    # Semantic: send compact JSON (~120–180 bytes/event). We model 150 bytes avg.
+    avg_pkt_bytes = 150
+    for ev in events:
+        pkt_bits = avg_pkt_bytes * 8
+        if coverage[ev.t] == 1:
+            # Sent successfully
+            delivered_events += 1
+            sent_bits_time[ev.t] += pkt_bits if send_mode != "Raw streams" else 0
+        else:
+            dropped_events += 1
+
+    # Adaptive: if coverage is poor, prioritize semantics and skip raw
+    if send_mode == "Adaptive (prefer Semantic)":
+        # Already accounted semantic; now reduce raw during low coverage windows
+        # Reduce raw by 70% during any second where coverage==1 but previous/next show gaps (edge of holes)
+        for t in range(total_s):
+            if coverage[t] == 1 and ((t>0 and coverage[t-1]==0) or (t<total_s-1 and coverage[t+1]==0)):
+                reduction = int(0.7 * (raw_bits_total // total_s))
+                sent_bits_time[t] = max(0, sent_bits_time[t] - reduction)
+        raw_bits_delivered = int(sent_bits_time.sum() - delivered_events * avg_pkt_bytes * 8)
+
+    # Final tallies
+    total_bits_sent = int(sent_bits_time.sum())
+    theoretical_raw_bits = int(raw_bits_total)  # what raw would be with perfect coverage
+
+    return {
+        "events": events,
+        "coverage": coverage,
+        "per_sec_bits": sent_bits_time,
+        "raw_bits_delivered": raw_bits_delivered,
+        "total_bits_sent": total_bits_sent,
+        "theoretical_raw_bits": theoretical_raw_bits,
+        "delivered_events": delivered_events,
+        "dropped_events": dropped_events,
+        "total_seconds": total_s
     }
 
-# ───────────────────────────── State init ─────────────────────────────
-def init_state():
-    ss = st.session_state
-    ss.setdefault("mode", "Student")
-    ss.setdefault("step", 1)
-    ss.setdefault("auto_advance", True)
-    ss.setdefault("color_blind", False)
+# ---------------------- Run Simulation ----------------------
+res = simulate(duration_min, accel_hz, force_hz, temp_hz, gnss_hz,
+               outside_temp, snow_intensity, icing_risk,
+               coverage_profile, send_mode)
 
-    ss.setdefault("active_nodes", [])
-    ss.setdefault("allocated_nodes", [])
-    ss.setdefault("selected", None)
-    ss.setdefault("fingers_revealed", 0)
+# ---------------------- UI: Metrics ----------------------
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Trip duration (min)", duration_min)
+with c2:
+    st.metric("Theoretical RAW size (MB)", f"{(res['theoretical_raw_bits']/(8*1024*1024)):.2f}")
+with c3:
+    st.metric("Actual sent (MB)", f"{(res['total_bits_sent']/(8*1024*1024)):.2f}")
+with c4:
+    savings = 1.0 - (res["total_bits_sent"] / max(res["theoretical_raw_bits"], 1))
+    st.metric("Bandwidth saved vs RAW", f"{100*savings:.1f}%")
 
-    ss.setdefault("key_id", 26)
-    ss.setdefault("route_path", [])
-    ss.setdefault("route_reasons", [])
-    ss.setdefault("route_texts", [])
-    ss.setdefault("route_idx", 0)
-    ss.setdefault("route_play", False)
-    ss.setdefault("last_tick", 0.0)
+c5, c6 = st.columns(2)
+with c5:
+    st.metric("Semantic events delivered", res["delivered_events"])
+with c6:
+    st.metric("Semantic events dropped (no coverage)", res["dropped_events"])
 
-    # one-time tips
-    ss.setdefault("tour_seen_step1", False)
-    ss.setdefault("tour_seen_step2", False)
-    ss.setdefault("tour_seen_step3", False)
+# ---------------------- Plots ----------------------
+st.subheader("Per‑second transmitted data & coverage")
+import pandas as pd
+df = pd.DataFrame({
+    "second": np.arange(res["total_seconds"]),
+    "bits_sent": res["per_sec_bits"],
+    "coverage": res["coverage"]
+})
+st.line_chart(df[["bits_sent"]])
+st.area_chart(df[["coverage"]])
 
-    # quick-check values
-    ss.setdefault("quiz1_k", 7)
-    ss.setdefault("quiz2_i", 4)
-
-    read_state_from_url()
-init_state()
-
-# ───────────────────────────── Figure builder ─────────────────────────────
-def ring_figure(
-    active: List[int],
-    selected: Optional[int] = None,
-    fingers: Optional[List[Finger]] = None,
-    show_start: Optional[int] = None,
-    show_radial: bool = False,
-    route_path: Optional[List[int]] = None,
-    route_hops: int = 0,
-    route_texts: Optional[List[str]] = None,
-    key: Optional[int] = None,
-    show_sectors: bool = False,
-    allocated_nodes: Optional[List[int]] = None,
-):
-    C = COLORS()
-    fig = go.Figure()
-
-    # Single ring
-    ang = np.linspace(0, 2*np.pi, 361)
-    fig.add_trace(go.Scatter(x=np.cos(ang), y=np.sin(ang), mode="lines",
-                             line=dict(color=C["ring"], width=2.2),
-                             hoverinfo="skip", name="Ring"))
-
-    # Sectors (skip hover/click)
-    if show_sectors and active:
-        sp = SPAL()
-        for idx, nid in enumerate(active):
-            add_sector(fig, active[idx-1], nid, sp[idx % len(sp)], alpha=0.10)
-
-    # Disabled nodes (clickable)
-    disabled = [i for i in ALL_POSITIONS if i not in set(active)]
-    if disabled:
-        xs, ys = zip(*[node_xy(i) for i in disabled])
-        fig.add_trace(go.Scatter(
-            x=xs, y=ys, mode="markers+text",
-            text=[str(i) for i in disabled], textposition="top center",
-            marker=dict(size=SIZES["disabled"], symbol="circle-open",
-                        color=C["disabled"], line=dict(width=1.6, color=C["disabled"])),
-            name="Disabled", opacity=0.85, hoverinfo="text",
-            customdata=[{"id": i, "kind": "disabled"} for i in disabled]
-        ))
-
-    # Active nodes (clickable)
-    succ_k = successor_of(key, active) if (key is not None and active) else None
-    if active:
-        xs, ys = zip(*[node_xy(i) for i in active])
-        sizes, colors, labels, cds = [], [], [], []
-        allocated_set = set(allocated_nodes or [])
-        for nid in active:
-            if selected == nid:
-                sizes.append(SIZES["selected"]); colors.append(C["selected"]); labels.append(f"{nid} (selected)")
-            elif succ_k == nid:
-                sizes.append(SIZES["succ"]); colors.append(C["succ"]); labels.append(f"{nid} (succ(key))")
-            elif allocated_set and nid in allocated_set:
-                sizes.append(SIZES["active"]); colors.append(C["allocated"]); labels.append(f"{nid} (just allocated)")
-            else:
-                sizes.append(SIZES["active"]); colors.append(C["active"]); labels.append(str(nid))
-            cds.append({"id": nid, "kind": "active"})
-        fig.add_trace(go.Scatter(
-            x=xs, y=ys, mode="markers+text",
-            text=[str(n) for n in active], textposition="top center",
-            hovertext=labels, hoverinfo="text",
-            marker=dict(size=sizes, color=colors, line=dict(width=1.6, color="white")),
-            name="Active", customdata=cds
-        ))
-
-    # Fingers (only latest shows tooltip)
-    if selected is not None and fingers:
-        sx, sy = node_xy(selected)
-        for j, f in enumerate(fingers):
-            tx, ty = node_xy(f.node)
-            is_last = (j == len(fingers) - 1)
-            fig.add_trace(go.Scatter(
-                x=[sx, tx], y=[sy, ty], mode="lines",
-                line=dict(width=4 if is_last else 3, dash="dot", color=C["active"]),
-                hoverinfo="text" if is_last else "skip",
-                hovertext=f"start[{f.i}]={f.start} → succ={f.node}" if is_last else None,
-                showlegend=False
-            ))
-
-    # Highlight current start[i]
-    if show_start is not None and selected is not None:
-        hx, hy = node_xy(show_start)
-        fig.add_trace(go.Scatter(
-            x=[hx], y=[hy], mode="markers+text",
-            text=[f"start={show_start}"], textposition="bottom center",
-            marker=dict(size=SIZES["diamond"], symbol="diamond",
-                        line=dict(width=1.2, color="black"), color=C["start"]),
-            showlegend=False
-        ))
-        if show_radial:
-            sx, sy = node_xy(selected)
-            fig.add_trace(go.Scatter(
-                x=[sx, hx], y=[sy, hy], mode="lines",
-                line=dict(width=1.5, dash="dash", color=C["radial"]),
-                showlegend=False
-            ))
-
-    # Route (draw partial up to route_hops)
-    if route_path and route_hops > 0:
-        for i in range(min(route_hops, len(route_path)-1)):
-            a, b = route_path[i], route_path[i+1]
-            ax, ay = node_xy(a); bx, by = node_xy(b)
-            tip = route_texts[i] if (route_texts and i < len(route_texts)) else f"{a} → {b}"
-            fig.add_trace(go.Scatter(
-                x=[ax,bx], y=[ay,by], mode="lines+markers",
-                line=dict(width=4, color=C["hop"]), marker=dict(size=8, color=C["hop"]),
-                hovertext=tip, hoverinfo="text", showlegend=False
-            ))
-            fig.add_annotation(x=bx, y=by, ax=ax, ay=ay, xref="x", yref="y", axref="x", ayref="y",
-                               showarrow=True, arrowhead=3, arrowsize=1.05, arrowwidth=2, arrowcolor=C["hop"])
-
-    fig.update_layout(
-        width=780, height=780, plot_bgcolor="white",
-        xaxis=dict(visible=False), yaxis=dict(visible=False),
-        margin=dict(l=8,r=8,t=30,b=8), title="Chord • Ring 0..31",
-        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="center", x=0.5, font=dict(size=11)),
-        hovermode="closest",          # avoid stacked hover
-        clickmode="event+select"      # help plotly_events
-    )
-    fig.update_yaxes(scaleanchor="x", scaleratio=1)
-    fig.update_layout(hoverlabel=dict(font_size=11, bgcolor="rgba(255,255,255,0.95)"))
-    return fig
-
-# ───────────────────────────── Small UI helpers ─────────────────────────────
-def pills_path(path: List[int], current_idx: int):
-    if not path: st.write("—"); return
-    items = []
-    for i, v in enumerate(path):
-        style = "font-weight:700;" if i <= current_idx else ""
-        items.append(f"""<span style="border:1px solid #e2e8f0;border-radius:999px;padding:4px 10px;margin-right:6px;{style}">{v}</span>""")
-        if i < len(path)-1: items.append("→")
-    st.markdown("".join(items), unsafe_allow_html=True)
-
-def preset_row():
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        if st.button("Example fig (9 nodes)", help="1,4,9,11,14,18,20,21,28"):
-            ids = [1,4,9,11,14,18,20,21,28]
-            st.session_state.active_nodes = ids
-            st.session_state.selected = ids[0]
-            st.session_state.fingers_revealed = 0
-    with c2:
-        if st.button("Sparse (6 random)"):
-            ids = sorted(np.random.choice(ALL_POSITIONS, 6, replace=False).tolist())
-            st.session_state.active_nodes = ids
-            st.session_state.selected = ids[0]
-            st.session_state.fingers_revealed = 0
-    with c3:
-        if st.button("Clustered"):
-            base = np.random.randint(0, SPACE)
-            ids = sorted({base, (base+1)%SPACE, (base+2)%SPACE, (base+5)%SPACE, (base+6)%SPACE, (base+10)%SPACE})
-            st.session_state.active_nodes = ids
-            st.session_state.selected = ids[0]
-            st.session_state.fingers_revealed = 0
-    with c4:
-        if st.button("Random 12"):
-            ids = sorted(np.random.choice(ALL_POSITIONS, 12, replace=False).tolist())
-            st.session_state.active_nodes = ids
-            st.session_state.selected = ids[0]
-            st.session_state.fingers_revealed = 0
-
-# ───────────────────────────── Header & stepper ─────────────────────────────
-topL, topR = st.columns([0.7, 0.3])
-with topL:
-    st.title("🔗 Chord DHT — Pro Tutor")
-    st.caption("Step 1: Allocate → Step 2: Build finger table → Step 3: Search/route")
-with topR:
-    st.session_state.mode = st.selectbox("Mode", ["Student","Explainer"],
-                                         index=0 if st.session_state.mode=="Student" else 1)
-    st.session_state.color_blind = st.toggle("Color-blind palette", value=st.session_state.color_blind)
-
-labels = ["① Allocate", "② Fingers", "③ Search"]
-sel = st.radio("Steps", labels, index=st.session_state.step-1, horizontal=True, label_visibility="collapsed")
-st.session_state.step = labels.index(sel) + 1
-st.session_state.auto_advance = st.toggle("Auto-advance after Allocate", value=st.session_state.auto_advance)
-
-# ───────────────────────────── STEP 1 ─────────────────────────────
-if st.session_state.step == 1:
-    left, right = st.columns([0.60, 0.40], gap="large")
-
-    with right:
-        st.markdown("### Step 1 — Allocate nodes")
-        if not st.session_state.tour_seen_step1:
-            st.info("① Paste labels → ② Click **Allocate** (IDs = SHA1(label) mod 32) → ③ Use **Presets** to try patterns.", icon="🎓")
-            if st.button("Got it"):
-                st.session_state.tour_seen_step1 = True
-
-        preset_row()
-        labels_box = st.text_area("Node labels", value="nodeA\nnodeB\nnodeC\nnodeD", height=120)
-
-        r1, r2, r3 = st.columns(3)
-        allocated_now = False
-        with r1:
-            if st.button("Allocate"):
-                labs = [s.strip() for s in labels_box.splitlines() if s.strip()]
-                ids = sorted(set(sha1_mod(x, SPACE) for x in labs))
-                st.session_state.active_nodes = ids
-                st.session_state.allocated_nodes = ids[:]
-                st.session_state.selected = ids[0] if ids else None
-                st.session_state.fingers_revealed = 0
-                allocated_now = True
-        with r2:
-            if st.button("Clear"):
-                st.session_state.active_nodes = []; st.session_state.allocated_nodes = []
-                st.session_state.selected = None; st.session_state.fingers_revealed = 0
-        with r3:
-            if st.button("Proceed ▸ Step 2"):
-                st.session_state.step = 2; write_state_to_url(); st.rerun()
-
-        manual = st.text_input("Manual IDs (optional, e.g. 1,4,9,11)")
-        if st.button("Use manual IDs"):
-            try:
-                ids = sorted(set(int(x) % SPACE for x in manual.replace(",", " ").split() if x.strip()!=""))
-                st.session_state.active_nodes = ids
-                st.session_state.allocated_nodes = ids[:]
-                st.session_state.selected = ids[0] if ids else None
-                st.session_state.fingers_revealed = 0
-                allocated_now = True
-            except ValueError:
-                st.warning("Manual IDs must be integers 0–31.")
-
-        if st.session_state.active_nodes:
-            st.write("**Active IDs:**")
-            st.markdown('<div class="chips">'+" ".join(f"<span>{n}</span>" for n in st.session_state.active_nodes)+"</div>", unsafe_allow_html=True)
-
-        st.markdown("**Hash equation**"); st.latex(r"\text{node\_id} = \operatorname{SHA1}(\text{label}) \bmod 32")
-
-        with st.expander("Quick check: which node stores key k?"):
-            k = st.number_input("Choose key k", 0, 31, value=st.session_state.quiz1_k)
-            st.session_state.quiz1_k = k
-            if st.session_state.active_nodes:
-                owner = successor_of(k, st.session_state.active_nodes)
-                st.write(f"**Answer:** successor({k}) = **{owner}**")
-            else:
-                st.caption("Allocate or load a preset to try this.")
-
-        if allocated_now and st.session_state.auto_advance and st.session_state.active_nodes:
-            st.session_state.step = 2; write_state_to_url(); st.rerun()
-
-    with left:
-        fig = ring_figure(
-            active=st.session_state.active_nodes,
-            selected=st.session_state.selected,
-            allocated_nodes=st.session_state.allocated_nodes,
-            show_sectors=False
-        )
-        st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="fig_step1")
-
-# ───────────────────────────── STEP 2 ─────────────────────────────
-elif st.session_state.step == 2:
-    if st.session_state.allocated_nodes: st.session_state.allocated_nodes = []
-    left, right = st.columns([0.60, 0.40], gap="large")
-
-    with right:
-        st.markdown("### Step 2 — Finger table")
-        if not st.session_state.tour_seen_step2:
-            st.info("Click a **grey** ID to **join** (blue + selected red). Click a **blue** ID to **select**. Enable removal to click blue and remove.", icon="🖱️")
-            if st.button("Got it  ✓"):
-                st.session_state.tour_seen_step2 = True
-
-        if not st.session_state.active_nodes:
-            st.info("Load a preset or allocate labels first.")
-        else:
-            st.session_state.selected = st.selectbox(
-                "Node n", st.session_state.active_nodes,
-                index=0 if (st.session_state.selected not in st.session_state.active_nodes or st.session_state.selected is None)
-                else st.session_state.active_nodes.index(st.session_state.selected)
-            )
-            st.session_state.allow_remove_click = st.toggle("Allow remove on click (active → disabled)", value=False)
-
-            f_all = build_fingers(st.session_state.selected, st.session_state.active_nodes, M)
-            k = st.session_state.fingers_revealed
-            f_show = f_all[:k]
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if st.button("Reveal next"):
-                    st.session_state.fingers_revealed = min(M, k+1)
-            with c2:
-                if st.button("Reveal all"):
-                    st.session_state.fingers_revealed = M
-            with c3:
-                if st.button("Proceed ▸ Step 3"):
-                    st.session_state.step = 3; write_state_to_url(); st.rerun()
-
-            df = pd.DataFrame([{"i": f.i, "start": f.start, "successor": f.node} for f in f_show],
-                              columns=["i","start","successor"])
-            st.dataframe(df, hide_index=True, height=240, use_container_width=True, key="ft_table")
-
-            if k > 0:
-                fe = f_show[-1]
-                st.markdown("**Current entry**")
-                st.latex(rf"n={st.session_state.selected}")
-                st.latex(rf"\text{{start}}[{fe.i}] = (n + 2^{{{fe.i-1}}}) \bmod 32 = {fe.start}")
-                st.latex(rf"\text{{finger}}[{fe.i}] = \operatorname{{succ}}({fe.start}) = {fe.node}")
-            else:
-                st.caption("Click **Reveal next** to build the table.")
-
-            with st.expander("Self-check: compute start[i] for this n"):
-                n = st.session_state.selected if st.session_state.selected is not None else 0
-                i_val = st.number_input("i (1..5)", 1, 5, value=st.session_state.quiz2_i)
-                st.session_state.quiz2_i = i_val
-                calc = (n + 2**(i_val-1)) % 32
-                succ = successor_of(calc, st.session_state.active_nodes) if st.session_state.active_nodes else None
-                st.latex(rf"\text{{start}}[{i_val}] = (n + 2^{{{i_val-1}}}) \bmod 32 = {calc}")
-                if succ is not None: st.latex(rf"\text{{finger}}[{i_val}] = \operatorname{{succ}}({calc}) = {succ}")
-
-    with left:
-        if not st.session_state.active_nodes:
-            fig = ring_figure(active=[], show_sectors=False)
-            st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="fig_step2_empty")
-        else:
-            f_all = build_fingers(st.session_state.selected, st.session_state.active_nodes, M)
-            k = st.session_state.fingers_revealed
-            fig = ring_figure(
-                active=st.session_state.active_nodes,
-                selected=st.session_state.selected,
-                fingers=f_all[:k],
-                show_start=(f_all[k-1].start if k>0 else None),
-                show_radial=True,
-                show_sectors=True
-            )
-            clicked = plotly_events(
-                fig, click_event=True, select_event=False,
-                override_width=780, override_height=780, key="fig_step2_click"
-            )
-            if clicked:
-                meta = clicked[0].get("customdata")
-                if isinstance(meta, dict) and "id" in meta and "kind" in meta:
-                    nid, kind = int(meta["id"]), meta["kind"]
-                    nodes = set(st.session_state.active_nodes)
-                    if kind == "disabled":
-                        nodes.add(nid); st.session_state.active_nodes = sorted(nodes)
-                        st.session_state.selected = nid; st.rerun()
-                    elif kind == "active":
-                        if st.session_state.allow_remove_click:
-                            if len(nodes) > 1:
-                                nodes.remove(nid); st.session_state.active_nodes = sorted(nodes)
-                                if st.session_state.selected not in nodes:
-                                    st.session_state.selected = st.session_state.active_nodes[0]
-                                st.rerun()
-                            else:
-                                st.warning("Cannot remove the last active node.")
-                        else:
-                            st.session_state.selected = nid; st.rerun()
-
-# ───────────────────────────── STEP 3 ─────────────────────────────
+# ---------------------- Event Log (Semantic) ----------------------
+st.subheader("Semantic Events (what the command center sees)")
+if res["events"]:
+    rows = []
+    for ev in res["events"]:
+        status = "delivered" if res["coverage"][ev.t]==1 and send_mode!="Raw streams" else ("dropped (no coverage)" if send_mode!="Raw streams" else "not sent (raw mode)")
+        rows.append({
+            "t (s)": ev.t,
+            "segment": section_by_time(ev.t, res["total_seconds"]),
+            "intent": ev.intent,
+            "slots": json.dumps(ev.slots),
+            "status": status
+        })
+    st.dataframe(pd.DataFrame(rows))
 else:
-    left, right = st.columns([0.60, 0.40], gap="large")
-    if not st.session_state.tour_seen_step3:
-        st.info("Press **Route** then use **Play** or **Next hop**. Click the **path pills** to jump to any hop.", icon="🎯")
-        if st.button("Got it ✓"):
-            st.session_state.tour_seen_step3 = True
+    st.info("No semantic events occurred in this run. Adjust winter conditions to increase events.")
 
-    with right:
-        st.markdown("### Step 3 — Search / Route")
-        if not st.session_state.active_nodes:
-            st.info("Load a preset or allocate labels first (Step 1).")
-        else:
-            start = st.selectbox("Start node", st.session_state.active_nodes, index=0, key="start_node_select")
-            k = st.number_input("Key k (0–31)", 0, 31, value=st.session_state.key_id)
-            st.session_state.key_id = k
+# ---------------------- Bytes Accounting (by sensor class) ----------------------
+st.subheader("Raw vs Semantic: back‑of‑envelope accounting")
+sensor_rows = [
+    {"Sensor": "Bogie accel (3‑axis)", "Rate": f"{accel_hz} Hz", "Raw MB (trip)": f"{bits_to_mb(res['total_seconds']*accel_hz*3*BITS_PER_SAMPLE):.2f}",
+     "Semantic": "ride_degradation (~0.15 KB/event)", "Notes": "Only when abnormal; dwell+severity slots"},
+    {"Sensor": "Pantograph force", "Rate": f"{force_hz} Hz", "Raw MB (trip)": f"{bits_to_mb(res['total_seconds']*force_hz*BITS_PER_SAMPLE):.2f}",
+     "Semantic": "pantograph_ice (~0.15 KB/event)", "Notes": "Force variance + ambient temp"},
+    {"Sensor": "Bearing temperature x4", "Rate": f"{temp_hz} Hz", "Raw MB (trip)": f"{bits_to_mb(res['total_seconds']*temp_hz*4*BITS_PER_SAMPLE):.2f}",
+     "Semantic": "bearing_overtemp (~0.12 KB/event)", "Notes": "PeakC + dwell"},
+    {"Sensor": "GNSS", "Rate": f"{gnss_hz} Hz", "Raw MB (trip)": f"{(res['total_seconds']*gnss_hz*400/(8*1024*1024)):.2f}",
+     "Semantic": "delay_alert / position_conf_low (~0.12–0.18 KB/event)", "Notes": "Station‑level or confidence events"},
+]
+st.table(pd.DataFrame(sensor_rows))
 
-            b1, b2, b3 = st.columns(3)
-            with b1:
-                if st.button("Route"):
-                    path, reasons, texts = chord_route(start, k, st.session_state.active_nodes, M)
-                    st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons, texts
-                    st.session_state.route_idx = 0
-                    st.session_state.route_play = False
-            with b2:
-                if st.button("Next hop"):
-                    if st.session_state.route_path:
-                        st.session_state.route_idx = min(len(st.session_state.route_path)-1, st.session_state.route_idx+1)
-            with b3:
-                if st.session_state.route_play:
-                    if st.button("⏸ Pause"): st.session_state.route_play = False
-                else:
-                    if st.button("▶ Play"): st.session_state.route_play = True
+# ---------------------- Download: sample semantic trace ----------------------
+sample = [{"t": ev.t, "intent": ev.intent, "slots": ev.slots} for ev in res["events"] if res["coverage"][ev.t]==1 and send_mode!="Raw streams"]
+st.download_button("Download delivered semantic events (JSON)", data=json.dumps(sample, indent=2), file_name="semantic_events.json", mime="application/json")
 
-            if st.session_state.route_play and st.session_state.route_path:
-                now = time.time()
-                if now - st.session_state.last_tick > 0.6:
-                    st.session_state.last_tick = now
-                    if st.session_state.route_idx < len(st.session_state.route_path)-1:
-                        st.session_state.route_idx += 1
-                    else:
-                        st.session_state.route_play = False
-                    st.rerun()
-
-            if not st.session_state.route_path and st.session_state.active_nodes:
-                path, reasons, texts = chord_route(start, k, st.session_state.active_nodes, M)
-                st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons, texts
-                st.session_state.route_idx = 0
-
-            succ_k = successor_of(k, st.session_state.active_nodes)
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Start", start); m2.metric("Key k", k); m3.metric("succ(k)", succ_k)
-
-            st.markdown("**Path**")
-            pills_path(st.session_state.route_path, st.session_state.route_idx)
-
-            st.markdown("**Reasoning (per hop)**")
-            for i in range(min(st.session_state.route_idx+1, len(st.session_state.route_reasons))):
-                st.latex(st.session_state.route_reasons[i])
-            st.caption("Hover a hop line on the ring to see the interval rule used for that hop.")
-
-            with st.expander("Self-check: predict next hop"):
-                if len(st.session_state.route_path) >= 1:
-                    cur = st.session_state.route_path[min(st.session_state.route_idx, len(st.session_state.route_path)-1)]
-                    st.write(f"Current node: **{cur}**, key **k={k}**")
-                    if st.button("Show expected next"):
-                        nodes = st.session_state.active_nodes
-                        idx = nodes.index(cur); curr_succ = nodes[(idx+1) % len(nodes)]
-                        if mod_between(cur, curr_succ, k, 2**M, incl_right=True):
-                            st.success(f"Next = succ({cur}) = {curr_succ}")
-                        else:
-                            fmap = [f.node for f in build_fingers(cur, nodes, M)]
-                            cpf = closest_preceding(cur, fmap, k, M)
-                            nxt = curr_succ if cpf == cur else cpf
-                            st.success(f"Next = {nxt} (closest preceding finger = {cpf})")
-                else:
-                    st.caption("Click Route first.")
-
-    with left:
-        if not st.session_state.active_nodes:
-            fig = ring_figure(active=[], show_sectors=False)
-            st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="fig_step3_empty")
-        else:
-            fig = ring_figure(
-                active=st.session_state.active_nodes,
-                selected=None, fingers=None,
-                show_sectors=True,
-                route_path=st.session_state.route_path,
-                route_hops=st.session_state.route_idx,
-                route_texts=st.session_state.route_texts,
-                key=st.session_state.key_id,
-            )
-            st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="fig_step3")
-
-# Keep URL in sync
-write_state_to_url()
+st.markdown("---")
+st.caption("This demo models realistic sensor rates & winter hazards, showing why semantic communication is essential for 6G rail in rural Nordic conditions.")
