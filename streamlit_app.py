@@ -1,102 +1,146 @@
-import time, json, zlib
+import json, zlib, math, time
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-from dataclasses import dataclass
-from typing import List, Dict
 from sklearn.cluster import KMeans
-import cbor2
 
-st.set_page_config(page_title="ENSURE-6G — Semantic Comms with Channel Model", layout="wide")
-st.title("ENSURE-6G: Semantic Communication • Live Simulation with Channel Modeling")
-st.caption("Sensors → features → events/tokens → Lane A (safety) / Lane B (ops) → PRIORITY SCHEDULER over a bursty channel with capacity, latency, jitter, loss, BER, CRC")
+# ---------- Page setup ----------
+st.set_page_config(page_title="ENSURE-6G • Semantic Rail Demo (Map)", layout="wide")
+st.title("ENSURE-6G: Semantic Communication • Rail Winter Demo (with Map)")
+st.caption("Map view of train, base stations, and command center • Live KPIs • Safety (Lane A) vs Ops (Lane B) semantics • Coverage-aware link")
 
-# ───────────────────────────────── Controls ─────────────────────────────────
+# ---------- Sidebar controls ----------
 with st.sidebar:
-    st.header("Simulation Controls")
-    duration_min = st.slider("Simulated duration (minutes)", 5, 30, 12, step=1)
-    seed = st.number_input("Random seed", value=42, step=1)
+    st.header("Route & Run")
+    duration_min = st.slider("Simulated duration (minutes)", 5, 20, 10, 1)
+    seed = st.number_input("Random seed", value=7, step=1)
+    autoplay = st.checkbox("Auto-play on the Map", value=False)
     st.markdown("---")
+
     st.subheader("Winter conditions")
     ambient_c = st.slider("Ambient temp (°C)", -30, 10, -12)
     snowfall = st.select_slider("Snowfall", options=["none","light","moderate","heavy"], value="moderate")
     icing = st.select_slider("Icing risk", options=["low","medium","high"], value="high")
     st.markdown("---")
-    st.subheader("Coverage profile")
-    coverage_profile = st.selectbox("Rural 5G/FRMCS coverage", ["Good", "Patchy (realistic)", "Poor"])
+
+    st.subheader("Link profile")
+    base_capacity_kbps = st.slider("Base capacity (kbps)", 128, 2048, 512, 64)
+    burst_factor = st.slider("Capacity burst factor", 1.0, 3.0, 2.0, 0.1)
+    good_loss_pct = st.slider("Loss in GOOD (%)", 0.0, 5.0, 0.5, 0.1)
+    bad_loss_pct  = st.slider("Loss in BAD (%)", 5.0, 60.0, 20.0, 1.0)
+    st.markdown("---")
+
+    st.subheader("Semantics & Packets")
     strategy = st.radio("Transmit strategy", ["Raw", "Semantic", "Adaptive (prefer Semantic)"], index=2)
+    k_codebook = st.select_slider("Codebook size (k-means z tokens)", options=[32, 64, 128, 256], value=128)
+    use_cbor = st.checkbox("Encode Lane B events as CBOR (smaller than JSON)", value=True)
     ensure_events = st.checkbox("Guarantee visible events", value=True)
-    st.markdown("---")
-    st.subheader("Codebook (k-means)")
-    k_codebook = st.select_slider("Codebook size (z tokens)", options=[32, 64, 128, 256], value=128)
-    show_cbor = st.checkbox("Use CBOR for Lane B packets", value=True)
-    st.markdown("---")
-    st.subheader("Channel model")
-    base_capacity_kbps = st.slider("Base capacity (kbps)", 64, 2048, 512, 64)
-    burst_factor = st.slider("Burst capacity factor", 1.0, 4.0, 2.0, 0.1,
-                             help="During good seconds, capacity = base × factor")
-    ge_good_p = st.slider("Gilbert-Elliott: P(stay GOOD)", 0.70, 0.99, 0.90, 0.01)
-    ge_bad_p  = st.slider("Gilbert-Elliott: P(stay BAD)", 0.70, 0.99, 0.85, 0.01)
-    good_loss_pct = st.slider("Loss in GOOD state (%)", 0.0, 5.0, 0.5, 0.1)
-    bad_loss_pct  = st.slider("Loss in BAD state (%)", 5.0, 60.0, 20.0, 1.0)
-    ber_good = st.slider("Bit error rate in GOOD", 0.0, 5e-6, 1e-6, 1e-6, format="%.6f")
-    ber_bad  = st.slider("Bit error rate in BAD", 0.0, 5e-5, 2e-5, 1e-6, format="%.6f")
-    base_latency_ms = st.slider("Base latency (ms)", 10, 300, 80, 10)
-    jitter_ms = st.slider("Random jitter (±ms)", 0, 150, 40, 5)
-    reorder_prob = st.slider("Reordering probability", 0.0, 0.2, 0.05, 0.01)
-    dup_prob = st.slider("Duplication probability", 0.0, 0.2, 0.02, 0.01)
 
-st.info("Tip: Patchy + higher BAD loss/BER shows why semantic + priority scheduling protects Lane A.")
+st.info("Scrub the time slider on the **Map** tab (or enable autoplay). Colors show link quality to the nearest base station.")
 
-# ─────────────────────────── Constants & helpers ───────────────────────────
-FS_ACCEL = 200     # Hz per axis
-FS_FORCE = 500     # Hz pantograph
-BITS_PER_SAMPLE = 16
+# ---------- Route & geography ----------
+# Major points (approx lat/lon)
+CITIES = [
+    ("Sundsvall",   62.3908, 17.3069),
+    ("Hudiksvall",  61.7280, 17.1040),
+    ("Söderhamn",   61.3030, 17.0580),
+    ("Gävle",       60.6749, 17.1413),
+    ("Uppsala",     59.8586, 17.6389),
+    ("Stockholm",   59.3293, 18.0686),
+]
+CMD_CENTER = ("Trafikledning Stockholm", 59.3326, 18.0649)
+
+# Simple set of base stations placed along the corridor (mock but plausible)
+BASE_STATIONS = [
+    ("BS-Sundsvall", 62.38, 17.33, 16_000),  # radius (approx meters) for good coverage
+    ("BS-Iggesund",  61.71, 17.11, 14_000),
+    ("BS-Söderh",    61.31, 17.07, 14_000),
+    ("BS-GävleN",    60.72, 17.17, 14_000),
+    ("BS-Uppsala",   59.86, 17.64, 14_000),
+    ("BS-Stockholm", 59.33, 18.07, 18_000),
+]
+
+# Interpolate the path into N waypoints
+def interpolate_route(points: List[Tuple[str, float, float]], total_secs: int) -> pd.DataFrame:
+    # Piecewise linear interpolation by equal time per leg (for simplicity)
+    legs = []
+    seg_secs = total_secs // (len(points)-1)
+    for i in range(len(points)-1):
+        n = seg_secs if i < len(points)-2 else total_secs - seg_secs*(len(points)-2)
+        a, lat1, lon1 = points[i]
+        b, lat2, lon2 = points[i+1]
+        t = np.linspace(0, 1, max(n, 2))
+        lat = lat1 + (lat2-lat1)*t
+        lon = lon1 + (lon2-lon1)*t
+        legs.append(pd.DataFrame({
+            "t": np.arange(len(t)) + (i*seg_secs),
+            "lat": lat,
+            "lon": lon,
+            "segment": [f"{a}→{b}"]*len(t)
+        }))
+    df = pd.concat(legs, ignore_index=True)
+    df = df.iloc[:total_secs]  # ensure exactly total_secs rows
+    return df
+
 SECS = duration_min * 60
+route_df = interpolate_route(CITIES, SECS)
+
+# ---------- Helpers: distances / coverage ----------
+R_EARTH = 6371000.0
+def haversine_m(lat1, lon1, lat2, lon2):
+    p = math.pi/180.0
+    dlat = (lat2-lat1)*p; dlon = (lon2-lon1)*p
+    a = (math.sin(dlat/2)**2 +
+         math.cos(lat1*p)*math.cos(lat2*p)*math.sin(dlon/2)**2)
+    return 2*R_EARTH*math.asin(math.sqrt(a))
+
+def nearest_bs_quality(lat, lon):
+    # Compute distance to all BS and select best
+    best = None
+    for name, blat, blon, r_good in BASE_STATIONS:
+        d = haversine_m(lat, lon, blat, blon)
+        # Piecewise: Good inside r_good; Patchy until 2.2x; Poor beyond
+        if d <= r_good:
+            q = "GOOD"
+        elif d <= 2.2*r_good:
+            q = "PATCHY"
+        else:
+            q = "POOR"
+        if (best is None) or (["GOOD","PATCHY","POOR"].index(q) < ["GOOD","PATCHY","POOR"].index(best[2])):
+            best = (name, d, q)
+    return best  # (name, distance_m, quality)
+
+# Capacity & loss from quality (plus bursts)
+def link_params(quality: str, t: int) -> Tuple[int, float]:
+    # capacity bits/s
+    cap = base_capacity_kbps * 1000
+    if quality == "GOOD":
+        cap = int(cap * burst_factor)  # bursts when good
+        loss = good_loss_pct / 100.0
+    elif quality == "PATCHY":
+        cap = int(cap * (0.6 + 0.2*math.sin(2*math.pi*t/30)))
+        loss = min(0.4, (bad_loss_pct*0.5)/100.0)
+    else:  # POOR
+        cap = int(cap * 0.25)
+        loss = bad_loss_pct / 100.0
+    return max(0, cap), loss
+
+# ---------- Sensor features & events (per-second) ----------
 rng = np.random.default_rng(int(seed))
-
-ROUTE = [("Sundsvall","Hudiksvall",120), ("Hudiksvall","Söderhamn",50),
-         ("Söderhamn","Gävle",75), ("Gävle","Uppsala",100), ("Uppsala","Stockholm",70)]
-total_km = sum(x[2] for x in ROUTE)
-
-def section_by_time(t: int) -> str:
-    pos = (t/SECS) * total_km
-    acc = 0
-    for a,b,l in ROUTE:
-        if pos <= acc + l:
-            return f"{a}→{b}"
-        acc += l
-    a,b,_ = ROUTE[-1]; return f"{a}→{b}"
-
-# ───────────────────── Coverage mask (macro availability) ──────────────────
-def build_coverage_mask(n_steps: int, profile: str, rng) -> np.ndarray:
-    if profile == "Good":
-        return (rng.random(n_steps) > 0.1).astype(np.uint8)
-    if profile == "Poor":
-        return (rng.random(n_steps) > 0.6).astype(np.uint8)
-    mask = np.ones(n_steps, dtype=np.uint8)
-    for start_frac in [0.22, 0.56]:
-        start = int(n_steps * start_frac)
-        gap = int(n_steps * 0.08)
-        mask[start:start+gap] = 0
-    idxs = rng.integers(0, n_steps, size=max(1, n_steps//20))
-    mask[idxs] = 0
-    return mask
-
-coverage = build_coverage_mask(SECS, coverage_profile, rng)
-
-# ───────────────────────── Feature synthesis per second ────────────────────
-@dataclass
-class Feat:
-    t: int; seg: str; rms: float; crest: float; band_20_50: float; band_50_120: float
-    jerk: float; temp_peak: float; temp_ewma: float; temp_slope_cpm: float
-    slip_ratio: float; wsp_count: int; panto_varN: float
-
 snow_factor = {"none":0.3, "light":0.7, "moderate":1.0, "heavy":1.5}[snowfall]
 ice_factor  = {"low":0.6, "medium":1.0, "high":1.4}[icing]
 
-def synth_features(t: int) -> Feat:
-    seg = section_by_time(t)
+@dataclass
+class Feat:
+    t: int; segment: str; rms: float; crest: float; band_20_50: float; band_50_120: float
+    jerk: float; temp_peak: float; temp_ewma: float; temp_slope_cpm: float
+    slip_ratio: float; wsp_count: int; panto_varN: float
+
+def synth_feature_row(t: int) -> Feat:
+    seg = route_df.loc[t, "segment"]
     base_rms = 0.18 + 0.05*np.sin(2*np.pi*t/180.0)
     rms = abs(base_rms*(1+0.6*(snow_factor-0.3)) + rng.normal(0, 0.02))
     band_20_50 = max(0.0, 0.12*(snow_factor) + rng.normal(0, 0.015))
@@ -118,30 +162,29 @@ def synth_features(t: int) -> Feat:
                 float(jerk), float(temp_peak), float(ewma), float(slope_cpm),
                 float(slip_ratio), int(wsp_count), float(panto_varN))
 
-features: List[Feat] = [synth_features(t) for t in range(SECS)]
+features: List[Feat] = [synth_feature_row(t) for t in range(SECS)]
 
-# ───────────────────────────── Event detection ─────────────────────────────
+# Event logic with dwell/hysteresis
 @dataclass
-class Event:
-    t: int; intent: str; slots: Dict[str, object]
-
+class Event: t: int; intent: str; slots: Dict[str, object]
 events: List[Event] = []
-RMS_HIGH = 0.35; SLIP_HIGH = 0.18; TEMP_HIGH = 85.0; PANTO_VAR_HIGH = 80.0; DWELL_S = 120
+RMS_HIGH=0.35; SLIP_HIGH=0.18; TEMP_HIGH=85.0; PANTO_VAR_HIGH=80.0; DWELL_S=120
 rms_since=slip_since=temp_since=panto_since=None
-
 for f in features:
-    # ride degradation
+    # ride
     rms_since = f.t if (f.rms>=RMS_HIGH and rms_since is None) else (rms_since if f.rms>=RMS_HIGH else None)
     if rms_since is not None and f.t - rms_since >= DWELL_S:
-        events.append(Event(f.t,"ride_degradation",{"segment":f.seg,"rms":round(f.rms,3),"dwell_s":f.t-rms_since}))
+        events.append(Event(f.t,"ride_degradation",{"segment":f.segment,"rms":round(f.rms,3),"dwell_s":f.t-rms_since}))
         rms_since=None
-    # low adhesion
+    # adhesion
     slip_since = f.t if (f.slip_ratio>=SLIP_HIGH and slip_since is None) else (slip_since if f.slip_ratio>=SLIP_HIGH else None)
     if slip_since is not None and f.t - slip_since >= 60:
-        km = round((f.t/SECS)*total_km,1)
+        # rough km est by path fraction
+        km_total = 415  # Sundsvall->Stockholm rough
+        km = round(km_total * (f.t/SECS), 1)
         events.append(Event(f.t,"low_adhesion_event",{"km":km,"slip_ratio":round(f.slip_ratio,3),"duration_s":f.t-slip_since}))
         slip_since=None
-    # overtemp
+    # temp
     temp_since = f.t if (f.temp_peak>=TEMP_HIGH and temp_since is None) else (temp_since if f.temp_peak>=TEMP_HIGH else None)
     if temp_since is not None and f.t - temp_since >= 180:
         events.append(Event(f.t,"bearing_overtemp",{"axle":"2L","peak_c":round(f.temp_peak,1),"dwell_s":f.t-temp_since}))
@@ -155,21 +198,24 @@ for f in features:
 if ensure_events and len(events)==0:
     t0=min(SECS-10,300)
     events += [
-        Event(t0,"ride_degradation",{"segment":section_by_time(t0),"rms":0.42,"dwell_s":180}),
+        Event(t0,"ride_degradation",{"segment":features[t0].segment,"rms":0.42,"dwell_s":180}),
         Event(t0+20,"low_adhesion_event",{"km":200.3,"slip_ratio":0.22,"duration_s":90}),
         Event(t0+40,"pantograph_ice",{"varN":95,"temp_c":ambient_c}),
     ]
 
-# ───────────────────── Codebook tokens (k-means on features) ───────────────
+# Codebook tokens on features (k-means)
 X = np.array([[f.rms, f.crest, f.band_20_50, f.band_50_120, f.jerk] for f in features], dtype=np.float32)
 kmeans = KMeans(n_clusters=int(k_codebook), n_init=5, random_state=int(seed)).fit(X)
 tokens = kmeans.predict(X)
-centroids = kmeans.cluster_centers_; order = np.argsort(centroids[:,0])
-labels = ["smooth"]*len(centroids)
+centroids = kmeans.cluster_centers_
+lab = ["smooth"]*len(centroids)
+order = np.argsort(centroids[:,0])
 if len(centroids)>=4:
-    labels[order[-1]]="rough-snow"; labels[order[-2]]="curve-rough"; labels[order[0]]="very-smooth"
+    lab[order[-1]]="rough-snow"; lab[order[-2]]="curve-rough"; lab[order[0]]="very-smooth"
 
-# ───────────────────────── Packet definitions & encode ─────────────────────
+# ---------- Packets ----------
+import cbor2
+
 def laneA_adhesion_state(f: Feat) -> Dict[str,int]:
     mu_est = max(0.0, min(0.6, 0.6 - 0.5*f.slip_ratio))
     return {"mu_q7_9":int(mu_est*(1<<9)),
@@ -178,264 +224,245 @@ def laneA_adhesion_state(f: Feat) -> Dict[str,int]:
             "wsp":int(min(255,f.wsp_count)),
             "valid_ms":500}
 
-def encode_laneA(pkt: Dict[str,int], seq: int) -> bytes:
-    payload = dict(pkt); payload.update({"seq":seq})
-    b = cbor2.dumps(payload)
-    crc = zlib.crc32(b).to_bytes(4, "big")
+def enc_laneA(pkt: Dict[str,int], seq: int) -> bytes:
+    body = dict(pkt); body.update({"seq":seq})
+    b = cbor2.dumps(body); crc = zlib.crc32(b).to_bytes(4,"big")
     return b + crc
 
-def encode_laneB(event: Event, tkn:int, tlabel:str, use_cbor: bool) -> bytes:
-    d = {"i":event.intent,"ts":int(event.t),"s":event.slots,"z":int(tkn),"zl":tlabel}
-    if use_cbor:
-        b = cbor2.dumps(d)
-    else:
-        b = json.dumps(d, separators=(",",":")).encode()
+def enc_laneB(ev: Event, z:int, zl:str, use_cbor: bool) -> bytes:
+    body = {"i":ev.intent,"ts":int(ev.t),"s":ev.slots,"z":int(z),"zl":zl}
+    b = cbor2.dumps(body) if use_cbor else json.dumps(body, separators=(",",":")).encode()
     crc = zlib.crc32(b).to_bytes(4,"big")
     return b + crc
 
-# ───────────────────────────── Channel model ────────────────────────────────
-@dataclass
-class TxPkt:
-    t_enq: int; lane: str; size_bits: int; seq: int; payload: bytes
+# ---------- Per-second link + scheduler (simple, map-friendly) ----------
+FS_ACCEL=200; FS_FORCE=500; BITS_PER_SAMPLE=16
+raw_bits_per_sec = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BITS_PER_SAMPLE + 400)
 
-def ge_sequence(n:int, pGG:float, pBB:float, rng) -> np.ndarray:
-    """Gilbert–Elliott GOOD/BAD state per second: 1=GOOD, 0=BAD."""
-    state = np.zeros(n, dtype=np.uint8)
-    state[0] = 1
-    for i in range(1,n):
-        if state[i-1]==1:
-            state[i] = 1 if rng.random()<pGG else 0
-        else:
-            state[i] = 0 if rng.random()<pBB else 1
-    return state
+laneA_bits = np.zeros(SECS, dtype=np.int64)
+laneB_bits = np.zeros(SECS, dtype=np.int64)
+cap_bits   = np.zeros(SECS, dtype=np.int64)
+loss_pct   = np.zeros(SECS, dtype=np.float32)
+quality    = ["GOOD"]*SECS
+nearest_bs = [""]*SECS
 
-ge = ge_sequence(SECS, ge_good_p, ge_bad_p, rng)
+laneA_sent = 0; laneA_drop = 0
+laneB_sent = 0; laneB_drop = 0
 
-# Capacity time series (bits/s), modulated by coverage and GE state
-cap_bits = np.zeros(SECS, dtype=np.int64)
-for t in range(SECS):
-    if coverage[t]==0:
-        cap_bits[t]=0
-    else:
-        cap = base_capacity_kbps*1000
-        if ge[t]==1:
-            cap = int(cap * burst_factor)
-        cap_bits[t]=cap
+seqA=0; seqB=0
+laneB_table = []
 
-# Loss/BER by state
-loss_pct_ts = np.where(ge==1, good_loss_pct, bad_loss_pct)
-ber_ts = np.where(ge==1, ber_good, ber_bad)
-
-# Scheduler: priority Lane A over Lane B, queues, latency/jitter, reorder/dup
-laneA_q: List[TxPkt] = []
-laneB_q: List[TxPkt] = []
-
-raw_bits_per_sec = (
-    FS_ACCEL*3*BITS_PER_SAMPLE +
-    FS_FORCE*BITS_PER_SAMPLE +
-    4*1*BITS_PER_SAMPLE +  # temps
-    400                    # GNSS approx bits/s
-)
-
-# Global counters (so nested try_tx can mutate them)
-delivered, dropped = 0, 0
-
-seqA = 0; seqB = 0
-per_sec_bits_sent = np.zeros(SECS, dtype=np.int64)
-queue_len_A = np.zeros(SECS, dtype=np.int32)
-queue_len_B = np.zeros(SECS, dtype=np.int32)
-
-# For latency stats
-latencies_A_ms: List[int] = []
-latencies_B_ms: List[int] = []
-delivered_events: List[Dict] = []
-
-def maybe_corrupt_and_check(payload: bytes, ber: float, rng) -> bool:
-    """Flip bits with BER; return True if CRC ok after corruption, else False."""
-    if len(payload)<5:  # payload + 4 CRC
-        return False
-    data, crc = payload[:-4], payload[-4:]
-    n_bits = len(data)*8
-    flips = rng.binomial(n_bits, min(max(ber,0.0), 0.5))
-    if flips>0:
-        arr = bytearray(data)
-        for _ in range(min(flips, 16)):  # cap flips for speed
-            pos = rng.integers(0, len(arr))
-            bit = 1 << rng.integers(0,8)
-            arr[pos] ^= bit
-        data = bytes(arr)
-    crc_ok = zlib.crc32(data).to_bytes(4,"big") == crc
-    return crc_ok
-
-def try_tx(pkt: TxPkt, t_now:int) -> bool:
-    """Attempt TX with loss, BER, latency/jitter, reordering, duplication."""
-    global delivered, dropped
-    # Loss by state before spending budget
-    if rng.random() < loss_pct_ts[t_now]/100.0:
-        dropped += 1
-        return False
-    # Latency + jitter
-    lat = base_latency_ms + rng.integers(-jitter_ms, jitter_ms+1)
-    if rng.random() < reorder_prob:
-        lat += rng.integers(20, 120)  # extra delay for reordering
-    # Bit errors with CRC check
-    ok = maybe_corrupt_and_check(pkt.payload, float(ber_ts[t_now]), rng)
-    if not ok:
-        dropped += 1
-        return False
-    # Duplication
-    deliver_twice = (rng.random() < dup_prob)
-    # Record delivery
-    if pkt.lane=="A":
-        latencies_A_ms.append(max(0,lat))
-    else:
-        latencies_B_ms.append(max(0,lat))
-    delivered += 1
-    if deliver_twice:
-        if pkt.lane=="A": latencies_A_ms.append(max(0,lat+5))
-        else: latencies_B_ms.append(max(0,lat+5))
-        delivered += 1
-    return True
+# Pre-index events for faster lookup
+events_by_t = {}
+for e in events:
+    events_by_t.setdefault(e.t, []).append(e)
 
 for t in range(SECS):
-    # Enqueue one Lane A adhesion telegram each second
-    pa = laneA_adhesion_state(features[t])
-    ba = encode_laneA(pa, seqA); seqA += 1
-    laneA_q.append(TxPkt(t_enq=t, lane="A", size_bits=len(ba)*8, seq=seqA, payload=ba))
+    lat = route_df.loc[t, "lat"]; lon = route_df.loc[t, "lon"]
+    bs_name, dist_m, q = nearest_bs_quality(lat, lon)
+    nearest_bs[t] = bs_name; quality[t] = q
+    cap, loss = link_params(q, t)
+    cap_bits[t] = cap; loss_pct[t] = loss
 
-    # Raw strategy
-    want_raw = (strategy in ["Raw","Adaptive (prefer Semantic)"])
-    send_raw_bits = 0
-    if want_raw and coverage[t]==1:
+    # Always try to send one Lane A telegram
+    pa = laneA_adhesion_state(features[t]); ba = enc_laneA(pa, seqA); seqA += 1
+    sizeA = len(ba)*8
+    if cap >= sizeA and (rng.random() > loss):
+        cap -= sizeA
+        laneA_bits[t] += sizeA; laneA_sent += 1
+    else:
+        laneA_drop += 1
+
+    # Strategy for raw background (consumes remaining cap)
+    if strategy in ["Raw", "Adaptive (prefer Semantic)"]:
         add = raw_bits_per_sec
-        if strategy=="Adaptive (prefer Semantic)":
-            if (t>0 and coverage[t-1]==0) or (t<SECS-1 and coverage[t+1]==0):
-                add = int(add*0.3)
-        send_raw_bits = add  # raw consumes capacity directly
+        if strategy == "Adaptive (prefer Semantic)":
+            # near border quality, adaptively reduce
+            if q != "GOOD": add = int(add*0.35)
+        raw_use = min(add, cap)
+        cap -= raw_use
+        # we show raw_use in neither lane; it just reduces capacity
 
     # Lane B events at this second
-    for ev in [e for e in events if e.t==t]:
-        bb = encode_laneB(ev, tokens[t], labels[tokens[t]], show_cbor)
-        laneB_q.append(TxPkt(t_enq=t, lane="B", size_bits=len(bb)*8, seq=seqB, payload=bb))
-        seqB += 1
-
-    # Service queues with available capacity cap_bits[t]
-    budget = cap_bits[t] - send_raw_bits
-    if budget < 0: budget = 0
-
-    # Lane A priority
-    i = 0
-    while i < len(laneA_q) and budget >= laneA_q[i].size_bits:
-        pkt = laneA_q.pop(i)
-        budget -= pkt.size_bits
-        per_sec_bits_sent[t] += pkt.size_bits
-        try_tx(pkt, t)
-        # don't increment i (we popped)
-
-    # Lane B next
-    j = 0
-    while j < len(laneB_q) and budget >= laneB_q[j].size_bits:
-        pkt = laneB_q.pop(j)
-        budget -= pkt.size_bits
-        per_sec_bits_sent[t] += pkt.size_bits
-        ok = try_tx(pkt, t)
-        if ok:
-            body = pkt.payload[:-4]
-            try:
-                d = cbor2.loads(body) if show_cbor else json.loads(body.decode())
-                delivered_events.append({
-                    "t_enq": pkt.t_enq,
-                    "lane": pkt.lane,
-                    "intent": d.get("i",""),
-                    "segment": d.get("s",{}).get("segment", section_by_time(pkt.t_enq)),
-                    "bytes": len(pkt.payload),
-                    "encoding": "CBOR" if show_cbor else "JSON",
-                    "z": d.get("z",""),
-                    "zl": d.get("zl","")
+    if t in events_by_t:
+        for ev in events_by_t[t]:
+            bb = enc_laneB(ev, tokens[t], lab[tokens[t]], use_cbor)
+            sizeB = len(bb)*8
+            if cap >= sizeB and (rng.random() > loss):
+                cap -= sizeB
+                laneB_bits[t] += sizeB; laneB_sent += 1
+                # record delivered row for the table
+                body = {"i":ev.intent,"ts":int(ev.t),"s":ev.slots,"z":int(tokens[t]),"zl":lab[tokens[t]]}
+                laneB_table.append({
+                    "t": t, "segment": features[t].segment, "intent": ev.intent,
+                    "bytes": len(bb), "encoding": "CBOR" if use_cbor else "JSON",
+                    "token_z": int(tokens[t]), "token_label": lab[tokens[t]],
+                    "near_bs": bs_name, "link_quality": q
                 })
-            except Exception:
-                pass
-        # don't increment j (we popped)
+            else:
+                laneB_drop += 1
 
-    queue_len_A[t] = len(laneA_q)
-    queue_len_B[t] = len(laneB_q)
+# ---------- Tabs ----------
+tab_map, tab_packets, tab_plots, tab_about = st.tabs(["🗺️ Map", "📦 Packets", "📈 Plots & KPIs", "ℹ️ About"])
 
-# ───────────────────────── Overview metrics ────────────────────────────────
-theoretical_raw_bits = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BITS_PER_SAMPLE + 400) * SECS
-actual_sent_bits = int(per_sec_bits_sent.sum())
-saved = 1.0 - (actual_sent_bits / max(theoretical_raw_bits,1))
+# ========================= Map TAB =========================
+with tab_map:
+    st.subheader("Map: Train • Base Stations • Command Center")
+    colA, colB = st.columns([2,1])
+    with colB:
+        # Timeline control
+        if "t_idx" not in st.session_state: st.session_state.t_idx = 0
+        t_idx = st.slider("Time (s)", 0, SECS-1, value=st.session_state.t_idx, key="time_slider")
+        st.session_state.t_idx = t_idx
 
-c1,c2,c3,c4 = st.columns(4)
-with c1: st.metric("Duration (min)", duration_min)
-with c2: st.metric("Raw if streamed (MB)", f"{theoretical_raw_bits/(8*1024*1024):.2f}")
-with c3: st.metric("Actual sent (MB)", f"{actual_sent_bits/(8*1024*1024):.2f}")
-with c4: st.metric("Bandwidth saved vs raw", f"{100*saved:.1f}%")
+        if autoplay:
+            # Advance a few steps and rerun (gentle animation)
+            new_t = min(SECS-1, t_idx+3)
+            st.session_state.t_idx = new_t
+            st.experimental_rerun()
 
-c5,c6,c7,c8 = st.columns(4)
-with c5: st.metric("Lane A queued (max)", int(queue_len_A.max()))
-with c6: st.metric("Lane B queued (max)", int(queue_len_B.max()))
-with c7: st.metric("Delivered msgs", delivered)
-with c8: st.metric("Dropped (loss/BER)", dropped)
+        # Point-in-time KPIs
+        st.metric("Segment", features[t_idx].segment)
+        st.metric("Nearest base station", nearest_bs[t_idx])
+        st.metric("Link quality", quality[t_idx])
+        st.metric("Lane A sent (total)", laneA_sent)
+        st.metric("Lane B sent (total)", laneB_sent)
 
-# ─────────────────────────── Charts & tables ───────────────────────────────
-st.subheader("Channel capacity, transmitted bits, and coverage")
-df = pd.DataFrame({"t":np.arange(SECS),
-                   "capacity_bits": cap_bits,
-                   "bits_sent": per_sec_bits_sent,
-                   "coverage": coverage,
-                   "GE_state": ge})
-st.line_chart(df.set_index("t")[["capacity_bits","bits_sent"]])
-st.area_chart(df.set_index("t")[["coverage"]])
+        st.markdown("---")
+        st.caption("Colors: Base station circles show nominal good coverage. Train dot color indicates link quality.")
 
-st.subheader("Queue sizes (priority scheduler)")
-dfq = pd.DataFrame({"t":np.arange(SECS),
-                    "LaneA_queue": queue_len_A,
-                    "LaneB_queue": queue_len_B})
-st.line_chart(dfq.set_index("t"))
+    with colA:
+        # PyDeck layers
+        import pydeck as pdk
 
-st.subheader("Latency distributions")
-colA, colB = st.columns(2)
-with colA:
-    if len(latencies_A_ms)>0:
-        st.write(f"Lane A: {len(latencies_A_ms)} deliveries")
-        st.bar_chart(pd.DataFrame({"lat_ms":latencies_A_ms}).clip(0,500))
+        # Route line
+        route_path = [{"position":[route_df.loc[i, "lon"], route_df.loc[i, "lat"]], "t":i} for i in range(SECS)]
+        path_layer = pdk.Layer(
+            "PathLayer",
+            data=[{"path":[d["position"] for d in route_path[::max(1, SECS//200)]], "name":"Sundsvall→Stockholm"}],
+            get_color=[60, 60, 120], width_scale=4, width_min_pixels=2,
+        )
+
+        # Base stations as discs
+        bs_df = pd.DataFrame(BASE_STATIONS, columns=["name","lat","lon","r_m"])
+        bs_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=bs_df,
+            get_position="[lon, lat]",
+            get_radius="r_m",
+            get_fill_color="[0, 150, 0, 40]",
+            stroked=True, get_line_color=[0,150,0], line_width_min_pixels=1,
+            pickable=True,
+        )
+
+        # Train marker at t_idx
+        qcol = {"GOOD":[0,170,0], "PATCHY":[255,165,0], "POOR":[200,0,0]}
+        train_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=pd.DataFrame([{
+                "lat": route_df.loc[t_idx,"lat"],
+                "lon": route_df.loc[t_idx,"lon"],
+                "color": qcol[quality[t_idx]]
+            }]),
+            get_position="[lon, lat]",
+            get_fill_color="color",
+            get_radius=1200,
+            stroked=True, get_line_color=[0,0,0], line_width_min_pixels=1,
+            pickable=False
+        )
+
+        # Command center marker
+        cc_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=pd.DataFrame([{"lat": CMD_CENTER[1], "lon": CMD_CENTER[2]}]),
+            get_position="[lon, lat]",
+            get_fill_color=[30,30,30],
+            get_radius=800,
+            stroked=True, get_line_color=[255,255,255], line_width_min_pixels=1,
+            pickable=False
+        )
+
+        view_state = pdk.ViewState(
+            latitude=60.7, longitude=17.5, zoom=6.2, pitch=0
+        )
+        st.pydeck_chart(pdk.Deck(
+            map_style="mapbox://styles/mapbox/light-v9",
+            initial_view_state=view_state,
+            layers=[path_layer, bs_layer, train_layer, cc_layer],
+            tooltip={"text":"{name}"}
+        ))
+        st.caption("Move the time slider (or enable autoplay). The train dot changes color with link quality (GOOD/PATCHY/POOR).")
+
+    st.markdown("---")
+    st.subheader("Delivered Lane-B Events (table)")
+    if laneB_table:
+        st.dataframe(pd.DataFrame(laneB_table))
     else:
-        st.info("No Lane A deliveries recorded (check channel settings)")
-with colB:
-    if len(latencies_B_ms)>0:
-        st.write(f"Lane B: {len(latencies_B_ms)} deliveries")
-        st.bar_chart(pd.DataFrame({"lat_ms":latencies_B_ms}).clip(0,500))
-    else:
-        st.info("No Lane B deliveries recorded")
+        st.info("No Lane-B events delivered under current conditions. Increase snowfall/icing or enable 'Guarantee visible events'.")
 
-st.subheader("Operational semantic events delivered (Lane B)")
-if delivered_events:
-    st.dataframe(pd.DataFrame(delivered_events))
-else:
-    st.info("No Lane B events delivered. Try increasing capacity or lowering loss/BER.")
+# ========================= Packets TAB =========================
+with tab_packets:
+    st.subheader("Packet Inspector")
+    example_t = min(SECS-1, max(0, SECS//3))
+    # Lane A
+    pktA = laneA_adhesion_state(features[example_t])
+    bA = enc_laneA(pktA, 123)
+    st.markdown("**Lane A (safety) adhesion_state**")
+    st.code(json.dumps(pktA, indent=2))
+    st.write(f"Encoded size: {len(bA)} bytes (CBOR + CRC32)")
 
-# ───────────────────────── Packet inspector ────────────────────────────────
-st.subheader("Packet inspector (sizes include CRC32 footer)")
-example_t = min(SECS-1, max(0, SECS//3))
-pktA_demo = laneA_adhesion_state(features[example_t])
-bA_demo = encode_laneA(pktA_demo, 123)
-st.markdown("**Lane A (safety) adhesion_state**")
-st.code(json.dumps(pktA_demo, indent=2))
-st.write(f"Encoded size: {len(bA_demo)} bytes (CBOR+CRC)")
+    # Lane B
+    ev = None
+    for e in events:
+        if e.t >= example_t: ev=e; break
+    if ev is None:
+        ev = Event(example_t,"ride_degradation",{"segment":features[example_t].segment,"rms":0.41,"dwell_s":160})
+    bB_json = enc_laneB(ev, tokens[example_t], lab[tokens[example_t]], use_cbor=False)
+    bB_cbor = enc_laneB(ev, tokens[example_t], lab[tokens[example_t]], use_cbor=True)
+    st.markdown("**Lane B (ops) example event**")
+    st.code(json.dumps({"i":ev.intent,"ts":ev.t,"s":ev.slots,"z":int(tokens[example_t]),"zl":lab[tokens[example_t]]}, indent=2))
+    st.write(f"JSON size: {len(bB_json)} bytes • CBOR size: {len(bB_cbor)} bytes (both include CRC32)")
 
-example_ev = next((e for e in events if e.t >= example_t), None)
-if example_ev is None:
-    example_ev = Event(example_t, "ride_degradation", {"segment": section_by_time(example_t), "rms": 0.41, "dwell_s": 160})
-bB_json = encode_laneB(example_ev, tokens[example_t], labels[tokens[example_t]], use_cbor=False)
-bB_cbor = encode_laneB(example_ev, tokens[example_t], labels[tokens[example_t]], use_cbor=True)
-st.markdown("**Lane B (ops) example event**")
-st.code(json.dumps({"i":example_ev.intent,"ts":example_ev.t,"s":example_ev.slots,"z":int(tokens[example_t]),"zl":labels[tokens[example_t]]}, indent=2))
-st.write(f"JSON size: {len(bB_json)} bytes • CBOR size: {len(bB_cbor)} bytes (both include CRC)")
+# ========================= Plots & KPIs TAB =========================
+with tab_plots:
+    st.subheader("Throughput & Quality over Time")
+    df_time = pd.DataFrame({
+        "t": np.arange(SECS),
+        "LaneA_bits": laneA_bits,
+        "LaneB_bits": laneB_bits,
+        "Capacity_bits": cap_bits,
+        "Quality": quality
+    })
+    st.line_chart(df_time.set_index("t")[["Capacity_bits","LaneA_bits","LaneB_bits"]])
+    q_counts = pd.Series(quality).value_counts()
+    col1, col2, col3, col4 = st.columns(4)
+    with col1: st.metric("Lane A delivered", int((laneA_bits>0).sum()))
+    with col2: st.metric("Lane B delivered", int((laneB_bits>0).sum()))
+    with col3: st.metric("Avg capacity (kbps)", f"{cap_bits.mean()/1000:.1f}")
+    with col4: st.metric("Quality time (GOOD/PATCHY/POOR)", f"{int(q_counts.get('GOOD',0))}/{int(q_counts.get('PATCHY',0))}/{int(q_counts.get('POOR',0))}")
 
-# ───────────────────────────── Download trace ──────────────────────────────
-st.subheader("Download delivered Lane B events (JSON)")
-st.download_button("Download JSON", data=json.dumps(delivered_events, indent=2),
-                   file_name="laneB_events_delivered.json", mime="application/json")
+    st.subheader("Bandwidth vs Raw (cumulative)")
+    raw_total_bits = raw_bits_per_sec * SECS
+    actual_total_bits = int(laneA_bits.sum() + laneB_bits.sum())
+    saved = 1.0 - (actual_total_bits / max(raw_total_bits,1))
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("Raw if streamed (MB)", f"{raw_total_bits/(8*1024*1024):.2f}")
+    with c2: st.metric("Actual sent (MB)", f"{actual_total_bits/(8*1024*1024):.2f}")
+    with c3: st.metric("Saved vs Raw", f"{100*saved:.1f}%")
 
-st.markdown("---")
-st.caption("This simulation includes: priority scheduling, time-varying capacity, Gilbert–Elliott burst losses, BER with CRC32 integrity check, latency/jitter, reordering & duplication, and coverage gaps. Lane A is prioritized and tiny; Lane B is best-effort.")
+# ========================= About TAB =========================
+with tab_about:
+    st.markdown("""
+### What you’re seeing
+- **Map**: The train moves Sundsvall→Stockholm; colored dot = link quality to the **nearest base station**.
+- **Lane A (safety)**: Tiny, fixed-field adhesion telegram every second (CBOR+CRC). Always prioritized.
+- **Lane B (ops)**: Event-driven semantics (e.g., low_adhesion, ride_degradation) + **codebook token `z`** (k-means).
+- **Capacity & loss**: Derived from proximity-based quality (GOOD/PATCHY/POOR) + bursts; **Raw** mode reduces available capacity.
+
+### Why it’s realistic & presentation-ready
+- Uses **per-second sensor features** (RMS, band powers, crest, jerk, slip, pantograph variance, temp slope).
+- **Events with dwell** mirror maintenance logic; **codebook tokens** are tiny semantic IDs.
+- **Coverage explains everything visually**: when the dot turns **orange/red**, Lane B drops first; Lane A still squeezes through.
+
+Tip: Start with *moderate snow*, *high icing*, *Adaptive* strategy, *base 512 kbps*, *burst×2*. Scrub the time slider and watch events deliver even as quality degrades.
+""")
