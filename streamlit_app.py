@@ -1,8 +1,8 @@
-# app_chord_tutor_stepper_v2.py
-# Changes vs previous:
-# - Title uses st.title(...) so it always appears
-# - Step 3 no longer draws fingers or start markers (prevents overlap with route)
-# - Optional toggle in Step 3 to show fingers if desired (default OFF)
+# app_chord_tutor_click_join.py
+# Chord DHT — stepper tutor with click-to-activate nodes in Step 2.
+# - Click a grey (disabled) dot in Step 2 to join/activate it.
+# - Optional toggle: also allow removing an active node by clicking it.
+# - Everything else as before: bigger nodes, multicolor sectors, fingers, route.
 
 import math
 from dataclasses import dataclass
@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_plotly_events import plotly_events  # NEW
 
 # ---------- Plotly config ----------
 PLOTLY_CONFIG = {
@@ -31,16 +32,9 @@ SECTOR_COLORS = ["#4E79A7","#F28E2B","#E15759","#76B7B2","#59A14F",
                  "#EDC948","#B07AA1","#FF9DA7","#9C755F","#BAB0AC"]
 
 # ---------- Page ----------
-st.set_page_config(page_title="Chord DHT • Stepper Tutor", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
-<style>
-  .block-container { padding-top: 0.8rem; }
-  .legend { color:#334155; font-size:0.95rem; }
-  .tip { background:#f8fafc; border:1px solid #e2e8f0; padding:10px 12px; border-radius:10px; }
-  .btn-row > div button { width:100%; height:42px; font-weight:600; }
-  .chips span { background:#f1f5f9; padding:4px 8px; border-radius:8px; margin-right:6px; display:inline-block; margin-bottom:6px; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Chord DHT • Stepper Tutor (click to join)", layout="wide", initial_sidebar_state="collapsed")
+st.title("🔗 Chord DHT — Step-by-step Tutor")
+st.caption("Step 1: Allocate → Step 2: Build finger table (click grey IDs to join) → Step 3: Search/route")
 
 # ---------- State ----------
 def init_state():
@@ -59,6 +53,7 @@ def init_state():
     if "route_idx" not in st.session_state: st.session_state.route_idx = 0
 
     if "search_show_fingers" not in st.session_state: st.session_state.search_show_fingers = False
+    if "allow_remove_click" not in st.session_state: st.session_state.allow_remove_click = False  # NEW
 init_state()
 
 # ---------- Chord helpers ----------
@@ -73,8 +68,7 @@ def mod_between(a: int, b: int, x: int, m: int, incl_right=False) -> bool:
 
 def successor_of(x: int, nodes_sorted: List[int]) -> int:
     for n in nodes_sorted:
-        if n >= x:
-            return n
+        if n >= x: return n
     return nodes_sorted[0]
 
 @dataclass
@@ -178,7 +172,7 @@ def ring_figure(
             color = SECTOR_COLORS[idx % len(SECTOR_COLORS)] if multicolor else COLORS["sector"]
             add_sector(fig, pred, nid, color, alpha=0.12)
 
-    # Disabled placeholders
+    # Disabled placeholders (CLICKABLE)
     disabled = [i for i in ALL_POSITIONS if i not in set(active)]
     if disabled:
         xs, ys = zip(*[node_xy(i) for i in disabled])
@@ -187,33 +181,36 @@ def ring_figure(
             text=[str(i) for i in disabled], textposition="top center",
             marker=dict(size=12, symbol="circle-open",
                         color="#9ca3af", line=dict(width=1.2, color="#9ca3af")),
-            name="Disabled", opacity=0.55, hoverinfo="skip"
+            name="Disabled", opacity=0.65, hoverinfo="text",
+            customdata=[{"id": i, "kind": "disabled"} for i in disabled]  # <-- click meta
         ))
 
-    # Active nodes
+    # Active nodes (CLICKABLE too if removal is enabled)
     succ_k = successor_of(key, active) if (key is not None and active) else None
     if active:
         xs, ys = zip(*[node_xy(i) for i in active])
-        sizes, colors, labels = [], [], []
+        sizes, colors, labels, cds = [], [], [], []
         allocated_set = set(allocated_nodes or [])
         for nid in active:
             if selected == nid:
-                sizes.append(22); colors.append(COLORS["selected"]); labels.append(f"{nid} (selected)")
+                sizes.append(22); colors.append("#d62728"); labels.append(f"{nid} (selected)")
             elif succ_k == nid:
-                sizes.append(20); colors.append(COLORS["succ"]); labels.append(f"{nid} (succ(key))")
+                sizes.append(20); colors.append("#ff7f0e"); labels.append(f"{nid} (succ(key))")
             elif allocated_set and nid in allocated_set:
-                sizes.append(18); colors.append(COLORS["allocated"]); labels.append(f"{nid} (just allocated)")
+                sizes.append(18); colors.append("#22c55e"); labels.append(f"{nid} (just allocated)")
             else:
-                sizes.append(18); colors.append(COLORS["active"]); labels.append(str(nid))
+                sizes.append(18); colors.append("#1f77b4"); labels.append(str(nid))
+            cds.append({"id": nid, "kind": "active"})
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="markers+text",
             text=[str(n) for n in active], textposition="top center",
             hovertext=labels, hoverinfo="text",
             marker=dict(size=sizes, color=colors, line=dict(width=1.3, color="white")),
-            name="Active"
+            name="Active",
+            customdata=cds  # <-- click meta
         ))
 
-    # Fingers (only if provided)
+    # Optional finger chords + start highlight (only if provided)
     if selected is not None and fingers:
         sx, sy = node_xy(selected)
         for f in fingers:
@@ -224,8 +221,6 @@ def ring_figure(
                 hovertext=f"start={f.start} → succ={f.node}", hoverinfo="text",
                 showlegend=False
             ))
-
-    # Highlight start[i] + radial (only if requested)
     if show_start is not None and selected is not None:
         hx, hy = node_xy(show_start)
         fig.add_trace(go.Scatter(
@@ -236,10 +231,9 @@ def ring_figure(
         if show_radial:
             sx, sy = node_xy(selected)
             fig.add_trace(go.Scatter(x=[sx, hx], y=[sy, hy], mode="lines",
-                                     line=dict(width=1.5, dash="dash", color="#6b7280"),
-                                     showlegend=False))
+                                     line=dict(width=1.5, dash="dash", color="#6b7280"), showlegend=False))
 
-    # Route
+    # Route (if any)
     if route_path and route_hops > 0:
         for i in range(min(route_hops, len(route_path)-1)):
             a, b = route_path[i], route_path[i+1]
@@ -257,17 +251,15 @@ def ring_figure(
     fig.update_layout(
         width=780, height=780,
         xaxis=dict(visible=False), yaxis=dict(visible=False),
-        margin=dict(l=8,r=8,t=30,b=8), plot_bgcolor="white",
+        margin=dict(l=8,r=8,t=30,b=8),
+        plot_bgcolor="white",
         title="Chord • Ring 0..31",
         legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="center", x=0.5, font=dict(size=11)),
     )
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
     return fig
 
-# ---------- Header + Stepper ----------
-st.title("🔗 Chord DHT — Step-by-step Tutor")
-st.caption("Step 1: Allocate → Step 2: Build finger table → Step 3: Search/route")
-
+# ---------- Stepper ----------
 step_labels = ["① Allocate", "② Fingers", "③ Search"]
 c1, c2 = st.columns([0.7, 0.3])
 with c1:
@@ -279,9 +271,10 @@ st.session_state.step = step_labels.index(sel) + 1
 # ========= STEP 1: Allocate =========
 if st.session_state.step == 1:
     left, right = st.columns([0.6, 0.4], gap="large")
+
     with right:
         st.markdown("### Step 1 — Allocate nodes")
-        st.markdown('<div class="tip">Enter labels (one per line) and click <b>Allocate</b>. IDs are <code>SHA1(label) mod 32</code>.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="tip">Enter labels and click <b>Allocate</b>. IDs are <code>SHA1(label) mod 32</code>.</div>', unsafe_allow_html=True)
         labels = st.text_area("Node labels", value="nodeA\nnodeB\nnodeC\nnodeD", height=140)
 
         allocated_now = False
@@ -329,28 +322,21 @@ if st.session_state.step == 1:
 
         st.markdown("**Hash equation**"); st.latex(r"\text{node\_id} = \operatorname{SHA1}(\text{label}) \bmod 32")
 
-        # Next + auto-advance
         if st.session_state.active_nodes:
             if st.button("Next: Build finger table →", use_container_width=True, type="primary"):
                 st.session_state.step = 2; st.rerun()
         if allocated_now and st.session_state.auto_advance and st.session_state.active_nodes:
             st.session_state.step = 2; st.rerun()
 
-        st.markdown("""<div class="legend"><b>Legend:</b>
-        <span style="color:#22c55e">● Just allocated</span>,
-        <span style="color:#1f77b4">● Active</span>,
-        <span style="color:#d62728">● Selected</span>,
-        <span style="color:#ff7f0e">● succ(key)</span>,
-        <span style="color:#9ca3af">◌ Disabled</span></div>""", unsafe_allow_html=True)
-
     with left:
         fig = ring_figure(active=st.session_state.active_nodes, selected=st.session_state.selected,
                           allocated_nodes=st.session_state.allocated_nodes, show_sectors=False, multicolor=True)
         st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step1")
 
-# ========= STEP 2: Fingers =========
+# ========= STEP 2: Fingers (click to join/leave) =========
 elif st.session_state.step == 2:
     if st.session_state.allocated_nodes: st.session_state.allocated_nodes = []  # clear green
+
     left, right = st.columns([0.6, 0.4], gap="large")
 
     with right:
@@ -363,9 +349,12 @@ elif st.session_state.step == 2:
                 index=0 if (st.session_state.selected not in st.session_state.active_nodes or st.session_state.selected is None)
                 else st.session_state.active_nodes.index(st.session_state.selected)
             )
+            st.session_state.allow_remove_click = st.toggle("Allow remove on click (active → disabled)", value=False)
+
             f_all = build_fingers(st.session_state.selected, st.session_state.active_nodes, M)
             k = st.session_state.fingers_revealed
             f_show = f_all[:k]
+            current_start = f_show[-1].start if k > 0 else None
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -391,18 +380,50 @@ elif st.session_state.step == 2:
             else:
                 st.caption("Click **Reveal next** to build the table.")
 
-            st.markdown('<div class="legend">Colored sectors show each node’s responsibility interval (pred → node].</div>', unsafe_allow_html=True)
+            st.caption("Tip: Click a grey ID on the ring to make that node join. (Enable removal to click active IDs and remove.)")
 
     with left:
+        # Build a figure with finger lines & start marker (for the selected node),
+        # and make points clickable via plotly_events
         if not st.session_state.active_nodes:
             fig = ring_figure(active=[], show_sectors=False)
+            st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step2")
         else:
             f_all = build_fingers(st.session_state.selected, st.session_state.active_nodes, M)
             k = st.session_state.fingers_revealed
-            fig = ring_figure(active=st.session_state.active_nodes, selected=st.session_state.selected,
-                              fingers=f_all[:k], show_start=(f_all[k-1].start if k>0 else None),
-                              show_radial=True, show_sectors=True, multicolor=True)
-        st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step2")
+            fig = ring_figure(
+                active=st.session_state.active_nodes,
+                selected=st.session_state.selected,
+                fingers=f_all[:k],
+                show_start=f_all[k-1].start if k>0 else None,
+                show_radial=True,
+                show_sectors=True, multicolor=True
+            )
+            # Use plotly_events to catch clicks
+            clicked = plotly_events(fig, click_event=True, select_event=False, override_width=780, override_height=780, key="ring_step2_click")
+            # clicked is a list of dicts; we put id/kind in customdata earlier
+            if clicked:
+                meta = clicked[0].get("customdata")  # {'id': int, 'kind': 'disabled'|'active'}
+                if isinstance(meta, dict) and "id" in meta and "kind" in meta:
+                    nid = int(meta["id"])
+                    kind = meta["kind"]
+                    nodes = set(st.session_state.active_nodes)
+                    if kind == "disabled":
+                        nodes.add(nid)  # join
+                        st.session_state.active_nodes = sorted(nodes)
+                        st.session_state.selected = nid  # focus the node that just joined
+                        st.rerun()
+                    elif kind == "active" and st.session_state.allow_remove_click:
+                        # Do not allow removing if it would empty the ring
+                        if len(nodes) > 1:
+                            nodes.remove(nid)
+                            st.session_state.active_nodes = sorted(nodes)
+                            # keep selected valid
+                            if st.session_state.selected not in nodes:
+                                st.session_state.selected = st.session_state.active_nodes[0]
+                            st.rerun()
+                        else:
+                            st.warning("Cannot remove the last active node.")
 
 # ========= STEP 3: Search =========
 else:
@@ -417,22 +438,19 @@ else:
             start = st.selectbox("Start node", st.session_state.active_nodes, index=0, key="start_node_select")
             k = st.number_input("Key k (0–31)", min_value=0, max_value=31, value=st.session_state.key_id, step=1)
 
-            # Optional: show fingers while searching (default OFF to avoid overlap)
             st.session_state.search_show_fingers = st.checkbox("Show fingers while searching (may clutter)", value=False)
 
-            st.markdown('<div class="btn-row">', unsafe_allow_html=True)
-            b1, b2 = st.columns(2)
-            with b1:
+            colb1, colb2 = st.columns(2)
+            with colb1:
                 if st.button("Route", use_container_width=True):
                     path, reasons, texts = chord_route(start, k, st.session_state.active_nodes, M)
                     st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons, texts
                     st.session_state.route_idx = 0
                     st.session_state.key_id = k
-            with b2:
+            with colb2:
                 if st.button("Next hop", use_container_width=True):
                     if st.session_state.route_path:
                         st.session_state.route_idx = min(len(st.session_state.route_path)-1, st.session_state.route_idx+1)
-            st.markdown('</div>', unsafe_allow_html=True)
 
             if not st.session_state.route_path and st.session_state.active_nodes:
                 path, reasons, texts = chord_route(start, k, st.session_state.active_nodes, M)
@@ -450,32 +468,30 @@ else:
             for i in range(min(st.session_state.route_idx+1, len(st.session_state.route_reasons))):
                 st.latex(st.session_state.route_reasons[i])
 
-            st.caption("Hover a hop line on the ring to see the interval rule used for that hop.")
-
     with left:
         if not st.session_state.active_nodes:
             fig = ring_figure(active=[], show_sectors=False)
+            st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step3_empty")
         else:
-            # IMPORTANT: hide fingers by default in Step 3 to avoid overlap
             if st.session_state.search_show_fingers:
                 sel = st.session_state.selected if (st.session_state.selected in st.session_state.active_nodes and st.session_state.selected is not None) else st.session_state.active_nodes[0]
                 f_all = build_fingers(sel, st.session_state.active_nodes, M)
                 fingers_for_search = f_all[:st.session_state.fingers_revealed]
                 show_start = f_all[st.session_state.fingers_revealed-1].start if st.session_state.fingers_revealed>0 else None
+                selected = sel
             else:
-                fingers_for_search = None
-                show_start = None
+                fingers_for_search = None; show_start = None; selected = None
 
             fig = ring_figure(
                 active=st.session_state.active_nodes,
-                selected=None if not st.session_state.search_show_fingers else st.session_state.selected,
+                selected=selected,
                 fingers=fingers_for_search,
                 show_start=show_start,
-                show_radial=False,                   # no radial in search by default
+                show_radial=False,
                 route_path=st.session_state.route_path,
                 route_hops=st.session_state.route_idx,
                 route_texts=st.session_state.route_texts,
                 key=st.session_state.key_id,
                 show_sectors=True, multicolor=True
             )
-        st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step3")
+            st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step3")
