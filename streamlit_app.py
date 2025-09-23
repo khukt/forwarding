@@ -1,5 +1,5 @@
 # app_fixed32_route.py
-# Chord DHT — Fixed ring 0..31, disabled placeholders, fingers, and step-by-step lookup route
+# Chord DHT — Fixed ring 0..31, disabled placeholders, finger-table reveal, step-by-step lookup.
 
 import hashlib
 import math
@@ -11,12 +11,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ---------------- Fixed ring ----------------
 M = 5
 SPACE = 2 ** M
 ALL_POSITIONS = list(range(SPACE))
 
-# ---------------- Math helpers ----------------
+# ---------------- Helpers ----------------
 def sha1_mod(s: str, space: int) -> int:
     h = hashlib.sha1(s.encode("utf-8")).hexdigest()
     return int(h, 16) % space
@@ -34,7 +33,6 @@ def successor_of(x: int, nodes_sorted: List[int]) -> int:
             return n
     return nodes_sorted[0]
 
-# ---------------- Chord data ----------------
 @dataclass
 class FingerEntry:
     i: int
@@ -59,7 +57,7 @@ def closest_preceding_finger(n: int, fingers: List[int], target: int, m: int) ->
     return n
 
 def chord_lookup_full(start_node: int, key: int, nodes_sorted: List[int], m: int, max_steps: int = 64):
-    """Return (path: List[int], reasons: List[str]) using only nodes_sorted (active)."""
+    """Return (path, reasons) for iterative Chord lookup using only active nodes."""
     if not nodes_sorted:
         return [start_node], [r"\text{No active nodes.}"]
     path = [start_node]
@@ -130,10 +128,9 @@ def ring_figure(
     fig.add_trace(go.Scatter(x=np.cos(circle_angles), y=np.sin(circle_angles),
                              mode="lines", name="Ring", hoverinfo="skip"))
 
+    # Disabled placeholders (0..31 not in active)
     active_set = set(active_nodes)
     disabled_positions = [i for i in ALL_POSITIONS if i not in active_set]
-
-    # Disabled placeholders (grey hollow)
     if disabled_positions:
         xs, ys = [], []
         for nid in disabled_positions:
@@ -145,7 +142,7 @@ def ring_figure(
             textposition="top center",
             marker=dict(size=10, symbol="circle-open", color="lightgray",
                         line=dict(width=1, color="lightgray")),
-            name="Disabled (placeholder)", opacity=0.45, hoverinfo="skip"
+            name="Disabled", opacity=0.45, hoverinfo="skip"
         ))
 
     # Active nodes (selected red, succ(key) orange)
@@ -181,7 +178,7 @@ def ring_figure(
                 hoverinfo="text", showlegend=False
             ))
 
-    # Highlight current start[i]
+    # Highlight start[i]
     if highlight_start is not None and selected is not None:
         hx, hy = node_xy(highlight_start, SPACE, R)
         fig.add_trace(go.Scatter(
@@ -212,9 +209,9 @@ def ring_figure(
                 x=bx, y=by, ax=ax, ay=ay,
                 xref="x", yref="y", axref="x", ayref="y",
                 showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=2
-            ))
+            )
 
-    # Optional pinned finger table card for selected
+    # Pin selected node's finger table card
     if selected is not None and fingers:
         x, y = node_xy(selected, SPACE, R * 1.12)
         table = "i  start  succ<br>" + "<br>".join(f"{fe.i}  {fe.start:<5}  {fe.node}" for fe in fingers)
@@ -248,14 +245,10 @@ def init_state():
 
 init_state()
 
-# ---------------- UI: active nodes ----------------
+# ---------------- UI ----------------
 st.set_page_config(page_title="Chord 0..31 • Fingers + Route", layout="wide")
 st.title("🔗 Chord DHT — Fixed Ring 0..31 (with step-by-step lookup)")
-
-st.markdown(
-    "IDs **0..31** are always drawn. IDs you do **not** list are shown as **disabled** placeholders "
-    "(grey hollow circles). Finger tables and routing use **only your active nodes**."
-)
+st.caption("Any ID not listed is shown as a disabled placeholder (grey hollow). Routing uses only active nodes.")
 
 mode = st.radio("Active-node input", ["Manual IDs (0..31)", "Hash labels → IDs (mod 32)"], index=0)
 
@@ -280,12 +273,12 @@ if not active_nodes:
     st.warning("Add at least one active node.")
     st.stop()
 
-# ---------------- Fingers (step-by-step) ----------------
+# --------- Step 1: finger-table reveal ----------
 st.header("Step 1 — Finger table (reveal per entry)")
 selected = st.selectbox("Selected node (draw fingers from here)", options=active_nodes, index=0)
 fingers_all = build_finger_table(selected, active_nodes, M)
 
-c1, c2, c3 = st.columns([1,1,6])
+c1, c2, _ = st.columns([1,1,6])
 with c1:
     if st.button("Reset entries"):
         st.session_state.k = 0
@@ -315,10 +308,10 @@ if k > 0:
 else:
     st.info("Click **Next entry** to compute finger[1].")
 
-# ---------------- Lookup (search the data / find the route) ----------------
+# --------- Step 2: lookup route ----------
 st.header("Step 2 — Search data / Find the route (step-by-step)")
 
-colA, colB, colC = st.columns([1.5,1.5,6])
+colA, colB, _ = st.columns([1.5,1.5,6])
 with colA:
     start_node = st.selectbox("Start node", options=active_nodes, index=0, key="start_node")
 with colB:
@@ -328,8 +321,7 @@ succ_k = successor_of(key_id, active_nodes)
 st.markdown("**Key responsibility:**")
 st.latex(rf"\operatorname{{succ}}(k) = {succ_k}")
 
-# Controls: build full route, then reveal hop-by-hop
-cA, cB, cC = st.columns([1,1,6])
+cA, cB, _ = st.columns([1,1,6])
 with cA:
     if st.button("Start lookup (reset)"):
         path, reasons = chord_lookup_full(start_node, key_id, active_nodes, M)
@@ -344,7 +336,7 @@ with cB:
                 st.session_state.route_idx + 1
             )
 
-# If route not initialized yet, compute once from defaults
+# Initialize route if needed
 if not st.session_state.route_path:
     path, reasons = chord_lookup_full(start_node, key_id, active_nodes, M)
     st.session_state.route_path = path
@@ -353,9 +345,9 @@ if not st.session_state.route_path:
 
 route_path = st.session_state.route_path
 route_reasons = st.session_state.route_reasons
-route_hops_to_show = st.session_state.route_idx  # number of edges to draw
+route_hops_to_show = st.session_state.route_idx
 
-# ---------------- Draw everything together ----------------
+# Draw ring + fingers + route
 fig = ring_figure(
     active_nodes=active_nodes,
     selected=selected,
@@ -374,7 +366,6 @@ st.subheader("🧭 Route")
 st.code(" → ".join(str(n) for n in route_path), language="text")
 
 st.subheader("📐 Hop-by-hop reasoning")
-# Reveal reasons matching the number of drawn hops (each hop adds one reason; final reason on arrival)
 max_to_show = min(route_hops_to_show + 1, len(route_reasons))
 for i in range(max_to_show):
     st.latex(route_reasons[i])
