@@ -1,5 +1,7 @@
-# app_chord_tutor_pro_fix_order.py
-# Fix: define read_state_from_url()/write_state_to_url() BEFORE init_state()
+# app_chord_tutor_pro_latest.py
+# Changes:
+# - uses st.query_params (read/write) instead of experimental_* APIs
+# - uses st.rerun() instead of st.experimental_rerun()
 
 import math, time, json
 from dataclasses import dataclass
@@ -134,36 +136,38 @@ def add_sector(fig, a, b, color, alpha=0.12, steps=40):
                              line=dict(width=0), fillcolor=color, opacity=alpha,
                              hoverinfo="text", hovertext="", showlegend=False))
 
-# -------------------- URL share (MOVED UP) --------------------
+# -------------------- URL share (NEW API) --------------------
 def read_state_from_url():
-    qp = st.experimental_get_query_params()
+    qp = dict(st.query_params)  # strings, not lists
     if not qp: return
     ss = st.session_state
     try:
-        if "nodes" in qp:
-            ids = sorted(set(int(x) % SPACE for x in json.loads(qp["nodes"][0])))
+        if "nodes" in qp and qp["nodes"]:
+            ids = sorted(set(int(x) % SPACE for x in json.loads(qp["nodes"])))
             ss["active_nodes"] = ids
-        if "sel" in qp and qp["sel"][0] != "":
-            ss["selected"] = int(qp["sel"][0])
-        if "k" in qp:
-            ss["key_id"] = int(qp["k"][0])
-        if "step" in qp:
-            ss["step"] = int(qp["step"][0])
+        if "sel" in qp and qp["sel"] != "":
+            ss["selected"] = int(qp["sel"])
+        if "k" in qp and qp["k"] != "":
+            ss["key_id"] = int(qp["k"])
+        if "step" in qp and qp["step"] != "":
+            ss["step"] = int(qp["step"])
     except Exception:
         pass
 
 def write_state_to_url():
     ss = st.session_state
-    st.experimental_set_query_params(
-        nodes=json.dumps(ss.active_nodes),
-        sel=ss.selected if ss.selected is not None else "",
-        k=ss.key_id, step=ss.step
-    )
+    # Assign the whole mapping; values must be strings
+    st.query_params = {
+        "nodes": json.dumps(ss.active_nodes),
+        "sel": "" if ss.selected is None else str(ss.selected),
+        "k": str(ss.key_id),
+        "step": str(ss.step),
+    }
 
 # -------------------- State --------------------
 def init_state():
     ss = st.session_state
-    ss.setdefault("mode", "Student")  # or Explainer
+    ss.setdefault("mode", "Student")
     ss.setdefault("step", 1)
     ss.setdefault("auto_advance", True)
     ss.setdefault("color_blind", False)
@@ -330,13 +334,12 @@ def ring_figure(
 # -------------------- UI Helpers --------------------
 def pills_path(path: List[int], current_idx: int):
     if not path: st.write("—"); return
-    col = st.container()
     items = []
     for i, v in enumerate(path):
         style = "font-weight:700;" if i <= current_idx else ""
         items.append(f"""<span style="border:1px solid #e2e8f0;border-radius:999px;padding:4px 10px;margin-right:6px;{style}">{v}</span>""")
         if i < len(path)-1: items.append("→")
-    col.markdown("".join(items), unsafe_allow_html=True)
+    st.markdown("".join(items), unsafe_allow_html=True)
 
 def preset_row():
     c1, c2, c3, c4 = st.columns(4)
@@ -583,6 +586,7 @@ else:
                 else:
                     if st.button("▶ Play"): st.session_state.route_play = True
 
+            # Play loop (use st.rerun())
             if st.session_state.route_play and st.session_state.route_path:
                 now = time.time()
                 if now - st.session_state.last_tick > 0.6:
@@ -591,7 +595,7 @@ else:
                         st.session_state.route_idx += 1
                     else:
                         st.session_state.route_play = False
-                    st.experimental_rerun()
+                    st.rerun()
 
             if not st.session_state.route_path and st.session_state.active_nodes:
                 path, reasons, texts = chord_route(start, k, st.session_state.active_nodes, M)
@@ -603,17 +607,7 @@ else:
             m1.metric("Start", start); m2.metric("Key k", k); m3.metric("succ(k)", succ_k)
 
             st.markdown("**Path**")
-            # pills
-            if st.session_state.route_path:
-                items = []
-                for i, v in enumerate(st.session_state.route_path):
-                    bold = i <= st.session_state.route_idx
-                    style = "font-weight:700;" if bold else ""
-                    items.append(f"""<span style="border:1px solid #e2e8f0;border-radius:999px;padding:4px 10px;margin-right:6px;{style}">{v}</span>""")
-                    if i < len(st.session_state.route_path)-1: items.append("→")
-                st.markdown("".join(items), unsafe_allow_html=True)
-            else:
-                st.write("—")
+            pills_path(st.session_state.route_path, st.session_state.route_idx)
 
             st.markdown("**Reasoning (per hop)**")
             for i in range(min(st.session_state.route_idx+1, len(st.session_state.route_reasons))):
