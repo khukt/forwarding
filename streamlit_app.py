@@ -1,143 +1,307 @@
+# app.py
+import math
+import random
+from dataclasses import dataclass
+from typing import List, Tuple
 
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, Polygon
-import time
 
-st.set_page_config(page_title="Classic Representation — Proxies, Skeletons & Forwarding Pointers", layout="wide")
-
-# ---------------- Layout matching the textbook style ----------------
-POS = {
-    "P1": (-2.2, -0.8),
-    "P2": (-2.2,  0.8),
-    "P3": ( 0.0,  0.0),
-    "P4": ( 2.2,  0.0),
-}
-
-BOX_W, BOX_H = 2.0, 1.6
-
-def process_box(ax, pid, extra_label=None):
-    x, y = POS[pid]
-    ax.add_patch(Rectangle((x, y), BOX_W, BOX_H, fill=False, linewidth=2))
-    ax.text(x+0.08, y+BOX_H-0.12, f"Process {pid}", fontsize=13, ha="left", va="top")
-    if extra_label:
-        ax.text(x+BOX_W+0.2, y+BOX_H*0.5, extra_label, fontsize=12, ha="left", va="center")
-
-def stub(ax, pid, side="right", name=""):
-    # Draw the classic pentagon stub flush with the box edge
-    x, y = POS[pid]
-    w, h = 0.32, 0.24
-    if side == "right":
-        sx, sy = x + BOX_W - 0.46, y + BOX_H*0.5 - h/2
-        pts = [(sx,sy),(sx+w*0.55,sy),(sx+w,sy+h*0.5),(sx+w*0.55,sy+h),(sx,sy+h)]
-        text_xy = (x+BOX_W+0.12, y+BOX_H*0.5)
-        ha = "left"
-    else:  # left side (for a symmetric look if needed)
-        sx, sy = x + 0.14, y + BOX_H*0.5 - h/2
-        pts = [(sx+w,sy),(sx+w*0.45,sy),(sx,sy+h*0.5),(sx+w*0.45,sy+h),(sx+w,sy+h)]
-        text_xy = (x-0.15, y+BOX_H*0.5)
-        ha = "right"
-    ax.add_patch(Polygon(pts, closed=True, fill=False, linewidth=2))
-    if name:
-        ax.text(*text_xy, name, fontsize=12, ha=ha, va="center")
-    # Return anchor where arrows should connect
-    anchor = (sx+w if side=="right" else sx, y + BOX_H*0.5)
-    return anchor
-
-def arrow(ax, src, dst, style="active"):
-    lw = 3 if style=="active" else 1.2
-    ls = "-" if style!="forward" else "--"
-    ax.annotate("", xy=dst, xytext=src,
-                arrowprops=dict(arrowstyle="->", lw=lw, linestyle=ls))
-
-# ---------------- Scenes: single clean path per step ----------------
-# Keys in `points`: P1_proxy, P2_proxy, P3_skel, P4_obj
-SCENES = [
-    {
-        "title": "I. Basic RPC view",
-        "explain": "One active invocation highlighted: Proxy p in P1 calls the Skeleton in P3, which in turn performs a local invocation to the Object in P4.",
-        "active": [("P1_proxy","P3_skel"), ("P3_skel","P4_obj")],
-        "forward": [],
-        "notes": {"P1_proxy":"Proxy p", "P2_proxy":"Proxy p′", "P3_skel":"Skeleton", "P4_obj":"Object"},
-        "show_p2": True
-    },
-    {
-        "title": "II. Migration with forwarding pointer",
-        "explain": "The object migrates to P3. First call still goes to P4; a forwarding pointer sends it to P3. (Here we highlight the forwarding pointer only.)",
-        "active": [("P1_proxy","P4_obj")],
-        "forward": [("P4_obj","P3_skel")],
-        "notes": {"P1_proxy":"Proxy p", "P2_proxy":"Proxy p′", "P3_skel":"Skeleton / Object", "P4_obj":"(old)"},
-        "show_p2": True
-    },
-    {
-        "title": "III. Shortcutting (after first forwarded call)",
-        "explain": "After learning the new location, Proxy p calls P3 directly. The forwarding chain can be removed.",
-        "active": [("P1_proxy","P3_skel")],
-        "forward": [],
-        "notes": {"P1_proxy":"Proxy p", "P2_proxy":"Proxy p′", "P3_skel":"Skeleton / Object", "P4_obj":""},
-        "show_p2": True
-    },
-]
-
-if "scene" not in st.session_state:
-    st.session_state.scene = 0
-
-# ---------------- Draw ----------------
-
-def draw_scene(idx):
-    S = SCENES[idx]
-    fig, ax = plt.subplots(figsize=(11, 6))
-
-    # Process boxes
-    process_box(ax, "P2")
-    process_box(ax, "P1")
-    process_box(ax, "P3")
-    process_box(ax, "P4", extra_label="Object")
-
-    # Stubs
-    p1_anchor = stub(ax, "P1", side="right", name="")  # we'll place label outside
-    p3_anchor = stub(ax, "P3", side="left", name="")   # external label "Skeleton"
-    # P2 proxy p′ inside P2 at right edge
-    p2_anchor = stub(ax, "P2", side="right", name="")
-
-    # External labels (clean, outside boxes)
-    ax.text(POS["P1"][0]+0.2, POS["P1"][1]-0.25, S["notes"].get("P1_proxy","Proxy p"), fontsize=12, ha="left", va="top")
-    ax.text(POS["P2"][0]+0.2, POS["P2"][1]+BOX_H+0.15, S["notes"].get("P2_proxy","Proxy p′"), fontsize=12, ha="left", va="bottom")
-    ax.text(POS["P3"][0]-0.25, POS["P3"][1]+BOX_H*0.5+0.22, S["notes"].get("P3_skel","Skeleton"), fontsize=12, ha="right", va="center")
-    ax.text(POS["P4"][0]+BOX_W+0.2, POS["P4"][1]+BOX_H*0.5, S["notes"].get("P4_obj","Object"), fontsize=12, ha="left", va="center")
-
-    # Background IPC (thin) P1->P3 and P2->P3
-    arrow(ax, p1_anchor, p3_anchor, style="ipc")
-    # slight upward offset for P2 to avoid overlap: move start y by +0.12
-    p2_offset = (p2_anchor[0], p2_anchor[1]+0.12)
-    arrow(ax, p2_offset, p3_anchor, style="ipc")
-
-    # Anchors map
-    anchors = {
-        "P1_proxy": p1_anchor,
-        "P2_proxy": p2_anchor,
-        "P3_skel":  p3_anchor,
-        "P4_obj":   (POS["P4"][0], POS["P4"][1] + BOX_H*0.5),
-    }
-
-    # Active path
-    for (a,b) in S["active"]:
-        # apply same y-offset for P2 active path to keep separation
-        a_pt = anchors[a]
-        if a == "P2_proxy":
-            a_pt = (a_pt[0], a_pt[1]+0.12)
-        arrow(ax, a_pt, anchors[b], style="active")
-
-    # Forwarding pointer
-    for (a,b) in S["forward"]:
-        arrow(ax, anchors[a], anchors[b], style="forward")
-
-    ax.set_xlim(-3.6, 4.0)
-    ax.set_ylim(-1.8, 2.6)
-    ax.axis("off")
-    st.pyplot(fig)
-    st.markdown(f"**{S['title']}**")
-    st.write(S["explain"])
+# ----------------------------
+# Utilities for circular math
+# ----------------------------
+def mod_interval_contains(a: int, b: int, x: int, m: int, inclusive_right: bool = False) -> bool:
+    """
+    Return True iff x is in interval (a, b] on a modulo-m ring (if inclusive_right=True)
+    or (a, b) if inclusive_right=False. Intervals are clockwise from a to b.
+    """
+    if a == b:
+        return inclusive_right  # full ring if inclusive_right else empty
+    if a < b:
+        if inclusive_right:
+            return a < x <= b
+        else:
+            return a < x < b
+    else:
+        # wrapped case
+        if inclusive_right:
+            return (a < x <= m - 1) or (0 <= x <= b)
+        else:
+            return (a < x < m) or (0 <= x < b)
 
 
-st.caption("Legend: thin arrows = background IPC, thick solid = active invocation, thick dashed = forwarding pointer.")
+def successor_of(x: int, nodes: List[int], m: int) -> int:
+    """First node >= x clockwise (wraps around)."""
+    for n in nodes:
+        if n >= x:
+            return n
+    return nodes[0]  # wrap
+
+
+def closest_preceding_finger(n: int, fingers: List[int], target: int, m: int) -> int:
+    """Closest finger of n that strictly precedes target in (n, target). Fallback: n."""
+    for f in reversed(fingers):
+        if f != n and mod_interval_contains(n, target, f, m, inclusive_right=False):
+            return f
+    return n
+
+
+# ----------------------------
+# Chord structures
+# ----------------------------
+@dataclass
+class FingerEntry:
+    i: int
+    start: int
+    node: int
+
+def build_finger_table(n: int, nodes: List[int], m: int) -> List[FingerEntry]:
+    fingers = []
+    space = 2 ** m
+    for i in range(1, m + 1):
+        start = (n + 2 ** (i - 1)) % space
+        succ = successor_of(start, nodes, space)
+        fingers.append(FingerEntry(i=i, start=start, node=succ))
+    return fingers
+
+def chord_lookup_path(start_node: int, key: int, nodes: List[int], m: int, max_steps: int = 64) -> List[int]:
+    """
+    Simulate Chord's iterative lookup from start_node to key.
+    Returns the sequence of visited nodes.
+    """
+    visited = [start_node]
+    space = 2 ** m
+    # Precompute finger table for each node (small networks—fine for teaching)
+    finger_map = {n: [fe.node for fe in build_finger_table(n, nodes, m)] for n in nodes}
+    while len(visited) < max_steps:
+        curr = visited[-1]
+        succ = successor_of(key, nodes, space)
+        if curr == succ:
+            break
+        # If key in (curr, successor(curr)] then next hop is successor(curr)
+        curr_idx = nodes.index(curr)
+        next_idx = (curr_idx + 1) % len(nodes)
+        curr_succ = nodes[next_idx]
+        if mod_interval_contains(curr, curr_succ, key, space, inclusive_right=True):
+            visited.append(curr_succ)
+            if curr_succ == succ:
+                break
+            continue
+        # Else pick closest preceding finger
+        nxt = closest_preceding_finger(curr, finger_map[curr], key, space)
+        if nxt == curr:
+            # fallback to immediate successor to make progress
+            visited.append(curr_succ)
+        else:
+            visited.append(nxt)
+        if visited[-1] == succ:
+            break
+    return visited
+
+
+# ----------------------------
+# Visualization helpers
+# ----------------------------
+def node_xy(id_val: int, m: int, radius: float = 1.0) -> Tuple[float, float]:
+    """Position node on unit circle by id."""
+    space = 2 ** m
+    theta = 2 * math.pi * (id_val / space)
+    return radius * math.cos(theta), radius * math.sin(theta)
+
+def arc_points(a: int, b: int, m: int, steps: int = 50, radius: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Clockwise arc from a -> b on the circle, returning arrays of x,y points.
+    """
+    space = 2 ** m
+    if a <= b:
+        ids = np.linspace(a, b, steps)
+    else:
+        # wrap around
+        forward = np.linspace(a, space, steps // 2, endpoint=False)
+        wrap = np.linspace(0, b, steps // 2 + 1)
+        ids = np.concatenate([forward, wrap])
+    thetas = 2 * np.pi * (ids / space)
+    return np.cos(thetas), np.sin(thetas)
+
+def ring_figure(nodes: List[int], m: int, selected: int = None, key: int = None,
+                finger_table: List[FingerEntry] = None, lookup_path: List[int] = None) -> go.Figure:
+    R = 1.0
+    # Base ring
+    circle_angles = np.linspace(0, 2 * np.pi, 361)
+    ring_x = np.cos(circle_angles)
+    ring_y = np.sin(circle_angles)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=ring_x, y=ring_y, mode="lines", name="Hash ring", hoverinfo="skip"))
+
+    # Nodes
+    xs, ys, texts, colors, sizes = [], [], [], [], []
+    for nid in nodes:
+        x, y = node_xy(nid, m, R)
+        xs.append(x); ys.append(y)
+        label = f"{nid}"
+        if nid == selected:
+            colors.append("crimson"); sizes.append(14); label += " (selected)"
+        elif key is not None and successor_of(key, nodes, 2 ** m) == nid:
+            colors.append("orange"); sizes.append(12); label += " (succ(key))"
+        else:
+            colors.append("royalblue"); sizes.append(10)
+        texts.append(label)
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="markers+text", text=[str(n) for n in nodes],
+        textposition="top center", marker=dict(size=sizes, color=colors, line=dict(width=1, color="white")),
+        name="Nodes", hovertext=texts, hoverinfo="text"
+    ))
+
+    # Draw finger table chords from selected node
+    if selected is not None and finger_table:
+        sx, sy = node_xy(selected, m, R)
+        for fe in finger_table:
+            tx, ty = node_xy(fe.node, m, R)
+            # straight chord
+            fig.add_trace(go.Scatter(
+                x=[sx, tx], y=[sy, ty], mode="lines",
+                line=dict(width=2, dash="dot"),
+                name=f"finger[{fe.i}]→{fe.node}",
+                hovertext=f"finger[{fe.i}] start={fe.start} → {fe.node}",
+                hoverinfo="text",
+                showlegend=False
+            ))
+
+    # Draw lookup path as directed segments
+    if lookup_path and len(lookup_path) > 1:
+        for i in range(len(lookup_path) - 1):
+            ax, ay = node_xy(lookup_path[i], m, R)
+            bx, by = node_xy(lookup_path[i + 1], m, R)
+            fig.add_trace(go.Scatter(
+                x=[ax, bx], y=[ay, by], mode="lines+markers",
+                line=dict(width=3),
+                marker=dict(size=6),
+                name=f"hop {i+1}",
+                hoverinfo="skip",
+                showlegend=False
+            ))
+            # arrow head via annotation
+            fig.add_annotation(
+                x=bx, y=by, ax=ax, ay=ay, xref="x", yref="y", axref="x", ayref="y",
+                showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=2
+            )
+
+    # Aesthetic layout
+    fig.update_layout(
+        width=750, height=750,
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        margin=dict(l=10, r=10, t=40, b=10),
+        plot_bgcolor="white",
+        title="Chord Hash Ring • Nodes • Finger Table • Lookup Path",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+    )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    return fig
+
+
+# ----------------------------
+# Streamlit App
+# ----------------------------
+st.set_page_config(page_title="Chord DHT Visualizer", layout="wide")
+
+st.title("🔗 Chord DHT Visualizer")
+st.caption("Interactive, classroom-friendly visualization of the Chord hash ring, finger tables, and lookups.")
+
+with st.sidebar:
+    st.header("⚙️ Parameters")
+    m = st.slider("m (identifier bits)", min_value=4, max_value=16, value=8, help="ID space size is 2^m.")
+    space = 2 ** m
+
+    st.write("### Nodes")
+    mode = st.radio("Node set", ["Random N nodes", "Custom IDs"], index=0)
+    if mode == "Random N nodes":
+        N = st.slider("Number of nodes", min_value=2, max_value=min(64, space), value=min(10, space))
+        seed = st.number_input("Random seed", value=42, step=1)
+        random.seed(seed)
+        nodes = sorted(random.sample(range(space), N))
+    else:
+        ids_text = st.text_area(
+            "Enter node IDs (comma/space separated)", value="1, 3, 6, 8, 12",
+            help=f"Each must be in [0, {space-1}]."
+        )
+        raw = [t.strip() for t in ids_text.replace(",", " ").split()]
+        try:
+            nodes = sorted(set(int(x) % space for x in raw if x != ""))
+        except ValueError:
+            st.error("Invalid IDs. Please enter integers.")
+            st.stop()
+        if len(nodes) < 2:
+            st.error("Need at least 2 nodes.")
+            st.stop()
+
+    st.divider()
+    st.write("### Focus & Lookup")
+    selected_node = st.selectbox("Selected node", options=nodes, index=0)
+    key_id = st.number_input(f"Key ID (0..{space-1})", min_value=0, max_value=space - 1, value=0, step=1)
+    show_lookup = st.checkbox("Show lookup path from selected node to key ID", value=True)
+
+    st.divider()
+    st.write("### Display Options")
+    show_fingers = st.checkbox("Show selected node's finger table chords", value=True)
+
+# Compute finger table & lookup path
+finger = build_finger_table(selected_node, nodes, m)
+path = chord_lookup_path(selected_node, key_id, nodes, m) if show_lookup else None
+
+# Main layout
+left, right = st.columns([0.6, 0.4], gap="large")
+
+with left:
+    fig = ring_figure(
+        nodes=nodes,
+        m=m,
+        selected=selected_node,
+        key=key_id,
+        finger_table=finger if show_fingers else None,
+        lookup_path=path
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+with right:
+    st.subheader("📇 Finger Table (selected node)")
+    df = pd.DataFrame(
+        [{"i": fe.i, "start": fe.start, "successor": fe.node} for fe in finger],
+        columns=["i", "start", "successor"]
+    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.subheader("🧭 Lookup Steps")
+    if show_lookup:
+        succ = successor_of(key_id, nodes, 2 ** m)
+        st.markdown(f"**Target key ID:** `{key_id}` → **responsible node (successor):** `{succ}`")
+        if path and len(path) > 1:
+            step_text = " → ".join(str(n) for n in path)
+            st.code(f"path: {step_text}\nsteps: {len(path)-1}", language="text")
+        else:
+            st.write("No movement (already at successor or trivial case).")
+
+    with st.expander("ℹ️ How to interpret this"):
+        st.markdown(
+            """
+- **Ring**: The circle represents the identifier space `[0, 2^m - 1]`.
+- **Nodes**: Blue dots are nodes; the **selected** node is red; the node responsible for the **key** is orange.
+- **Finger chords**: Dashed lines from the selected node point to its finger entries (successors of `(n + 2^{i-1}) mod 2^m`).
+- **Lookup path**: Solid arrows show the hop-by-hop path using Chord’s greedy routing to locate the key’s responsible node.
+- **Table**: Lists `(i, start, successor)` for the selected node’s finger table.
+            """
+        )
+
+st.divider()
+with st.expander("📘 Teaching tips & suggested exercises"):
+    st.markdown(
+        """
+1. **Vary `m`** to see how the space grows and fingers get longer.
+2. **Increase/decrease N** to discuss scalability and `O(log N)` routing.
+3. **Manually place nodes** (Custom IDs) to craft edge cases (e.g., sparse clusters).
+4. **Trace lookups** for different key IDs and compare hop counts.
+5. **Ask: what changes if a node joins/leaves?** (Discuss stabilization conceptually.)
+        """
+    )
