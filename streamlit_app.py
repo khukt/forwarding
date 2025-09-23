@@ -1,10 +1,10 @@
 # app.py
-# Chord DHT — teaching-first visualizer with equation updates
-# ------------------------------------------------------------
+# Chord DHT — teaching-first visualizer with equation updates (fixed LaTeX rendering)
+# -----------------------------------------------------------------------------------
 # Features:
 # 1) Small ID space (2^m) with SHA-1 % 2^m allocation (nodes & keys)
-# 2) Finger table building with fully-expanded equations
-# 3) Lookup path with per-hop reasoning & equations
+# 2) Finger table building with fully-expanded equations (rendered via st.latex)
+# 3) Lookup path with per-hop reasoning & equations (rendered via st.latex)
 # 4) Interactive ring visual using Plotly
 
 import hashlib
@@ -63,25 +63,22 @@ def build_finger_table(n: int, nodes_sorted: List[int], m: int) -> List[FingerEn
 
 def finger_equations(n: int, m: int, entries: List[FingerEntry]) -> List[str]:
     """
-    Pretty LaTeX for each finger: start[i] = (n + 2^{i-1}) mod 2^m = value; finger[i] = succ(start[i]) = node
+    Return LaTeX bodies (no \( \) wrappers) for each finger entry:
+    finger[i]: start[i] = (n + 2^{i-1}) mod 2^m = value, node = succ(start[i]) = node
     """
-    space = 2 ** m
     lines = []
     for fe in entries:
         i = fe.i
-        start_expr = f"({n} + 2^{{{i-1}}}) \\bmod 2^{{{m}}}"
-        start_val = fe.start
-        succ_val = fe.node
         lines.append(
-            rf"\[\text{{finger}}[{i}]:\; "
-            rf"\text{{start}}[{i}] = {start_expr} = {start_val},\; "
-            rf"\text{{node}} = \operatorname{{succ}}({start_val}) = {succ_val}\]"
+            rf"\text{{finger}}[{i}]:\; "
+            rf"\text{{start}}[{i}] = ({n} + 2^{{{i-1}}}) \bmod 2^{{{m}}} = {fe.start},\; "
+            rf"\text{{node}} = \operatorname{{succ}}({fe.start}) = {fe.node}"
         )
     return lines
 
 
 # ----------------------------
-# Lookup (iterative Chord)
+# Lookup (iterative Chord) — returns hop reasons as LaTeX bodies
 # ----------------------------
 def closest_preceding_finger(n: int, fingers: List[int], target: int, m: int) -> int:
     for f in reversed(fingers):
@@ -93,12 +90,13 @@ def chord_lookup_with_reasons(start_node: int, key: int, nodes_sorted: List[int]
     """
     Return (visited_nodes, justification_lines[])
     Each hop has a short equation/interval explanation for teaching.
+    Strings are LaTeX bodies suitable for st.latex().
     """
     space = 2 ** m
     visited = [start_node]
-    reasons = []
+    reasons: List[str] = []
     if len(nodes_sorted) == 0:
-        return visited, ["No nodes in the ring."]
+        return visited, [r"\text{No nodes in the ring.}"]
     succ_key = successor_of(key, nodes_sorted)
 
     # Precompute finger lists (targets only) for all nodes
@@ -110,7 +108,7 @@ def chord_lookup_with_reasons(start_node: int, key: int, nodes_sorted: List[int]
     while len(visited) < max_steps:
         curr = visited[-1]
         if curr == succ_key:
-            reasons.append(rf"\(\textbf{{Stop:}}\; \text{{current}}={curr}=\operatorname{{succ}}({key})\).")
+            reasons.append(rf"\mathbf{{Stop:}}\; \text{{current}}={curr}=\operatorname{{succ}}({key})")
             break
 
         # immediate successor of curr on ring
@@ -121,12 +119,12 @@ def chord_lookup_with_reasons(start_node: int, key: int, nodes_sorted: List[int]
         in_interval = mod_interval_contains(curr, curr_succ, key, space, inclusive_right=True)
         if in_interval:
             reasons.append(
-                rf"\(\text{{Since }} {key}\in({curr},{curr_succ}] "
-                rf"\Rightarrow \text{{next}}=\operatorname{{succ}}({curr})={curr_succ}\)."
+                rf"\text{{Since }} {key}\in({curr},{curr_succ}] \Rightarrow "
+                rf"\text{{next}}=\operatorname{{succ}}({curr})={curr_succ}"
             )
             visited.append(curr_succ)
             if curr_succ == succ_key:
-                reasons.append(rf"\(\textbf{{Arrived at }} \operatorname{{succ}}({key})={succ_key}\).")
+                reasons.append(rf"\mathbf{{Arrived}}\ \text{{at}}\ \operatorname{{succ}}({key})={succ_key}")
                 break
             continue
 
@@ -135,23 +133,22 @@ def chord_lookup_with_reasons(start_node: int, key: int, nodes_sorted: List[int]
         if cpf == curr:
             # fallback to successor to ensure progress
             reasons.append(
-                rf"\(\text{{No finger in }}({curr},{key}) "
-                rf"\Rightarrow \text{{fallback to }} \operatorname{{succ}}({curr})={curr_succ}\)."
+                rf"\text{{No finger in }}({curr},{key}) \Rightarrow "
+                rf"\text{{fallback to }} \operatorname{{succ}}({curr})={curr_succ}"
             )
             visited.append(curr_succ)
         else:
             reasons.append(
-                rf"\(\text{{Choose closest preceding finger of }}{curr}\text{{ toward }}{key}: "
-                rf"{cpf}\in({curr},{key})\)."
+                rf"\text{{Choose closest preceding finger of }}{curr}\ \text{{toward }}{key}: "
+                rf"{cpf}\in({curr},{key})"
             )
             visited.append(cpf)
 
         if visited[-1] == succ_key:
-            reasons.append(rf"\(\textbf{{Arrived at }} \operatorname{{succ}}({key})={succ_key}\).")
+            reasons.append(rf"\mathbf{{Arrived}}\ \text{{at}}\ \operatorname{{succ}}({key})={succ_key}")
             break
 
     return visited, reasons
-
 
 
 # ----------------------------
@@ -271,7 +268,7 @@ key_labels  = [s.strip() for s in key_labels_text.splitlines() if s.strip()]
 node_map = {lbl: sha1_mod(lbl, space) for lbl in node_labels}
 key_map  = {lbl: sha1_mod(lbl, space) for lbl in key_labels}
 nodes_sorted = sorted(set(node_map.values()))
-id_to_node_labels = {}
+id_to_node_labels: Dict[int, List[str]] = {}
 for lbl, nid in node_map.items():
     id_to_node_labels.setdefault(nid, []).append(lbl)
 
@@ -290,7 +287,7 @@ if key_map:
 # Compute finger table & lookup
 finger_entries = build_finger_table(selected_node, nodes_sorted, m) if selected_node is not None else []
 lookup_path, hop_reasons = ([], [])
-if show_lookup and (selected_node is not None) and (key_id is not None):
+if show_lookup and (selected_node is not None) and (key_id is not None) and nodes_sorted:
     lookup_path, hop_reasons = chord_lookup_with_reasons(selected_node, key_id, nodes_sorted, m)
 
 # =========== Layout ===========
@@ -318,14 +315,15 @@ with right:
         )
         st.dataframe(df_nodes, use_container_width=True, hide_index=True)
         if show_eq:
-            st.markdown("**Equation:**  \n"
-                        rf"\(\text{{node\_id}} = \operatorname{{SHA1}}(\text{{label}}) \bmod 2^{{{m}}}\)")
+            st.markdown("**Equation:**")
+            st.latex(rf"\text{{node\_id}} = \operatorname{{SHA1}}(\text{{label}}) \bmod 2^{{{m}}}")
             with st.expander("Show per-node numeric substitutions"):
                 for lbl, nid in sorted(node_map.items(), key=lambda x: x[1]):
                     hhex = hashlib.sha1(lbl.encode("utf-8")).hexdigest()
+                    # Show first 10 hex chars just for readability
                     st.latex(
-                        rf"\text{{{lbl}}}:"
-                        rf"\quad \operatorname{{SHA1}}({lbl}) = \texttt{{{hhex[:10]}}}\dots "
+                        rf"\text{{{lbl}}}: "
+                        rf"\operatorname{{SHA1}}(\text{{{lbl}}}) = \texttt{{{hhex[:10]}}}\ldots "
                         rf"\Rightarrow \text{{int}} \bmod 2^{{{m}}} = {nid}"
                     )
     else:
@@ -345,9 +343,9 @@ with right:
         df_keys = pd.DataFrame(rows)
         st.dataframe(df_keys, use_container_width=True, hide_index=True)
         if show_eq:
-            st.markdown("**Responsibility rule:**  \n"
-                        rf"\(\operatorname{{succ}}(k) = \min\{{ n \in \text{{nodes}} \mid n \ge k \}}\)"
-                        rf"\ \text{{(wrap to 0 if none)}}.")
+            st.markdown("**Responsibility rule:**")
+            st.latex(r"\operatorname{succ}(k) = \min\{\, n \in \text{nodes} \mid n \ge k \,\}")
+            st.latex(r"\text{(wrap to }0\text{ if none)}")
     elif key_map and not nodes_sorted:
         st.warning("Add nodes first to compute responsibility.")
 
@@ -359,26 +357,24 @@ with right:
         )
         st.dataframe(df_ft, use_container_width=True, hide_index=True)
         if show_eq:
-            st.markdown("**Definition:**  \n"
-                        rf"\(\text{{start}}[i] = (n + 2^{{i-1}}) \bmod 2^{{{m}}},\quad "
-                        rf"\text{{finger}}[i] = \operatorname{{succ}}(\text{{start}}[i])\)")
+            st.markdown("**Definition:**")
+            st.latex(rf"\text{{start}}[i] = (n + 2^{{i-1}}) \bmod 2^{{{m}}}")
+            st.latex(r"\text{finger}[i] = \operatorname{succ}(\text{start}[i])")
             with st.expander("Show per-entry substitutions"):
                 for line in finger_equations(selected_node, m, finger_entries):
-                    st.markdown(line)
+                    st.latex(line)
 
     st.subheader("🧭 Lookup Steps & Reasons")
     if show_lookup and key_id is not None and selected_node is not None and nodes_sorted:
         succ_k = successor_of(key_id, nodes_sorted)
-        st.markdown(
-            rf"**Target key:** \(k={key_id}\) &nbsp;&nbsp; "
-            rf"**Responsible node:** \(\operatorname{{succ}}(k) = {succ_k}\)"
-        )
+        st.markdown("**Summary:**")
+        st.latex(rf"\text{{Target key }}k={key_id}\,,\quad \operatorname{{succ}}(k)={succ_k}")
         if lookup_path:
             st.code(" → ".join(str(n) for n in lookup_path), language="text")
         if show_eq and hop_reasons:
             with st.expander("Show hop-by-hop reasoning"):
                 for r in hop_reasons:
-                    st.markdown(r)
+                    st.latex(r)
     elif show_lookup:
         st.info("Pick at least one node and one key to run a lookup.")
 
