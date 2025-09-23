@@ -101,9 +101,11 @@ def chord_lookup_with_reasons(start_node: int, key: int, nodes_sorted: List[int]
         return visited, ["No nodes in the ring."]
     succ_key = successor_of(key, nodes_sorted)
 
-    # Precompute finger lists (targets only) for all nodes to keep it simple
-    finger_map: Dict[int, List[int]] = {n: [fe.node for fe in build_finger_table(n, nodes_sorted, m)]
-                                        for n in nodes_sorted}
+    # Precompute finger lists (targets only) for all nodes
+    finger_map: Dict[int, List[int]] = {
+        n: [fe.node for fe in build_finger_table(n, nodes_sorted, m)]
+        for n in nodes_sorted
+    }
 
     while len(visited) < max_steps:
         curr = visited[-1]
@@ -119,8 +121,8 @@ def chord_lookup_with_reasons(start_node: int, key: int, nodes_sorted: List[int]
         in_interval = mod_interval_contains(curr, curr_succ, key, space, inclusive_right=True)
         if in_interval:
             reasons.append(
-                rf"\(\text{{Since }} {key}\in({curr},{curr\_succ}] \Rightarrow \text{{next}}=\text{{successor}}({curr})={curr\_succ}\)."
-                .replace("curr_succ", "succ("+str(curr)+")")
+                rf"\(\text{{Since }} {key}\in({curr},{curr_succ}] "
+                rf"\Rightarrow \text{{next}}=\operatorname{{succ}}({curr})={curr_succ}\)."
             )
             visited.append(curr_succ)
             if curr_succ == succ_key:
@@ -133,12 +135,14 @@ def chord_lookup_with_reasons(start_node: int, key: int, nodes_sorted: List[int]
         if cpf == curr:
             # fallback to successor to ensure progress
             reasons.append(
-                rf"\(\text{{No finger in }}({curr},{key}) \Rightarrow \text{{fallback to }} \operatorname{{succ}}({curr})={curr_succ}\)."
+                rf"\(\text{{No finger in }}({curr},{key}) "
+                rf"\Rightarrow \text{{fallback to }} \operatorname{{succ}}({curr})={curr_succ}\)."
             )
             visited.append(curr_succ)
         else:
             reasons.append(
-                rf"\(\text{{Choose closest preceding finger of }}{curr}\text{ toward }{key}: {cpf}\in({curr},{key})\)."
+                rf"\(\text{{Choose closest preceding finger of }}{curr}\text{{ toward }}{key}: "
+                rf"{cpf}\in({curr},{key})\)."
             )
             visited.append(cpf)
 
@@ -147,6 +151,7 @@ def chord_lookup_with_reasons(start_node: int, key: int, nodes_sorted: List[int]
             break
 
     return visited, reasons
+
 
 
 # ----------------------------
