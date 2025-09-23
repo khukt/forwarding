@@ -198,9 +198,9 @@ def encode_laneB(event: Event, tkn:int, tlabel:str, use_cbor: bool) -> bytes:
 class TxPkt:
     t_enq: int; lane: str; size_bits: int; seq: int; payload: bytes
 
-# Gilbert-Elliott state per second
 def ge_sequence(n:int, pGG:float, pBB:float, rng) -> np.ndarray:
-    state = np.zeros(n, dtype=np.uint8)  # 1=GOOD, 0=BAD
+    """Gilbert–Elliott GOOD/BAD state per second: 1=GOOD, 0=BAD."""
+    state = np.zeros(n, dtype=np.uint8)
     state[0] = 1
     for i in range(1,n):
         if state[i-1]==1:
@@ -237,23 +237,24 @@ raw_bits_per_sec = (
     400                    # GNSS approx bits/s
 )
 
-seqA = 0; seqB = 0
+# Global counters (so nested try_tx can mutate them)
 delivered, dropped = 0, 0
+
+seqA = 0; seqB = 0
 per_sec_bits_sent = np.zeros(SECS, dtype=np.int64)
 queue_len_A = np.zeros(SECS, dtype=np.int32)
 queue_len_B = np.zeros(SECS, dtype=np.int32)
 
 # For latency stats
-latencies_A_ms = []
-latencies_B_ms = []
-delivered_events = []
+latencies_A_ms: List[int] = []
+latencies_B_ms: List[int] = []
+delivered_events: List[Dict] = []
 
 def maybe_corrupt_and_check(payload: bytes, ber: float, rng) -> bool:
     """Flip bits with BER; return True if CRC ok after corruption, else False."""
     if len(payload)<5:  # payload + 4 CRC
         return False
     data, crc = payload[:-4], payload[-4:]
-    # BER corruption: approximate by flipping k bits where k~Binomial(n_bits, ber)
     n_bits = len(data)*8
     flips = rng.binomial(n_bits, min(max(ber,0.0), 0.5))
     if flips>0:
@@ -265,6 +266,36 @@ def maybe_corrupt_and_check(payload: bytes, ber: float, rng) -> bool:
         data = bytes(arr)
     crc_ok = zlib.crc32(data).to_bytes(4,"big") == crc
     return crc_ok
+
+def try_tx(pkt: TxPkt, t_now:int) -> bool:
+    """Attempt TX with loss, BER, latency/jitter, reordering, duplication."""
+    global delivered, dropped
+    # Loss by state before spending budget
+    if rng.random() < loss_pct_ts[t_now]/100.0:
+        dropped += 1
+        return False
+    # Latency + jitter
+    lat = base_latency_ms + rng.integers(-jitter_ms, jitter_ms+1)
+    if rng.random() < reorder_prob:
+        lat += rng.integers(20, 120)  # extra delay for reordering
+    # Bit errors with CRC check
+    ok = maybe_corrupt_and_check(pkt.payload, float(ber_ts[t_now]), rng)
+    if not ok:
+        dropped += 1
+        return False
+    # Duplication
+    deliver_twice = (rng.random() < dup_prob)
+    # Record delivery
+    if pkt.lane=="A":
+        latencies_A_ms.append(max(0,lat))
+    else:
+        latencies_B_ms.append(max(0,lat))
+    delivered += 1
+    if deliver_twice:
+        if pkt.lane=="A": latencies_A_ms.append(max(0,lat+5))
+        else: latencies_B_ms.append(max(0,lat+5))
+        delivered += 1
+    return True
 
 for t in range(SECS):
     # Enqueue one Lane A adhesion telegram each second
@@ -280,8 +311,7 @@ for t in range(SECS):
         if strategy=="Adaptive (prefer Semantic)":
             if (t>0 and coverage[t-1]==0) or (t<SECS-1 and coverage[t+1]==0):
                 add = int(add*0.3)
-        # raw consumes capacity directly
-        send_raw_bits = add
+        send_raw_bits = add  # raw consumes capacity directly
 
     # Lane B events at this second
     for ev in [e for e in events if e.t==t]:
@@ -293,50 +323,16 @@ for t in range(SECS):
     budget = cap_bits[t] - send_raw_bits
     if budget < 0: budget = 0
 
-    # Helper to transmit a packet with channel effects
-    def try_tx(pkt: TxPkt, t_now:int) -> bool:
-        nonlocal delivered, dropped
-        # Loss by state (Gilbert-Elliott) before spending budget
-        if rng.random() < loss_pct_ts[t_now]/100.0:
-            dropped += 1
-            return False
-        # Consume capacity
-        # (We assume if it's scheduled here, size_bits has already been subtracted)
-        # Latency + jitter
-        lat = base_latency_ms + rng.integers(-jitter_ms, jitter_ms+1)
-        if rng.random() < reorder_prob:
-            lat += rng.integers(20, 120)  # add extra delay for reordering
-        # Bit errors
-        ok = maybe_corrupt_and_check(pkt.payload, float(ber_ts[t_now]), rng)
-        if not ok:
-            dropped += 1
-            return False
-        # Duplication
-        deliver_twice = (rng.random() < dup_prob)
-        # Record delivery (with latency)
-        if pkt.lane=="A":
-            latencies_A_ms.append(max(0,lat))
-        else:
-            latencies_B_ms.append(max(0,lat))
-        delivered += 1
-        if deliver_twice:
-            if pkt.lane=="A": latencies_A_ms.append(max(0,lat+5))
-            else: latencies_B_ms.append(max(0,lat+5))
-            delivered += 1
-        return True
-
-    # Serve Lane A first, then Lane B
-    # We allow multiple packets per second subject to budget
-    # Use FIFO within each lane
-    # Lane A
+    # Lane A priority
     i = 0
     while i < len(laneA_q) and budget >= laneA_q[i].size_bits:
         pkt = laneA_q.pop(i)
         budget -= pkt.size_bits
         per_sec_bits_sent[t] += pkt.size_bits
         try_tx(pkt, t)
-        # do not increment i because we popped
-    # Lane B
+        # don't increment i (we popped)
+
+    # Lane B next
     j = 0
     while j < len(laneB_q) and budget >= laneB_q[j].size_bits:
         pkt = laneB_q.pop(j)
@@ -344,13 +340,9 @@ for t in range(SECS):
         per_sec_bits_sent[t] += pkt.size_bits
         ok = try_tx(pkt, t)
         if ok:
-            # decode for table (safe: payload may be JSON or CBOR)
             body = pkt.payload[:-4]
             try:
-                if show_cbor:
-                    d = cbor2.loads(body)
-                else:
-                    d = json.loads(body.decode())
+                d = cbor2.loads(body) if show_cbor else json.loads(body.decode())
                 delivered_events.append({
                     "t_enq": pkt.t_enq,
                     "lane": pkt.lane,
@@ -363,14 +355,13 @@ for t in range(SECS):
                 })
             except Exception:
                 pass
-        # do not increment j because we popped
+        # don't increment j (we popped)
 
     queue_len_A[t] = len(laneA_q)
     queue_len_B[t] = len(laneB_q)
 
 # ───────────────────────── Overview metrics ────────────────────────────────
-# Theoretical raw if streamed continuously (ignores channel caps)
-theoretical_raw_bits = raw_bits_per_sec * SECS
+theoretical_raw_bits = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BITS_PER_SAMPLE + 400) * SECS
 actual_sent_bits = int(per_sec_bits_sent.sum())
 saved = 1.0 - (actual_sent_bits / max(theoretical_raw_bits,1))
 
