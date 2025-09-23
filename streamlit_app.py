@@ -1,5 +1,8 @@
-# app_chord_tutor_click_join_v2.py
+# app_chord_tutor_click_join_v3.py
 # Chord DHT — stepper tutor with click-to-join in Step 2 + ring shape fallback.
+# Updated for Streamlit deprecation:
+# - Replaced use_container_width with width='content'
+# - Removed unsupported 'config' arg from plotly_events()
 
 import math
 from dataclasses import dataclass
@@ -175,7 +178,8 @@ def ring_figure(
     fig.add_trace(go.Scatter(x=np.cos(ang), y=np.sin(ang), mode="lines",
                              line=dict(color=COLORS["ring"], width=2.2), hoverinfo="skip", name="Ring"))
     # ring fallback shape (always visible)
-    fig.add_shape(type="circle", xref="x", yref="y", x0=-1.0, y0=-1.0, x1=1.0, y1=1.0, line=dict(color=COLORS["ring"], width=2))
+    fig.add_shape(type="circle", xref="x", yref="y", x0=-1.0, y0=-1.0, x1=1.0, y1=1.0,
+                  line=dict(color=COLORS["ring"], width=2))
 
     # sectors
     if show_sectors and active:
@@ -299,7 +303,7 @@ if st.session_state.step == 1:
         allocated_now = False
         b1, b2, b3 = st.columns(3)
         with b1:
-            if st.button("Allocate", use_container_width=True):
+            if st.button("Allocate"):
                 lab = [s.strip() for s in labels.splitlines() if s.strip()]
                 ids = sorted(set(sha1_mod(x, SPACE) for x in lab))
                 st.session_state.active_nodes = ids
@@ -308,7 +312,7 @@ if st.session_state.step == 1:
                 st.session_state.fingers_revealed = 0
                 allocated_now = True
         with b2:
-            if st.button("Load example", use_container_width=True):
+            if st.button("Load example"):
                 ids = [1,4,9,11,14,18,20,21,28]
                 st.session_state.active_nodes = ids
                 st.session_state.allocated_nodes = ids[:]
@@ -316,14 +320,14 @@ if st.session_state.step == 1:
                 st.session_state.fingers_revealed = 0
                 allocated_now = True
         with b3:
-            if st.button("Clear", use_container_width=True):
+            if st.button("Clear"):
                 st.session_state.active_nodes = []
                 st.session_state.allocated_nodes = []
                 st.session_state.selected = None
                 st.session_state.fingers_revealed = 0
 
         manual = st.text_input("Manual IDs (optional, e.g. 1,4,9,11)")
-        if st.button("Use manual IDs", use_container_width=True):
+        if st.button("Use manual IDs"):
             raw = [t.strip() for t in manual.replace(",", " ").split()]
             try:
                 ids = sorted(set(int(x) % SPACE for x in raw if x != ""))
@@ -341,9 +345,8 @@ if st.session_state.step == 1:
 
         st.markdown("**Hash equation**"); st.latex(r"\text{node\_id} = \operatorname{SHA1}(\text{label}) \bmod 32")
 
-        # Step navigation
         if st.session_state.active_nodes:
-            if st.button("Proceed to Step 2 ▸ Fingers", use_container_width=True, type="primary"):
+            if st.button("Proceed to Step 2 ▸ Fingers"):
                 st.session_state.step = 2; st.rerun()
         if allocated_now and st.session_state.auto_advance and st.session_state.active_nodes:
             st.session_state.step = 2; st.rerun()
@@ -358,7 +361,7 @@ if st.session_state.step == 1:
     with left:
         fig = ring_figure(active=st.session_state.active_nodes, selected=st.session_state.selected,
                           allocated_nodes=st.session_state.allocated_nodes, show_sectors=False, multicolor=True)
-        st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step1")
+        st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="ring_step1")
 
 # ========= STEP 2: Fingers (click to join/leave/select) =========
 elif st.session_state.step == 2:
@@ -384,13 +387,13 @@ elif st.session_state.step == 2:
 
             c1, c2, c3 = st.columns(3)
             with c1:
-                if st.button("Reveal next", use_container_width=True):
+                if st.button("Reveal next"):
                     st.session_state.fingers_revealed = min(M, k+1)
             with c2:
-                if st.button("Reveal all", use_container_width=True):
+                if st.button("Reveal all"):
                     st.session_state.fingers_revealed = M
             with c3:
-                if st.button("Proceed to Step 3 ▸ Search", use_container_width=True, type="primary"):
+                if st.button("Proceed to Step 3 ▸ Search"):
                     st.session_state.step = 3; st.rerun()
 
             df = pd.DataFrame([{"i": f.i, "start": f.start, "successor": f.node} for f in f_show],
@@ -411,7 +414,7 @@ elif st.session_state.step == 2:
     with left:
         if not st.session_state.active_nodes:
             fig = ring_figure(active=[], show_sectors=False)
-            st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step2_empty")
+            st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="ring_step2_empty")
         else:
             f_all = build_fingers(st.session_state.selected, st.session_state.active_nodes, M)
             k = st.session_state.fingers_revealed
@@ -427,7 +430,7 @@ elif st.session_state.step == 2:
             clicked = plotly_events(
                 fig, click_event=True, select_event=False,
                 override_width=780, override_height=780,
-                key="ring_step2_click", config=PLOTLY_CONFIG
+                key="ring_step2_click"   # NOTE: no 'config' arg here
             )
             if clicked:
                 meta = clicked[0].get("customdata")  # {'id': int, 'kind': 'disabled'|'active'}
@@ -471,13 +474,13 @@ else:
 
             colb1, colb2 = st.columns(2)
             with colb1:
-                if st.button("Route", use_container_width=True):
+                if st.button("Route"):
                     path, reasons, texts = chord_route(start, k, st.session_state.active_nodes, M)
                     st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons, texts
                     st.session_state.route_idx = 0
                     st.session_state.key_id = k
             with colb2:
-                if st.button("Next hop", use_container_width=True):
+                if st.button("Next hop"):
                     if st.session_state.route_path:
                         st.session_state.route_idx = min(len(st.session_state.route_path)-1, st.session_state.route_idx+1)
 
@@ -502,7 +505,7 @@ else:
     with left:
         if not st.session_state.active_nodes:
             fig = ring_figure(active=[], show_sectors=False)
-            st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step3_empty")
+            st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="ring_step3_empty")
         else:
             if st.session_state.search_show_fingers:
                 sel = st.session_state.selected if (st.session_state.selected in st.session_state.active_nodes and st.session_state.selected is not None) else st.session_state.active_nodes[0]
@@ -525,4 +528,4 @@ else:
                 key=st.session_state.key_id,
                 show_sectors=True, multicolor=True
             )
-            st.plotly_chart(fig, use_container_width=False, config=PLOTLY_CONFIG, key="ring_step3")
+            st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="ring_step3")
