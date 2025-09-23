@@ -6,3 +6,4 @@ plotly
 streamlit-plotly-events
 kaleido
 cbor2
+scikit-learn
