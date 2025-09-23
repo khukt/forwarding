@@ -5,3 +5,4 @@ pyvis
 plotly
 streamlit-plotly-events
 kaleido
+cbor2
