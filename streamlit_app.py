@@ -1,13 +1,11 @@
-# app_chord_tutor_pro_clickfix.py
-# Fixes:
-# - More reliable click targets on nodes (larger markers)
-# - Sector layers set to hover/click-skip so they never eat clicks
-# - Removed fallback ring shape to avoid "double ring"
-# - Keeps st.query_params + st.rerun() APIs
+# app_chord_tutor_pro_v3.py
+# Chord DHT – Step-by-step Tutor (improved UX, reliable clicks, faster lookups)
 
 import math, time, json
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from functools import lru_cache
+from bisect import bisect_left
 
 import numpy as np
 import pandas as pd
@@ -15,9 +13,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_plotly_events import plotly_events
 
-# -------------------- Config --------------------
+# ───────────────────────────── Streamlit & Plotly config ─────────────────────────────
 st.set_page_config(page_title="Chord DHT • Pro Tutor", layout="wide", initial_sidebar_state="collapsed")
-
 PLOTLY_CONFIG = {
     "displaylogo": False,
     "modeBarButtonsToRemove": [
@@ -27,40 +24,40 @@ PLOTLY_CONFIG = {
     "toImageButtonOptions": {"format":"png","filename":"chord_ring","height":900,"width":900,"scale":2},
 }
 
-# Color palettes
+# ───────────────────────────── Constants & palettes ─────────────────────────────
+M = 5                           # keyspace bits
+SPACE = 2 ** M                  # 32 ids (0..31)
+ALL_POSITIONS = list(range(SPACE))
+
+SIZES = {
+    "disabled": 18, "active": 20, "succ": 22, "selected": 24, "diamond": 18
+}
+
 PALETTE_NORMAL = {
-    "ring": "#334155", "disabled": "#9ca3af",
-    "active": "#1f77b4", "allocated": "#22c55e",
-    "selected": "#d62728", "succ": "#ff7f0e",
-    "start": "#9467bd", "radial": "#6b7280", "hop": "#111827",
-    "sector": "#3b82f6",
-    "pill": "#0f172a",
+    "ring": "#334155", "disabled": "#9ca3af", "active": "#1f77b4", "allocated": "#22c55e",
+    "selected": "#d62728", "succ": "#ff7f0e", "start": "#9467bd", "radial": "#6b7280",
+    "hop": "#111827", "sector": "#3b82f6"
 }
 PALETTE_CBLIND = {
-    "ring": "#3B3B3B", "disabled": "#9c9c9c",
-    "active": "#0072B2", "allocated": "#009E73",
-    "selected": "#D55E00", "succ": "#CC79A7",
-    "start": "#9467bd", "radial": "#6b7280", "hop": "#2b2b2b",
-    "sector": "#56B4E9",
-    "pill": "#000000",
+    "ring": "#3B3B3B", "disabled": "#9c9c9c", "active": "#0072B2", "allocated": "#009E73",
+    "selected": "#D55E00", "succ": "#CC79A7", "start": "#9467bd", "radial": "#6b7280",
+    "hop": "#2b2b2b", "sector": "#56B4E9"
 }
 SECTOR_COLORS_A = ["#4E79A7","#F28E2B","#E15759","#76B7B2","#59A14F",
                    "#EDC948","#B07AA1","#FF9DA7","#9C755F","#BAB0AC"]
 SECTOR_COLORS_B = ["#0072B2","#009E73","#E69F00","#56B4E9","#F0E442",
                    "#D55E00","#CC79A7","#999999","#009E73","#0072B2"]
 
-# -------------------- Constants --------------------
-M = 5
-SPACE = 2 ** M
-ALL_POSITIONS = list(range(SPACE))
+def COLORS():   return PALETTE_CBLIND if st.session_state.color_blind else PALETTE_NORMAL
+def SPAL():     return SECTOR_COLORS_B if st.session_state.color_blind else SECTOR_COLORS_A
 
-# -------------------- Utilities --------------------
+# ───────────────────────────── Geometry & helpers ─────────────────────────────
 def sha1_mod(s: str, space: int) -> int:
     import hashlib
     return int(hashlib.sha1(s.encode("utf-8")).hexdigest(), 16) % space
 
-def node_xy(i: int, space=SPACE, r=1.0) -> Tuple[float,float]:
-    t = 2*math.pi*i/space
+def node_xy(i: int, r: float = 1.0) -> Tuple[float,float]:
+    t = 2*math.pi*i/SPACE
     return r*math.cos(t), r*math.sin(t)
 
 def mod_between(a: int, b: int, x: int, m: int, incl_right=False) -> bool:
@@ -69,24 +66,29 @@ def mod_between(a: int, b: int, x: int, m: int, incl_right=False) -> bool:
     return ((a < x <= m-1) or (0 <= x <= b)) if incl_right else ((a < x < m) or (0 <= x < b))
 
 def successor_of(x: int, nodes_sorted: List[int]) -> int:
-    for n in nodes_sorted:
-        if n >= x:
-            return n
-    return nodes_sorted[0]
+    """O(log N) successor with bisect. nodes_sorted must be sorted."""
+    if not nodes_sorted: return x
+    pos = bisect_left(nodes_sorted, x)
+    return nodes_sorted[pos] if pos < len(nodes_sorted) else nodes_sorted[0]
 
-@dataclass
+@dataclass(frozen=True)
 class Finger:
     i: int
     start: int
     node: int
 
-def build_fingers(n: int, nodes: List[int], m: int) -> List[Finger]:
+@lru_cache(maxsize=4096)
+def _build_fingers_cached(n: int, nodes_tuple: Tuple[int, ...], m: int) -> Tuple[Finger, ...]:
+    if not nodes_tuple: return tuple()
+    nodes = list(nodes_tuple)
     out: List[Finger] = []
-    if not nodes: return out
     for i in range(1, m+1):
         s = (n + 2**(i-1)) % (2**m)
         out.append(Finger(i=i, start=s, node=successor_of(s, nodes)))
-    return out
+    return tuple(out)
+
+def build_fingers(n: int, nodes: List[int], m: int) -> List[Finger]:
+    return list(_build_fingers_cached(n, tuple(nodes), m))
 
 def closest_preceding(n: int, fingers: List[int], target: int, m: int) -> int:
     for f in reversed(fingers):
@@ -126,7 +128,7 @@ def chord_route(start: int, key: int, nodes: List[int], m: int, max_steps=64):
     return path, latex, texts
 
 def add_sector(fig, a, b, color, alpha=0.10, steps=40):
-    """Sector polygons that do NOT capture hover/click (skip), so node clicks pass through."""
+    """Sector polygons that do NOT capture hover/click (so node clicks pass through)."""
     if a == b: return
     start = a/SPACE*2*math.pi; end = b/SPACE*2*math.pi
     th = np.linspace(start, end, steps) if a < b else np.concatenate([
@@ -136,41 +138,36 @@ def add_sector(fig, a, b, color, alpha=0.10, steps=40):
     xs = np.cos(th)*R1; ys = np.sin(th)*R1
     xs2 = np.cos(th[::-1])*R2; ys2 = np.sin(th[::-1])*R2
     fig.add_trace(go.Scatter(
-        x=np.r_[xs,xs2], y=np.r_[ys,ys2],
-        fill="toself", mode="none",  # <- no line/markers
-        fillcolor=color, opacity=alpha,
-        hoverinfo="skip",  # <- no hover tool
-        showlegend=False
+        x=np.r_[xs,xs2], y=np.r_[ys,ys2], fill="toself", mode="none",
+        fillcolor=color, opacity=alpha, hoverinfo="skip", showlegend=False
     ))
 
-# -------------------- URL share --------------------
+# ───────────────────────────── URL state (new Streamlit API) ─────────────────────────────
 def read_state_from_url():
     qp = dict(st.query_params)
     if not qp: return
     ss = st.session_state
     try:
         if "nodes" in qp and qp["nodes"]:
-            ids = sorted(set(int(x) % SPACE for x in json.loads(qp["nodes"])))
-            ss["active_nodes"] = ids
+            ss.active_nodes = sorted(set(int(x) % SPACE for x in json.loads(qp["nodes"])))
         if "sel" in qp and qp["sel"] != "":
-            ss["selected"] = int(qp["sel"])
+            ss.selected = int(qp["sel"])
         if "k" in qp and qp["k"] != "":
-            ss["key_id"] = int(qp["k"])
+            ss.key_id = int(qp["k"])
         if "step" in qp and qp["step"] != "":
-            ss["step"] = int(qp["step"])
+            ss.step = int(qp["step"])
     except Exception:
         pass
 
 def write_state_to_url():
-    ss = st.session_state
     st.query_params = {
-        "nodes": json.dumps(ss.active_nodes),
-        "sel": "" if ss.selected is None else str(ss.selected),
-        "k": str(ss.key_id),
-        "step": str(ss.step),
+        "nodes": json.dumps(st.session_state.active_nodes),
+        "sel": "" if st.session_state.selected is None else str(st.session_state.selected),
+        "k": str(st.session_state.key_id),
+        "step": str(st.session_state.step),
     }
 
-# -------------------- State --------------------
+# ───────────────────────────── State init ─────────────────────────────
 def init_state():
     ss = st.session_state
     ss.setdefault("mode", "Student")
@@ -191,26 +188,19 @@ def init_state():
     ss.setdefault("route_play", False)
     ss.setdefault("last_tick", 0.0)
 
-    # tours
+    # one-time tips
     ss.setdefault("tour_seen_step1", False)
     ss.setdefault("tour_seen_step2", False)
     ss.setdefault("tour_seen_step3", False)
 
-    # quizzes
+    # quick-check values
     ss.setdefault("quiz1_k", 7)
     ss.setdefault("quiz2_i", 4)
-    ss.setdefault("quiz3_next_from", None)
 
     read_state_from_url()
 init_state()
 
-def palette():
-    return PALETTE_CBLIND if st.session_state.color_blind else PALETTE_NORMAL
-
-def sector_palette():
-    return SECTOR_COLORS_B if st.session_state.color_blind else SECTOR_COLORS_A
-
-# -------------------- Drawing --------------------
+# ───────────────────────────── Figure builder ─────────────────────────────
 def ring_figure(
     active: List[int],
     selected: Optional[int] = None,
@@ -222,46 +212,37 @@ def ring_figure(
     route_texts: Optional[List[str]] = None,
     key: Optional[int] = None,
     show_sectors: bool = False,
-    multicolor: bool = True,
     allocated_nodes: Optional[List[int]] = None,
 ):
-    COLORS = palette()
+    C = COLORS()
     fig = go.Figure()
 
-    # Single ring (no duplicate shape)
+    # Single ring
     ang = np.linspace(0, 2*np.pi, 361)
-    fig.add_trace(go.Scatter(
-        x=np.cos(ang), y=np.sin(ang), mode="lines",
-        line=dict(color=COLORS["ring"], width=2.2),
-        hoverinfo="skip", name="Ring"
-    ))
+    fig.add_trace(go.Scatter(x=np.cos(ang), y=np.sin(ang), mode="lines",
+                             line=dict(color=C["ring"], width=2.2),
+                             hoverinfo="skip", name="Ring"))
 
-    # Sectors (click/hover skipped so markers always receive events)
+    # Sectors (skip hover/click)
     if show_sectors and active:
-        sp = sector_palette()
+        sp = SPAL()
         for idx, nid in enumerate(active):
-            pred = active[idx-1]
-            color = sp[idx % len(sp)]
-            add_sector(fig, pred, nid, color, alpha=0.10)
+            add_sector(fig, active[idx-1], nid, sp[idx % len(sp)], alpha=0.10)
 
-    # Disabled nodes (bigger markers; easy to click)
+    # Disabled nodes (clickable)
     disabled = [i for i in ALL_POSITIONS if i not in set(active)]
     if disabled:
         xs, ys = zip(*[node_xy(i) for i in disabled])
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="markers+text",
             text=[str(i) for i in disabled], textposition="top center",
-            marker=dict(
-                size=18,  # was 12
-                symbol="circle-open",
-                color=COLORS["disabled"],
-                line=dict(width=1.6, color=COLORS["disabled"])
-            ),
+            marker=dict(size=SIZES["disabled"], symbol="circle-open",
+                        color=C["disabled"], line=dict(width=1.6, color=C["disabled"])),
             name="Disabled", opacity=0.85, hoverinfo="text",
             customdata=[{"id": i, "kind": "disabled"} for i in disabled]
         ))
 
-    # Active nodes (bigger)
+    # Active nodes (clickable)
     succ_k = successor_of(key, active) if (key is not None and active) else None
     if active:
         xs, ys = zip(*[node_xy(i) for i in active])
@@ -269,54 +250,55 @@ def ring_figure(
         allocated_set = set(allocated_nodes or [])
         for nid in active:
             if selected == nid:
-                sizes.append(24); colors.append(COLORS["selected"]); labels.append(f"{nid} (selected)")
+                sizes.append(SIZES["selected"]); colors.append(C["selected"]); labels.append(f"{nid} (selected)")
             elif succ_k == nid:
-                sizes.append(22); colors.append(COLORS["succ"]); labels.append(f"{nid} (succ(key))")
+                sizes.append(SIZES["succ"]); colors.append(C["succ"]); labels.append(f"{nid} (succ(key))")
             elif allocated_set and nid in allocated_set:
-                sizes.append(20); colors.append(COLORS["allocated"]); labels.append(f"{nid} (just allocated)")
+                sizes.append(SIZES["active"]); colors.append(C["allocated"]); labels.append(f"{nid} (just allocated)")
             else:
-                sizes.append(20); colors.append(COLORS["active"]); labels.append(str(nid))
+                sizes.append(SIZES["active"]); colors.append(C["active"]); labels.append(str(nid))
             cds.append({"id": nid, "kind": "active"})
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="markers+text",
             text=[str(n) for n in active], textposition="top center",
             hovertext=labels, hoverinfo="text",
             marker=dict(size=sizes, color=colors, line=dict(width=1.6, color="white")),
-            name="Active",
-            customdata=cds
+            name="Active", customdata=cds
         ))
 
-    # Fingers
+    # Fingers (only latest shows tooltip)
     if selected is not None and fingers:
         sx, sy = node_xy(selected)
         for j, f in enumerate(fingers):
             tx, ty = node_xy(f.node)
+            is_last = (j == len(fingers) - 1)
             fig.add_trace(go.Scatter(
                 x=[sx, tx], y=[sy, ty], mode="lines",
-                line=dict(width=4 if j==len(fingers)-1 else 3,
-                          dash="dot", color=palette()["active"]),
-                hovertext=f"start[{f.i}]={f.start} → succ={f.node}", hoverinfo="text",
+                line=dict(width=4 if is_last else 3, dash="dot", color=C["active"]),
+                hoverinfo="text" if is_last else "skip",
+                hovertext=f"start[{f.i}]={f.start} → succ={f.node}" if is_last else None,
                 showlegend=False
             ))
 
-    # Highlight start[i]
+    # Highlight current start[i]
     if show_start is not None and selected is not None:
         hx, hy = node_xy(show_start)
         fig.add_trace(go.Scatter(
             x=[hx], y=[hy], mode="markers+text",
             text=[f"start={show_start}"], textposition="bottom center",
-            marker=dict(size=18, symbol="diamond", line=dict(width=1.2, color="black"), color=palette()["start"]),
+            marker=dict(size=SIZES["diamond"], symbol="diamond",
+                        line=dict(width=1.2, color="black"), color=C["start"]),
             showlegend=False
         ))
         if show_radial:
             sx, sy = node_xy(selected)
             fig.add_trace(go.Scatter(
                 x=[sx, hx], y=[sy, hy], mode="lines",
-                line=dict(width=1.5, dash="dash", color=palette()["radial"]),
+                line=dict(width=1.5, dash="dash", color=C["radial"]),
                 showlegend=False
             ))
 
-    # Route (if any)
+    # Route (draw partial up to route_hops)
     if route_path and route_hops > 0:
         for i in range(min(route_hops, len(route_path)-1)):
             a, b = route_path[i], route_path[i+1]
@@ -324,24 +306,25 @@ def ring_figure(
             tip = route_texts[i] if (route_texts and i < len(route_texts)) else f"{a} → {b}"
             fig.add_trace(go.Scatter(
                 x=[ax,bx], y=[ay,by], mode="lines+markers",
-                line=dict(width=4, color=palette()["hop"]),
-                marker=dict(size=8, color=palette()["hop"]),
+                line=dict(width=4, color=C["hop"]), marker=dict(size=8, color=C["hop"]),
                 hovertext=tip, hoverinfo="text", showlegend=False
             ))
             fig.add_annotation(x=bx, y=by, ax=ax, ay=ay, xref="x", yref="y", axref="x", ayref="y",
-                               showarrow=True, arrowhead=3, arrowsize=1.05, arrowwidth=2, arrowcolor=palette()["hop"])
+                               showarrow=True, arrowhead=3, arrowsize=1.05, arrowwidth=2, arrowcolor=C["hop"])
 
     fig.update_layout(
-        width=780, height=780,
+        width=780, height=780, plot_bgcolor="white",
         xaxis=dict(visible=False), yaxis=dict(visible=False),
-        margin=dict(l=8,r=8,t=30,b=8), plot_bgcolor="white",
-        title="Chord • Ring 0..31",
+        margin=dict(l=8,r=8,t=30,b=8), title="Chord • Ring 0..31",
         legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="center", x=0.5, font=dict(size=11)),
+        hovermode="closest",          # avoid stacked hover
+        clickmode="event+select"      # help plotly_events
     )
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    fig.update_layout(hoverlabel=dict(font_size=11, bgcolor="rgba(255,255,255,0.95)"))
     return fig
 
-# -------------------- UI Helpers --------------------
+# ───────────────────────────── Small UI helpers ─────────────────────────────
 def pills_path(path: List[int], current_idx: int):
     if not path: st.write("—"); return
     items = []
@@ -379,24 +362,22 @@ def preset_row():
             st.session_state.selected = ids[0]
             st.session_state.fingers_revealed = 0
 
-# -------------------- State init --------------------
-def init_view():
-    # Header & mode
-    topL, topR = st.columns([0.7, 0.3])
-    with topL:
-        st.title("🔗 Chord DHT — Pro Tutor")
-        st.caption("Step 1: Allocate → Step 2: Build finger table → Step 3: Search/route")
-    with topR:
-        st.session_state.mode = st.selectbox("Mode", ["Student","Explainer"], index=0 if st.session_state.mode=="Student" else 1)
-        st.session_state.color_blind = st.toggle("Color-blind palette", value=st.session_state.color_blind)
+# ───────────────────────────── Header & stepper ─────────────────────────────
+topL, topR = st.columns([0.7, 0.3])
+with topL:
+    st.title("🔗 Chord DHT — Pro Tutor")
+    st.caption("Step 1: Allocate → Step 2: Build finger table → Step 3: Search/route")
+with topR:
+    st.session_state.mode = st.selectbox("Mode", ["Student","Explainer"],
+                                         index=0 if st.session_state.mode=="Student" else 1)
+    st.session_state.color_blind = st.toggle("Color-blind palette", value=st.session_state.color_blind)
 
-    labels = ["① Allocate", "② Fingers", "③ Search"]
-    sel = st.radio("Steps", labels, index=st.session_state.step-1, horizontal=True, label_visibility="collapsed")
-    st.session_state.step = labels.index(sel) + 1
-    st.session_state.auto_advance = st.toggle("Auto-advance after Allocate", value=st.session_state.auto_advance)
-init_view()
+labels = ["① Allocate", "② Fingers", "③ Search"]
+sel = st.radio("Steps", labels, index=st.session_state.step-1, horizontal=True, label_visibility="collapsed")
+st.session_state.step = labels.index(sel) + 1
+st.session_state.auto_advance = st.toggle("Auto-advance after Allocate", value=st.session_state.auto_advance)
 
-# -------------------- STEP 1 --------------------
+# ───────────────────────────── STEP 1 ─────────────────────────────
 if st.session_state.step == 1:
     left, right = st.columns([0.60, 0.40], gap="large")
 
@@ -407,10 +388,9 @@ if st.session_state.step == 1:
             if st.button("Got it"):
                 st.session_state.tour_seen_step1 = True
 
-        st.markdown('<div class="tip">IDs are <code>SHA1(label) mod 32</code>. Initially, all positions are disabled.</div>', unsafe_allow_html=True)
         preset_row()
-
         labels_box = st.text_area("Node labels", value="nodeA\nnodeB\nnodeC\nnodeD", height=120)
+
         r1, r2, r3 = st.columns(3)
         allocated_now = False
         with r1:
@@ -469,7 +449,7 @@ if st.session_state.step == 1:
         )
         st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="fig_step1")
 
-# -------------------- STEP 2 --------------------
+# ───────────────────────────── STEP 2 ─────────────────────────────
 elif st.session_state.step == 2:
     if st.session_state.allocated_nodes: st.session_state.allocated_nodes = []
     left, right = st.columns([0.60, 0.40], gap="large")
@@ -489,12 +469,12 @@ elif st.session_state.step == 2:
                 index=0 if (st.session_state.selected not in st.session_state.active_nodes or st.session_state.selected is None)
                 else st.session_state.active_nodes.index(st.session_state.selected)
             )
-            allow_remove = st.toggle("Allow remove on click (active → disabled)", value=False)
-            st.session_state.allow_remove_click = allow_remove
+            st.session_state.allow_remove_click = st.toggle("Allow remove on click (active → disabled)", value=False)
 
             f_all = build_fingers(st.session_state.selected, st.session_state.active_nodes, M)
             k = st.session_state.fingers_revealed
             f_show = f_all[:k]
+
             c1, c2, c3 = st.columns(3)
             with c1:
                 if st.button("Reveal next"):
@@ -541,9 +521,8 @@ elif st.session_state.step == 2:
                 fingers=f_all[:k],
                 show_start=(f_all[k-1].start if k>0 else None),
                 show_radial=True,
-                show_sectors=True, multicolor=True
+                show_sectors=True
             )
-            # CLICK HANDLER
             clicked = plotly_events(
                 fig, click_event=True, select_event=False,
                 override_width=780, override_height=780, key="fig_step2_click"
@@ -568,7 +547,7 @@ elif st.session_state.step == 2:
                         else:
                             st.session_state.selected = nid; st.rerun()
 
-# -------------------- STEP 3 --------------------
+# ───────────────────────────── STEP 3 ─────────────────────────────
 else:
     left, right = st.columns([0.60, 0.40], gap="large")
     if not st.session_state.tour_seen_step3:
@@ -602,7 +581,6 @@ else:
                 else:
                     if st.button("▶ Play"): st.session_state.route_play = True
 
-            # Play loop
             if st.session_state.route_play and st.session_state.route_path:
                 now = time.time()
                 if now - st.session_state.last_tick > 0.6:
@@ -654,9 +632,8 @@ else:
         else:
             fig = ring_figure(
                 active=st.session_state.active_nodes,
-                selected=None,
-                fingers=None,
-                show_sectors=True, multicolor=True,
+                selected=None, fingers=None,
+                show_sectors=True,
                 route_path=st.session_state.route_path,
                 route_hops=st.session_state.route_idx,
                 route_texts=st.session_state.route_texts,
@@ -664,5 +641,5 @@ else:
             )
             st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="fig_step3")
 
-# persist sharable state in URL
+# Keep URL in sync
 write_state_to_url()
