@@ -1,278 +1,353 @@
-import json, math, time
-from dataclasses import dataclass
-from typing import Dict, List
+import time, math, io, json
 import numpy as np
 import pandas as pd
 import streamlit as st
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+from sklearn.cluster import KMeans
 import cbor2
 
-# -------------------- Page Setup --------------------
-st.set_page_config(page_title="ENSURE-6G Semantic Communication", layout="wide")
-st.markdown("# ENSURE-6G • Semantic Communication for Next-Gen Rail")
-st.caption("Realistic winter rail scenario (Sundsvall ↔ Stockholm). Transmit meaning, not firehoses.")
+st.set_page_config(page_title="ENSURE-6G — Live Semantic Communication Simulator", layout="wide")
+st.title("ENSURE-6G: Live Semantic Communication Simulator (Rail • Winter • 6G)")
+st.caption("Realistic time-series → features → events + codebook tokens → Lane A (safety) / Lane B (ops) packets • Coverage-aware transmission")
 
-# -------------------- Domain Defaults --------------------
-ROUTE_SECTIONS = [
-    ("Sundsvall", "Hudiksvall", 120),
-    ("Hudiksvall", "Söderhamn", 50),
-    ("Söderhamn", "Gävle", 75),
-    ("Gävle", "Uppsala", 100),
-    ("Uppsala", "Stockholm", 70),
-]
+# -------------------------- Controls --------------------------
+with st.sidebar:
+    st.header("Simulation Controls")
+    duration_min = st.slider("Simulated duration (minutes)", 5, 30, 12, step=1)
+    seed = st.number_input("Random seed", value=42, step=1)
+    st.markdown("---")
+    st.subheader("Winter conditions")
+    ambient_c = st.slider("Ambient temp (°C)", -30, 10, -12)
+    snowfall = st.select_slider("Snowfall", options=["none","light","moderate","heavy"], value="moderate")
+    icing = st.select_slider("Icing risk", options=["low","medium","high"], value="high")
+    st.markdown("---")
+    st.subheader("Coverage profile")
+    coverage_profile = st.selectbox("Rural 5G/6G coverage", ["Good", "Patchy (realistic)", "Poor"])
+    strategy = st.radio("Transmit strategy", ["Raw", "Semantic", "Adaptive (prefer Semantic)"], index=2)
+    ensure_events = st.checkbox("Guarantee visible events", value=True)
+    st.markdown("---")
+    st.subheader("Codebook")
+    k_codebook = st.select_slider("k-means codebook size (z tokens)", options=[32, 64, 128, 256], value=128)
+    show_cbor = st.checkbox("Use CBOR for Lane B packets (smaller than JSON)", value=True)
 
-# Sensor nominal rates (edge side; we don't stream these)
-FS_ACCEL = 200    # Hz (3-axis bogie accel)
-FS_PANTO = 500    # Hz (pantograph force)
-FS_TEMP  = 1      # Hz (4 bearings)
-FS_GNSS  = 1      # Hz (position)
+st.info("Tip: Use 'Patchy (realistic)' coverage + moderate snow + high icing to see semantic resilience vs raw.")
 
-BITS_PER_SAMPLE = 16  # assume 16-bit raw numeric
+# -------------------------- Constants --------------------------
+FS_ACCEL = 200   # Hz per axis
+FS_FORCE = 500   # Hz pantograph
+BITS_PER_SAMPLE = 16  # assume int16 raw
+SECS = duration_min * 60
+rng = np.random.default_rng(int(seed))
 
-# -------------------- Helpers --------------------
-def section_by_time(t: int, total_s: int) -> str:
-    seg_len = [s[2] for s in ROUTE_SECTIONS]
-    total_len = sum(seg_len)
-    pos = (t / max(total_s,1)) * total_len
-    acc = 0
-    for a, b, L in ROUTE_SECTIONS:
-        if pos <= acc + L:
-            return f"{a}→{b}"
-        acc += L
-    a, b, _ = ROUTE_SECTIONS[-1]
-    return f"{a}→{b}"
-
-def build_coverage_mask(n_steps: int, profile: str, seed: int = 42) -> np.ndarray:
-    rng = np.random.default_rng(seed)
+# Coverage mask generator
+def build_coverage_mask(n_steps: int, profile: str, rng) -> np.ndarray:
     if profile == "Good":
-        return (rng.random(n_steps) > 0.1).astype(np.uint8)     # ~90% avail
+        return (rng.random(n_steps) > 0.1).astype(np.uint8)  # ~90% available
     if profile == "Poor":
-        return (rng.random(n_steps) > 0.6).astype(np.uint8)     # ~40% avail
-    # Patchy: long holes + micro-fades
+        return (rng.random(n_steps) > 0.6).astype(np.uint8)  # ~40% available
+    # Patchy: deterministic long gaps plus microfades
     mask = np.ones(n_steps, dtype=np.uint8)
-    for start in [int(n_steps*0.2), int(n_steps*0.55)]:
-        mask[start:start+int(n_steps*0.08)] = 0
-    for _ in range(max(1, n_steps//20)):
-        mask[rng.integers(0, n_steps)] = 0
+    # two rural long gaps
+    for start_frac in [0.22, 0.56]:
+        start = int(n_steps * start_frac)
+        gap = int(n_steps * 0.08)
+        mask[start:start+gap] = 0
+    # random microfades
+    idxs = rng.integers(0, n_steps, size=max(1, n_steps//20))
+    mask[idxs] = 0
     return mask
 
+coverage = build_coverage_mask(SECS, coverage_profile, rng)
+
+# -------------------------- Signal synthesis (per-second windows) --------------------------
+# We do not store raw waveforms to keep it light. We synthesize features directly from parameterized signals.
+
+@dataclass
+class Feat:
+    t: int
+    seg: str
+    rms: float
+    crest: float
+    band_20_50: float
+    band_50_120: float
+    jerk: float
+    temp_peak: float
+    temp_ewma: float
+    temp_slope_cpm: float
+    slip_ratio: float
+    wsp_count: int
+    panto_varN: float
+
+# Route segments (km approximate weights for label only)
+ROUTE = [("Sundsvall","Hudiksvall",120), ("Hudiksvall","Söderhamn",50), ("Söderhamn","Gävle",75), ("Gävle","Uppsala",100), ("Uppsala","Stockholm",70)]
+total_km = sum(x[2] for x in ROUTE)
+
+def section_by_time(t: int) -> str:
+    pos = (t/SECS) * total_km
+    acc = 0
+    for a,b,l in ROUTE:
+        if pos <= acc + l:
+            return f"{a}→{b}"
+        acc += l
+    a,b,_ = ROUTE[-1]; return f"{a}→{b}"
+
+# Winter factors
+snow_factor = {"none":0.3, "light":0.7, "moderate":1.0, "heavy":1.5}[snowfall]
+ice_factor  = {"low":0.6, "medium":1.0, "high":1.4}[icing]
+
+# Feature generation model (statistically plausible)
+def synth_features(t: int) -> Feat:
+    seg = section_by_time(t)
+    # Baseline vibration features
+    base_rms = 0.18 + 0.05*np.sin(2*np.pi*t/180.0)
+    # Snow increases low/mid band power and rms
+    rms = abs(base_rms * (1 + 0.6*(snow_factor-0.3)) + rng.normal(0, 0.02))
+    band_20_50 = max(0.0, 0.12*(snow_factor) + rng.normal(0, 0.015))
+    band_50_120 = max(0.0, 0.08*(snow_factor) + rng.normal(0, 0.015))
+    crest = 2.2 + 0.2*(snow_factor) + rng.normal(0, 0.05)
+    jerk = 0.6 + 0.3*(snow_factor) + rng.normal(0, 0.05)
+
+    # Temperature (bearing) dynamics
+    temp_base = 45 + 0.02*t + (0 if ambient_c < -15 else 2)  # colder outside → slower rise
+    temp_noise = rng.normal(0, 0.3)
+    temp_inst = temp_base + temp_noise + (3.0 if snow_factor>1.2 and (t%600>300) else 0.0)
+    # Simple EWMA & slope estimates (simulate)
+    ewma = 0.8*temp_base + 0.2*temp_inst
+    slope_cpm = (0.8 + 0.4*(ice_factor-1.0))  # °C per minute approx
+    temp_peak = temp_inst + max(0, rng.normal(0.5, 0.2))
+
+    # Slip ratio and WSP
+    slip_ratio = max(0.0, rng.normal(0.05, 0.01) + 0.08*(snow_factor-0.3))
+    wsp_count = int(max(0, rng.normal(5, 2) + 12*(snow_factor-0.3)))
+
+    # Pantograph variance (ice -> higher)
+    panto_varN = max(0.0, rng.normal(40, 8) + 25*(ice_factor-1.0))
+
+    return Feat(t, seg, float(rms), float(crest), float(band_20_50), float(band_50_120),
+                float(jerk), float(temp_peak), float(ewma), float(slope_cpm),
+                float(slip_ratio), int(wsp_count), float(panto_varN))
+
+# Generate per-second features
+features: List[Feat] = [synth_features(t) for t in range(SECS)]
+
+# -------------------------- Event logic (dwell & hysteresis) --------------------------
 @dataclass
 class Event:
     t: int
     intent: str
     slots: Dict[str, object]
 
-def simulate_trip(duration_min: int,
-                  snowfall: str,
-                  icing_risk: str,
-                  coverage_profile: str,
-                  tx_mode: str):
-    total_s = duration_min * 60
-    # Raw bits if we naively streamed everything continuously
-    accel_bits = total_s * FS_ACCEL * 3 * BITS_PER_SAMPLE
-    panto_bits = total_s * FS_PANTO * BITS_PER_SAMPLE
-    temp_bits  = total_s * FS_TEMP  * 4 * BITS_PER_SAMPLE
-    gnss_bits  = total_s * FS_GNSS  * 400  # ~50 bytes/sample
-    raw_bits_total = accel_bits + panto_bits + temp_bits + gnss_bits
+events: List[Event] = []
+# thresholds (tunable)
+RMS_HIGH = 0.35
+SLIP_HIGH = 0.18
+TEMP_HIGH = 85.0
+PANTO_VAR_HIGH = 80.0
+DWELL_S = 120
 
-    # Winter → event rates
-    snow_factor = {"none":0.2,"light":0.5,"moderate":1.0,"heavy":1.6}[snowfall]
-    ice_factor  = {"low":0.5,"medium":1.0,"high":1.5}[icing_risk]
+# state
+rms_above_since = None
+slip_above_since = None
+temp_above_since = None
+panto_above_since = None
 
-    ride_events = max(1, int(2 * snow_factor))
-    adhesion_events = max(1, int(2 * snow_factor))
-    panto_events = int(1 * ice_factor)
-    bearing_events = 1 if ice_factor > 1.0 else 0
-    delay_events = 1
+for f in features:
+    # ride degradation
+    if f.rms >= RMS_HIGH:
+        rms_above_since = f.t if rms_above_since is None else rms_above_since
+    else:
+        rms_above_since = None
+    if rms_above_since is not None and f.t - rms_above_since >= DWELL_S:
+        events.append(Event(f.t, "ride_degradation", {"segment": f.seg, "rms": round(f.rms,3), "dwell_s": f.t - rms_above_since}))
+        rms_above_since = None  # emit sparsely
 
-    rng = np.random.default_rng(0)
-    N = ride_events + adhesion_events + panto_events + bearing_events + delay_events
-    ev_times = np.clip(rng.integers(40, max(41, total_s-40), size=N), 0, total_s-1)
-    ev_times.sort()
+    # low adhesion
+    if f.slip_ratio >= SLIP_HIGH:
+        slip_above_since = f.t if slip_above_since is None else slip_above_since
+    else:
+        slip_above_since = None
+    if slip_above_since is not None and f.t - slip_above_since >= 60:
+        km = round((f.t/SECS)*sum(x[2] for x in ROUTE), 1)
+        events.append(Event(f.t, "low_adhesion_event", {"km": km, "slip_ratio": round(f.slip_ratio,3), "duration_s": f.t - slip_above_since}))
+        slip_above_since = None
 
-    events: List[Event] = []
-    idx = 0
-    for t in ev_times:
-        seg = section_by_time(t, total_s)
-        if idx < ride_events:
-            events.append(Event(t, "ride_degradation",
-                                {"segment": seg, "sev": rng.choice(["low","medium","high"], p=[0.45,0.45,0.10]),
-                                 "rms": round(float(rng.uniform(0.3, 0.8)), 2), "dwell_s": int(rng.integers(120, 420))}))
-        elif idx < ride_events + adhesion_events:
-            events.append(Event(t, "low_adhesion_event",
-                                {"km": round(float(rng.uniform(100, 300)), 1),
-                                 "slip_ratio": round(float(rng.uniform(0.15, 0.35)), 2),
-                                 "duration_s": int(rng.integers(60, 180))}))
-        elif idx < ride_events + adhesion_events + panto_events:
-            events.append(Event(t, "pantograph_ice",
-                                {"varN": int(rng.integers(60, 140)), "temp_c": int(rng.integers(-25, -5))}))
-        elif idx < ride_events + adhesion_events + panto_events + bearing_events:
-            events.append(Event(t, "bearing_overtemp",
-                                {"axle": rng.choice(["1L","1R","2L","2R"]),
-                                 "peak_c": round(float(rng.uniform(80, 90)), 1),
-                                 "dwell_s": int(rng.integers(180, 420))}))
-        else:
-            events.append(Event(t, "delay_alert",
-                                {"station": "Gävle", "delay_min": int(rng.integers(3, 10))}))
-        idx += 1
+    # bearing overtemp
+    if f.temp_peak >= TEMP_HIGH:
+        temp_above_since = f.t if temp_above_since is None else temp_above_since
+    else:
+        temp_above_since = None
+    if temp_above_since is not None and f.t - temp_above_since >= 180:
+        events.append(Event(f.t, "bearing_overtemp", {"axle": "2L", "peak_c": round(f.temp_peak,1), "dwell_s": f.t - temp_above_since}))
+        temp_above_since = None
 
-    # Coverage & transmitted bits timeline
-    cov = build_coverage_mask(total_s, coverage_profile)
-    bits_per_sec_raw = int(raw_bits_total // max(1, total_s))
-    timeline_bits = np.zeros(total_s, dtype=np.int64)
+    # pantograph ice
+    if f.panto_varN >= PANTO_VAR_HIGH and ambient_c <= -8:
+        panto_above_since = f.t if panto_above_since is None else panto_above_since
+    else:
+        panto_above_since = None
+    if panto_above_since is not None and f.t - panto_above_since >= 90:
+        events.append(Event(f.t, "pantograph_ice", {"varN": int(f.panto_varN), "temp_c": ambient_c}))
+        panto_above_since = None
 
-    raw_bits_delivered = 0
-    delivered, dropped = 0, 0
-    avg_sem_bytes = 150  # Lane B packet typical JSON size
+# Guarantee events for demo if selected
+if ensure_events and len(events) == 0:
+    # inject one of each
+    t_inj = min(SECS-10, 300)
+    events.extend([
+        Event(t_inj, "ride_degradation", {"segment": section_by_time(t_inj), "rms": 0.42, "dwell_s": 180}),
+        Event(t_inj+20, "low_adhesion_event", {"km": 200.3, "slip_ratio": 0.22, "duration_s": 90}),
+        Event(t_inj+40, "pantograph_ice", {"varN": 95, "temp_c": ambient_c}),
+    ])
 
-    # RAW transmission
-    if tx_mode in ["Raw streams", "Adaptive (prefer Semantic)"]:
-        for t in range(total_s):
-            if cov[t] == 1:
-                timeline_bits[t] += bits_per_sec_raw
-        raw_bits_delivered = int(timeline_bits.sum())
+# -------------------------- Codebook tokens (k-means on feature vectors) --------------------------
+# Build feature matrix
+X = np.array([[f.rms, f.crest, f.band_20_50, f.band_50_120, f.jerk] for f in features], dtype=np.float32)
+# We fit k-means on this run (small k, fast); in production you'd preload centroids.
+kmeans = KMeans(n_clusters=int(k_codebook), n_init=5, random_state=int(seed)).fit(X)
+tokens = kmeans.predict(X)  # z per second
+# Optional: simple human-readable labels for a few clusters (demo)
+# We'll assign labels by centroid RMS/band power ranking
+centroids = kmeans.cluster_centers_
+cent_rms = centroids[:,0]
+order = np.argsort(cent_rms)
+labels = ["smooth"]*len(centroids)
+if len(centroids) >= 4:
+    labels[order[-1]] = "rough-snow"
+    labels[order[-2]] = "curve-rough"
+    labels[order[0]]  = "very-smooth"
 
-    # SEMANTIC events transmission (Lane B)
-    if tx_mode != "Raw streams":
-        for ev in events:
-            if cov[ev.t] == 1:
-                delivered += 1
-                timeline_bits[ev.t] += avg_sem_bytes * 8
-            else:
-                dropped += 1
-
-    # Adaptive: reduce raw during edges of coverage holes
-    if tx_mode == "Adaptive (prefer Semantic)":
-        reduction = int(0.7 * bits_per_sec_raw)
-        for t in range(total_s):
-            if cov[t] == 1 and ((t>0 and cov[t-1]==0) or (t<total_s-1 and cov[t+1]==0)):
-                timeline_bits[t] = max(0, timeline_bits[t] - reduction)
-        raw_bits_delivered = int(timeline_bits.sum() - delivered * avg_sem_bytes * 8)
-
+# -------------------------- Packetization + Network --------------------------
+# Lane A: safety telegram examples (fixed fields, tiny)
+def laneA_adhesion_state(f: Feat) -> Dict[str, int]:
+    mu_est = max(0.0, min(0.6, 0.6 - 0.5*f.slip_ratio))  # crude lower bound
     return {
-        "events": events,
-        "coverage": cov,
-        "per_sec_bits": timeline_bits,
-        "theoretical_raw_bits": int(raw_bits_total),
-        "actual_sent_bits": int(timeline_bits.sum()),
-        "delivered_events": delivered,
-        "dropped_events": dropped,
-        "total_seconds": total_s
+        "mu_q7_9": int((mu_est) * (1<<9)),   # fixed-point
+        "conf_pct": int(max(0, min(100, 100 - 120*abs(0.2-f.slip_ratio)))),
+        "slip": int(f.slip_ratio >= SLIP_HIGH),
+        "wsp": int(min(255, f.wsp_count)),
+        "valid_ms": 500
     }
 
-# -------------------- TAB 1: Why semantics? --------------------
-tab1, tab2, tab3, tab4 = st.tabs(["Why semantics?", "Live simulation", "Safety vs Ops", "Evidence"])
+def encode_laneA(pkt: Dict[str,int], seq: int) -> bytes:
+    # Serialize deterministically: tiny CBOR-like but using cbor2 for convenience
+    payload = dict(pkt); payload.update({"seq": seq})
+    b = cbor2.dumps(payload)  # in practice you might use fixed-width binary
+    return b
 
-with tab1:
-    st.subheader("Executive overview")
-    c1, c2, c3 = st.columns(3)
-    # Quick back-of-envelope for 10 minutes
-    ten_min = 10*60
-    raw_10m = ten_min*(FS_ACCEL*3 + FS_PANTO)*BITS_PER_SAMPLE + ten_min*(FS_TEMP*4*BITS_PER_SAMPLE + FS_GNSS*400)
-    sem_10m = 90 * 150 * 8  # pretend ~90 semantic events in 10m, 150 B each
-    saved = 1 - (sem_10m / max(raw_10m,1))
-    with c1: st.metric("Raw if streamed (10 min)", f"{raw_10m/(8*1024*1024):.2f} MB")
-    with c2: st.metric("Semantic actually sent (10 min)", f"{sem_10m/(8*1024):.1f} KB")
-    with c3: st.metric("Bandwidth saved", f"{100*saved:.1f}%")
-    st.markdown("**We transmit meaning, not firehoses.** Edge extracts task-relevant semantics from sensors. Safety telegrams stay tiny and deterministic; non-safety analytics remain efficient even with patchy coverage.")
+# Lane B: operational events (JSON/CBOR)
+def encode_laneB(event: Event, use_cbor: bool) -> bytes:
+    d = {"i": event.intent, "ts": int(event.t), "s": event.slots}
+    if use_cbor:
+        return cbor2.dumps(d)
+    return json.dumps(d, separators=(",",":")).encode()
 
-    st.image("https://dummyimage.com/1200x140/0a2540/e0f7ff&text=ENSURE-6G+Semantic+Communication+Diagram", caption="Two lanes: A (safety) and B (operations)", use_container_width=True)
+# Transmission simulation
+per_sec_bits = np.zeros(SECS, dtype=np.int64)
+delivered = 0; dropped = 0
+laneA_msgs = 0
+laneB_msgs = 0
 
-# -------------------- TAB 2: Live simulation --------------------
-with tab2:
-    st.subheader("Live simulation — winter rail (Sundsvall ↔ Stockholm)")
-    colL, colR = st.columns([1,1])
-    with colL:
-        duration_min = st.slider("Trip duration (minutes)", 10, 60, 20, step=5)
-        snowfall = st.select_slider("Snowfall", options=["none","light","moderate","heavy"], value="moderate")
-        icing_risk = st.select_slider("Icing risk", options=["low","medium","high"], value="high")
-        coverage = st.selectbox("Coverage profile", ["Good", "Patchy (realistic)", "Poor"])
-        tx_mode = st.radio("Transmit strategy", ["Raw streams", "Semantic only", "Adaptive (prefer Semantic)"], index=2)
-        st.caption("Tip: try Patchy + Adaptive to see semantics win.")
-        run = st.button("Run simulation", type="primary")
+# Raw budget if attempted (per second)
+raw_bits_per_sec = (
+    FS_ACCEL*3*BITS_PER_SAMPLE +
+    FS_FORCE*BITS_PER_SAMPLE +
+    4*1*BITS_PER_SAMPLE +   # temps 1 Hz x4
+    400                     # GNSS NMEA-ish bits/s
+)
 
-    if run:
-        res = simulate_trip(duration_min, snowfall, icing_risk, coverage, tx_mode)
+# For each second, decide what to send based on strategy & coverage
+seqA = 0
+laneB_trace = []
+for t in range(SECS):
+    cov = coverage[t] == 1
 
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: st.metric("Trip duration", f"{duration_min} min")
-        with c2: st.metric("Theoretical RAW", f"{res['theoretical_raw_bits']/(8*1024*1024):.2f} MB")
-        with c3: st.metric("Actual sent", f"{res['actual_sent_bits']/(8*1024*1024):.2f} MB")
-        with c4:
-            saved = 1 - (res["actual_sent_bits"]/max(res["theoretical_raw_bits"],1))
-            st.metric("Bandwidth saved", f"{100*saved:.1f}%")
+    # Lane A: adhesion telegram every 1s
+    pa = laneA_adhesion_state(features[t])
+    ba = encode_laneA(pa, seqA); seqA += 1
+    laneA_msgs += 1
+    if cov:
+        per_sec_bits[t] += len(ba)*8
+        delivered += 1
+    else:
+        dropped += 1
 
-        c5, c6 = st.columns(2)
-        with c5: st.metric("Semantic events delivered", res["delivered_events"])
-        with c6: st.metric("Semantic events dropped", res["dropped_events"])
+    # Strategy behaviors for raw/semantic
+    if strategy in ["Raw","Adaptive (prefer Semantic)"]:
+        if cov:
+            # In Adaptive, we lower raw near coverage holes (we model as 70% reduction)
+            add = raw_bits_per_sec
+            if strategy == "Adaptive (prefer Semantic)":
+                if (t>0 and coverage[t-1]==0) or (t<SECS-1 and coverage[t+1]==0):
+                    add = int(add * 0.3)
+            per_sec_bits[t] += add
 
-        st.markdown("**Per-second transmitted bits & coverage**")
-        df = pd.DataFrame({"t_s": np.arange(res["total_seconds"]),
-                           "bits_sent": res["per_sec_bits"],
-                           "coverage": res["coverage"]})
-        st.line_chart(df[["bits_sent"]], height=220)
-        st.area_chart(df[["coverage"]], height=120)
+    # Lane B: send an event if any occurring at t
+    for ev in [e for e in events if e.t == t]:
+        bb = encode_laneB(ev, show_cbor)
+        laneB_msgs += 1
+        if cov:
+            per_sec_bits[t] += len(bb)*8
+            delivered += 1
+            laneB_trace.append({"t": t, "intent": ev.intent, "slots": ev.slots, "bytes": len(bb), "encoding": "CBOR" if show_cbor else "JSON", "segment": section_by_time(t), "token_z": int(tokens[t]), "token_label": labels[tokens[t]]})
+        else:
+            dropped += 1
 
-        st.markdown("**Event log (what the control centre sees)**")
-        rows = []
-        for ev in res["events"]:
-            status = "sent" if (tx_mode != "Raw streams" and res["coverage"][ev.t] == 1) else ("dropped" if tx_mode!="Raw streams" else "not sent (raw mode)")
-            rows.append({"t (s)": ev.t, "segment": section_by_time(ev.t, res["total_seconds"]), "intent": ev.intent, "slots": json.dumps(ev.slots), "status": status})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220)
+# -------------------------- Overview Metrics --------------------------
+theoretical_raw_bits = raw_bits_per_sec * SECS
+actual_sent_bits = int(per_sec_bits.sum())
+saved = 1.0 - (actual_sent_bits / max(theoretical_raw_bits,1))
 
-# -------------------- TAB 3: Safety vs Ops --------------------
-with tab3:
-    st.subheader("Lane A (safety) vs Lane B (operations)")
+c1,c2,c3,c4 = st.columns(4)
+with c1: st.metric("Duration (min)", duration_min)
+with c2: st.metric("Raw if streamed (MB)", f"{theoretical_raw_bits/(8*1024*1024):.2f}")
+with c3: st.metric("Actual sent (MB)", f"{actual_sent_bits/(8*1024*1024):.2f}")
+with c4: st.metric("Bandwidth saved vs raw", f"{100*saved:.1f}%")
 
-    colA, colB = st.columns(2)
-    with colA:
-        st.markdown("### Lane A — Safety telegrams (tiny, bounded)")
-        adhesion_cbor = {
-            0: -0.03,  # mu_lowbound (example)
-            1: 78,     # confidence %
-            2: True,   # slip active
-            3: 19,     # WSP count (last 10 s)
-            4: 500,    # valid_ms
-            5: 12345678, # timestamp
-            6: 4152,     # seq
-        }
-        b = cbor2.dumps(adhesion_cbor)
-        st.code(f"CBOR bytes: {len(b)}\n{adhesion_cbor}")
-        st.caption("Fixed fields, integrity (CRC/seq) in transport layer; tiny payloads (tens of bytes).")
+c5,c6,c7 = st.columns(3)
+with c5: st.metric("Lane A telegrams", laneA_msgs)
+with c6: st.metric("Lane B events", laneB_msgs)
+with c7: st.metric("Messages delivered", delivered)
 
-        speed_cbor = {
-            0: 1400,  # v_max_dms (140.0 km/h)
-            1: 123,   # section_id
-            2: 1,     # reason (adhesion)
-            3: 5000,  # ttl_ms
-            4: 4153,  # seq
-        }
-        st.code(f"CBOR bytes: {len(cbor2.dumps(speed_cbor))}\n{speed_cbor}")
+# -------------------------- Charts --------------------------
+st.subheader("Transmitted bits per second & coverage")
+df = pd.DataFrame({"t": np.arange(SECS), "bits": per_sec_bits, "coverage": coverage})
+st.line_chart(df.set_index("t")[["bits"]])
+st.area_chart(df.set_index("t")[["coverage"]])
 
-    with colB:
-        st.markdown("### Lane B — Operational semantics (rich, non-safety)")
-        ex_json = {"i":"low_adhesion_event","s":{"km":245.3,"slip_ratio":0.22,"duration_s":90}}
-        ex_bytes_json = len(json.dumps(ex_json).encode())
-        ex_bytes_cbor = len(cbor2.dumps(ex_json))
-        st.code(json.dumps(ex_json, indent=2))
-        st.write(f"Size → JSON: ~{ex_bytes_json} B • CBOR: ~{ex_bytes_cbor} B")
-        st.caption("Lane B never drives safety decisions; it informs maintenance and operations.")
+# -------------------------- Event Table (Lane B) --------------------------
+st.subheader("Operational semantic events (Lane B)")
+if laneB_trace:
+    st.dataframe(pd.DataFrame(laneB_trace))
+else:
+    st.info("No Lane B events fired under current conditions. Toggle 'Guarantee visible events' or increase snow/icing.")
 
-# -------------------- TAB 4: Evidence --------------------
-with tab4:
-    st.subheader("Scientific evidence")
-    # Static, self-explanatory charts (synthetic but realistic)
-    data = {
-        "Sensor": ["Accel (3-axis)", "Pantograph force", "Bearings x4", "GNSS"],
-        "Raw MB / 10 min": [1.4, 3.6, 0.01, 0.06],
-        "Semantic KB / 10 min": [6.0, 6.0, 1.0, 1.0],
-    }
-    df = pd.DataFrame(data)
-    st.table(df)
-    st.caption(">99% bandwidth reduction for high-rate sensors with no material loss in task performance.")
+# -------------------------- Packet Inspector --------------------------
+st.subheader("Packet inspector")
+example_t = min(SECS-1, max(0, SECS//3))
+example_ev = next((e for e in events if e.t >= example_t), None)
+colL, colR = st.columns(2)
 
-    # Task preservation placeholders (numbers you can tune later)
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Ride comfort index error", "±3.8%")
-    with c2: st.metric("Fault classifier AUROC drop", "−2.1 pp")
-    with c3: st.metric("Safety telegram p99 latency", "≤ 100 ms")
-    st.caption("Semantic prioritisation preserves decision-critical updates even under poor coverage. CBOR halves payload vs JSON with identical meaning.")
+with colL:
+    st.markdown("**Lane A (safety) adhesion_state**")
+    pktA = laneA_adhesion_state(features[example_t])
+    bA = encode_laneA(pktA, 123)
+    st.code(json.dumps(pktA, indent=2))
+    st.write(f"Encoded size: {len(bA)} bytes (CBOR)")
+
+with colR:
+    st.markdown("**Lane B (ops) example event**")
+    if example_ev is None:
+        example_ev = Event(example_t, "ride_degradation", {"segment": section_by_time(example_t), "rms": 0.41, "dwell_s": 160})
+    bB_json = encode_laneB(example_ev, use_cbor=False)
+    bB_cbor = encode_laneB(example_ev, use_cbor=True)
+    st.code(json.dumps({"i": example_ev.intent, "ts": example_ev.t, "s": example_ev.slots}, indent=2))
+    st.write(f"JSON size: {len(bB_json)} bytes • CBOR size: {len(bB_cbor)} bytes")
+
+# -------------------------- Download trace --------------------------
+st.subheader("Download delivered Lane B events (for analysis)")
+delivered_events = [e for e in laneB_trace]
+st.download_button("Download JSON", data=json.dumps(delivered_events, indent=2), file_name="laneB_events.json", mime="application/json")
+
+st.markdown("---")
+st.caption("Live simulation • Realistic per-second features and events • Codebook tokens (k-means) • Coverage-aware transmission • Lane A safety telegrams are tiny and bounded; Lane B carries rich ops semantics.")
