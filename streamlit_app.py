@@ -1,6 +1,5 @@
-# app_chord_tutor_pro.py
-# Chord DHT Tutor — Interactive, student-friendly version
-# Requirements (see bottom): streamlit, plotly, pandas, numpy, streamlit-plotly-events
+# app_chord_tutor_pro_fix_order.py
+# Fix: define read_state_from_url()/write_state_to_url() BEFORE init_state()
 
 import math, time, json
 from dataclasses import dataclass
@@ -135,6 +134,32 @@ def add_sector(fig, a, b, color, alpha=0.12, steps=40):
                              line=dict(width=0), fillcolor=color, opacity=alpha,
                              hoverinfo="text", hovertext="", showlegend=False))
 
+# -------------------- URL share (MOVED UP) --------------------
+def read_state_from_url():
+    qp = st.experimental_get_query_params()
+    if not qp: return
+    ss = st.session_state
+    try:
+        if "nodes" in qp:
+            ids = sorted(set(int(x) % SPACE for x in json.loads(qp["nodes"][0])))
+            ss["active_nodes"] = ids
+        if "sel" in qp and qp["sel"][0] != "":
+            ss["selected"] = int(qp["sel"][0])
+        if "k" in qp:
+            ss["key_id"] = int(qp["k"][0])
+        if "step" in qp:
+            ss["step"] = int(qp["step"][0])
+    except Exception:
+        pass
+
+def write_state_to_url():
+    ss = st.session_state
+    st.experimental_set_query_params(
+        nodes=json.dumps(ss.active_nodes),
+        sel=ss.selected if ss.selected is not None else "",
+        k=ss.key_id, step=ss.step
+    )
+
 # -------------------- State --------------------
 def init_state():
     ss = st.session_state
@@ -175,29 +200,6 @@ def palette():
 
 def sector_palette():
     return SECTOR_COLORS_B if st.session_state.color_blind else SECTOR_COLORS_A
-
-# -------------------- URL share --------------------
-def read_state_from_url():
-    qp = st.experimental_get_query_params()
-    if not qp: return
-    ss = st.session_state
-    try:
-        if "nodes" in qp:
-            ids = sorted(set(int(x) % SPACE for x in json.loads(qp["nodes"][0])))
-            ss["active_nodes"] = ids
-        if "sel" in qp: ss["selected"] = int(qp["sel"][0])
-        if "k" in qp: ss["key_id"] = int(qp["k"][0])
-        if "step" in qp: ss["step"] = int(qp["step"][0])
-    except Exception:
-        pass
-
-def write_state_to_url():
-    ss = st.session_state
-    st.experimental_set_query_params(
-        nodes=json.dumps(ss.active_nodes),
-        sel=ss.selected if ss.selected is not None else "",
-        k=ss.key_id, step=ss.step
-    )
 
 # -------------------- Drawing --------------------
 def ring_figure(
@@ -386,7 +388,7 @@ if st.session_state.step == 1:
     with right:
         st.markdown("### Step 1 — Allocate nodes")
         if not st.session_state.tour_seen_step1:
-            st.info("① Paste labels → ② Click **Allocate** (IDs = SHA1(label) mod 32) → ③ Use **Presets** to quickly try patterns.", icon="🎓")
+            st.info("① Paste labels → ② Click **Allocate** (IDs = SHA1(label) mod 32) → ③ Use **Presets** to try patterns.", icon="🎓")
             if st.button("Got it"):
                 st.session_state.tour_seen_step1 = True
         st.markdown('<div class="tip">IDs are <code>SHA1(label) mod 32</code>. Initially, all positions are disabled.</div>', unsafe_allow_html=True)
@@ -431,7 +433,6 @@ if st.session_state.step == 1:
 
         st.markdown("**Hash equation**"); st.latex(r"\text{node\_id} = \operatorname{SHA1}(\text{label}) \bmod 32")
 
-        # Quick self-check
         with st.expander("Quick check: which node stores key k?"):
             k = st.number_input("Choose key k", 0, 31, value=st.session_state.quiz1_k)
             st.session_state.quiz1_k = k
@@ -441,7 +442,6 @@ if st.session_state.step == 1:
             else:
                 st.caption("Allocate or load a preset to try this.")
 
-        # auto advance & URL
         if allocated_now and st.session_state.auto_advance and st.session_state.active_nodes:
             st.session_state.step = 2; write_state_to_url(); st.rerun()
 
@@ -462,7 +462,7 @@ elif st.session_state.step == 2:
     with right:
         st.markdown("### Step 2 — Finger table")
         if not st.session_state.tour_seen_step2:
-            st.info("Click a **grey** ID to **join** (becomes blue + selected red). Click a **blue** ID to **select** it. Enable removal to click blue and remove.", icon="🖱️")
+            st.info("Click a **grey** ID to **join** (blue + selected red). Click a **blue** ID to **select**. Enable removal to click blue and remove.", icon="🖱️")
             if st.button("Got it  ✓"):
                 st.session_state.tour_seen_step2 = True
 
@@ -491,7 +491,6 @@ elif st.session_state.step == 2:
                 if st.button("Proceed ▸ Step 3"):
                     st.session_state.step = 3; write_state_to_url(); st.rerun()
 
-            # Table
             df = pd.DataFrame([{"i": f.i, "start": f.start, "successor": f.node} for f in f_show],
                               columns=["i","start","successor"])
             st.dataframe(df, hide_index=True, height=240, use_container_width=True, key="ft_table")
@@ -505,7 +504,6 @@ elif st.session_state.step == 2:
             else:
                 st.caption("Click **Reveal next** to build the table.")
 
-            # Self-check
             with st.expander("Self-check: compute start[i] for this n"):
                 n = st.session_state.selected if st.session_state.selected is not None else 0
                 i_val = st.number_input("i (1..5)", 1, 5, value=st.session_state.quiz2_i)
@@ -568,7 +566,6 @@ else:
             k = st.number_input("Key k (0–31)", 0, 31, value=st.session_state.key_id)
             st.session_state.key_id = k
 
-            # Controls
             b1, b2, b3 = st.columns(3)
             with b1:
                 if st.button("Route"):
@@ -586,7 +583,6 @@ else:
                 else:
                     if st.button("▶ Play"): st.session_state.route_play = True
 
-            # Play loop
             if st.session_state.route_play and st.session_state.route_path:
                 now = time.time()
                 if now - st.session_state.last_tick > 0.6:
@@ -607,20 +603,28 @@ else:
             m1.metric("Start", start); m2.metric("Key k", k); m3.metric("succ(k)", succ_k)
 
             st.markdown("**Path**")
-            pills_path(st.session_state.route_path, st.session_state.route_idx)
+            # pills
+            if st.session_state.route_path:
+                items = []
+                for i, v in enumerate(st.session_state.route_path):
+                    bold = i <= st.session_state.route_idx
+                    style = "font-weight:700;" if bold else ""
+                    items.append(f"""<span style="border:1px solid #e2e8f0;border-radius:999px;padding:4px 10px;margin-right:6px;{style}">{v}</span>""")
+                    if i < len(st.session_state.route_path)-1: items.append("→")
+                st.markdown("".join(items), unsafe_allow_html=True)
+            else:
+                st.write("—")
 
             st.markdown("**Reasoning (per hop)**")
             for i in range(min(st.session_state.route_idx+1, len(st.session_state.route_reasons))):
                 st.latex(st.session_state.route_reasons[i])
             st.caption("Hover a hop line on the ring to see the interval rule used for that hop.")
 
-            # Self-check: predict next hop
             with st.expander("Self-check: predict next hop"):
                 if len(st.session_state.route_path) >= 1:
                     cur = st.session_state.route_path[min(st.session_state.route_idx, len(st.session_state.route_path)-1)]
                     st.write(f"Current node: **{cur}**, key **k={k}**")
                     if st.button("Show expected next"):
-                        # recompute the very next decision from 'cur'
                         nodes = st.session_state.active_nodes
                         idx = nodes.index(cur); curr_succ = nodes[(idx+1) % len(nodes)]
                         if mod_between(cur, curr_succ, k, 2**M, incl_right=True):
@@ -638,7 +642,6 @@ else:
             fig = ring_figure(active=[], show_sectors=False)
             st.plotly_chart(fig, width="content", config=PLOTLY_CONFIG, key="fig_step3_empty")
         else:
-            # Hide fingers by default in Step 3 (cleaner)
             fig = ring_figure(
                 active=st.session_state.active_nodes,
                 selected=None,
