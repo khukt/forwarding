@@ -1,13 +1,14 @@
 # app_fixed32_students.py
 # Chord DHT — Student-friendly 3-step tutor for the fixed 0..31 ring (m=5)
 # Step 1: Assign nodes • Step 2: Build finger table • Step 3: Search/route
-# UX focus: stepper, colorblind-safe colors, projector mode, presets, tiny quiz
+# New: Show sectors (responsibility), Export PNG, Per-hop tooltips
 
 import hashlib
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 import random
+import io
 
 import numpy as np
 import pandas as pd
@@ -47,9 +48,14 @@ def init_state():
     if "key_id" not in st.session_state: st.session_state.key_id = 26
     if "route_path" not in st.session_state: st.session_state.route_path: List[int] = []
     if "route_reasons" not in st.session_state: st.session_state.route_reasons: List[str] = []
+    if "route_texts" not in st.session_state: st.session_state.route_texts: List[str] = []
     if "route_idx" not in st.session_state: st.session_state.route_idx = 0
     if "quiz" not in st.session_state:
         st.session_state.quiz = {"start": None, "key": None, "show": False, "answer": None, "route": [], "reasons": []}
+    if "projector" not in st.session_state: st.session_state.projector = False
+    if "colorblind" not in st.session_state: st.session_state.colorblind = True
+    if "show_sectors" not in st.session_state: st.session_state.show_sectors = True
+
 init_state()
 
 # ----------------- Math helpers -----------------
@@ -91,40 +97,98 @@ def closest_preceding_finger(n: int, fingers: List[int], target: int, m: int) ->
     return n
 
 def chord_lookup_full(start_node: int, key: int, nodes_sorted: List[int], m: int, max_steps: int = 64):
-    if not nodes_sorted: return [start_node], [r"\text{No active nodes.}"]
-    path = [start_node]; reasons: List[str] = []
+    """
+    Return (path, reasons_latex, reasons_text) for iterative Chord lookup using only active nodes.
+    reasons_text aligns to edges (for tooltips). reasons_latex includes final arrival messages.
+    """
+    if not nodes_sorted:
+        return [start_node], [r"\text{No active nodes.}"], ["No active nodes"]
+    path = [start_node]
+    reasons_latex: List[str] = []
+    reasons_text: List[str] = []   # one per hop
     succ_k = successor_of(key, nodes_sorted)
-    finger_map: Dict[int, List[int]] = {n: [fe.node for fe in build_finger_table(n, nodes_sorted, m)] for n in nodes_sorted}
+    finger_map: Dict[int, List[int]] = {n: [fe.node for fe in build_finger_table(n, nodes_sorted, m)]
+                                        for n in nodes_sorted}
+
     while len(path) < max_steps:
         curr = path[-1]
         if curr == succ_k:
-            reasons.append(rf"\mathbf{{Stop:}}\ \text{{current}}={curr}=\operatorname{{succ}}({key})")
+            reasons_latex.append(rf"\mathbf{{Stop:}}\ \text{{current}}={curr}=\operatorname{{succ}}({key})")
             break
+
         curr_idx = nodes_sorted.index(curr)
         curr_succ = nodes_sorted[(curr_idx + 1) % len(nodes_sorted)]
+
         if mod_interval_contains(curr, curr_succ, key, 2 ** m, inclusive_right=True):
-            reasons.append(rf"\text{{Since }} {key}\in({curr},{curr_succ}] \Rightarrow \text{{next}}=\operatorname{{succ}}({curr})={curr_succ}")
+            reasons_latex.append(
+                rf"\text{{Since }} {key}\in({curr},{curr_succ}] \Rightarrow "
+                rf"\text{{next}}=\operatorname{{succ}}({curr})={curr_succ}"
+            )
+            reasons_text.append(f"{key} in ({curr},{curr_succ}] ⇒ next = succ({curr}) = {curr_succ}")
             path.append(curr_succ)
             if curr_succ == succ_k:
-                reasons.append(rf"\mathbf{{Arrived}}\ \text{{at}}\ \operatorname{{succ}}({key})={succ_k}")
-                break
+                reasons_latex.append(rf"\mathbf{{Arrived}}\ \text{{at}}\ \operatorname{{succ}}({key})={succ_k}")
             continue
+
         cpf = closest_preceding_finger(curr, finger_map[curr], key, m)
         if cpf == curr:
-            reasons.append(rf"\text{{No finger in }}({curr},{key}) \Rightarrow \text{{fallback to }} \operatorname{{succ}}({curr})={curr_succ}")
+            reasons_latex.append(
+                rf"\text{{No finger in }}({curr},{key}) \Rightarrow "
+                rf"\text{{fallback to }} \operatorname{{succ}}({curr})={curr_succ}"
+            )
+            reasons_text.append(f"No finger in ({curr},{key}) ⇒ fallback succ({curr}) = {curr_succ}")
             path.append(curr_succ)
         else:
-            reasons.append(rf"\text{{Choose closest preceding finger of }}{curr}\ \text{{toward }}{key}: {cpf}\in({curr},{key})")
+            reasons_latex.append(
+                rf"\text{{Choose closest preceding finger of }}{curr}\ \text{{toward }}{key}: "
+                rf"{cpf}\in({curr},{key})"
+            )
+            reasons_text.append(f"Closest preceding finger toward {key}: {cpf} ∈ ({curr},{key})")
             path.append(cpf)
+
         if path[-1] == succ_k:
-            reasons.append(rf"\mathbf{{Arrived}}\ \text{{at}}\ \operatorname{{succ}}({key})={succ_k}")
+            reasons_latex.append(rf"\mathbf{{Arrived}}\ \text{{at}}\ \operatorname{{succ}}({key})={succ_k}")
             break
-    return path, reasons
+
+    return path, reasons_latex, reasons_text
 
 # ----------------- Plot helpers (UI palette aware) -----------------
 def node_xy(id_val: int, space: int, radius: float = 1.0) -> Tuple[float, float]:
     theta = 2 * math.pi * (id_val / space)
     return radius * math.cos(theta), radius * math.sin(theta)
+
+def add_sector(fig: go.Figure, a: int, b: int, color: str, alpha: float = 0.08, steps: int = 40):
+    """
+    Shade the responsibility interval (a, b] clockwise on the ring as a thin wedge.
+    """
+    if a == b:
+        return  # full circle responsibility is not meaningful here
+    start = a / SPACE * 2 * math.pi
+    end = b / SPACE * 2 * math.pi
+    if a < b:
+        thetas = np.linspace(start, end, steps)
+    else:
+        # wrap-around
+        thetas = np.concatenate([np.linspace(start, 2*math.pi, steps//2),
+                                 np.linspace(0, end, steps - steps//2)])
+
+    R_outer = 1.02
+    R_inner = 0.90
+    xs = np.cos(thetas) * R_outer
+    ys = np.sin(thetas) * R_outer
+    xs2 = np.cos(thetas[::-1]) * R_inner
+    ys2 = np.sin(thetas[::-1]) * R_inner
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([xs, xs2]),
+        y=np.concatenate([ys, ys2]),
+        fill="toself",
+        mode="lines",
+        line=dict(width=0),
+        fillcolor=color,
+        opacity=alpha,
+        hoverinfo="skip",
+        showlegend=False
+    ))
 
 def ring_figure(
     active_nodes: List[int],
@@ -134,23 +198,25 @@ def ring_figure(
     show_radial: bool = False,
     route_path: Optional[List[int]] = None,
     route_hops_to_show: int = 0,
+    route_texts: Optional[List[str]] = None,
     key: Optional[int] = None,
     width: int = 700,
     height: int = 700,
     projector: bool = False,
     colorblind: bool = True,
+    show_sectors: bool = True,
 ) -> go.Figure:
 
-    # Color choices (colorblind-friendly): blue, orange, purple, gray
     COLORS = {
         "ring": "#334155",
         "disabled": "#9ca3af",
         "active": "#1f77b4" if colorblind else "royalblue",
-        "selected": "#d62728",    # red (distinct)
-        "succ": "#ff7f0e",        # orange
-        "start": "#9467bd",       # purple
-        "radial": "#6b7280",      # gray
-        "hop": "#111827",         # near-black
+        "selected": "#d62728",
+        "succ": "#ff7f0e",
+        "start": "#9467bd",
+        "radial": "#6b7280",
+        "hop": "#111827",
+        "sector": "#3b82f6" if colorblind else "#2563eb",  # blue-ish
     }
 
     R = 1.0
@@ -161,6 +227,12 @@ def ring_figure(
     fig.add_trace(go.Scatter(x=np.cos(circle_angles), y=np.sin(circle_angles),
                              mode="lines", line=dict(color=COLORS["ring"], width=2 if projector else 1.5),
                              name="Ring", hoverinfo="skip"))
+
+    # Responsibility sectors for active nodes (predecessor -> node)
+    if show_sectors and active_nodes:
+        for idx, nid in enumerate(active_nodes):
+            pred = active_nodes[idx - 1]  # predecessor in sorted list (wraps)
+            add_sector(fig, pred, nid, COLORS["sector"], alpha=0.08 if not projector else 0.12)
 
     # Disabled placeholders
     disabled_positions = [i for i in ALL_POSITIONS if i not in set(active_nodes)]
@@ -228,16 +300,17 @@ def ring_figure(
                 name="n→start", hoverinfo="skip", showlegend=False
             ))
 
-    # Route arrows
+    # Route arrows with tooltips
     if route_path and route_hops_to_show > 0:
         for i in range(min(route_hops_to_show, len(route_path) - 1)):
             a = route_path[i]; b = route_path[i + 1]
             ax, ay = node_xy(a, SPACE, R); bx, by = node_xy(b, SPACE, R)
+            tip = route_texts[i] if (route_texts and i < len(route_texts)) else f"hop {i+1}: {a} → {b}"
             fig.add_trace(go.Scatter(
                 x=[ax, bx], y=[ay, by], mode="lines+markers",
                 line=dict(width=4 if projector else 3, color=COLORS["hop"]),
                 marker=dict(size=8 if projector else 6, color=COLORS["hop"]),
-                name=f"hop {i+1}", hoverinfo="skip", showlegend=False
+                name=f"hop {i+1}", hovertext=tip, hoverinfo="text", showlegend=False
             ))
             fig.add_annotation(
                 x=bx, y=by, ax=ax, ay=ay,
@@ -262,8 +335,13 @@ with l:
     st.subheader("🔗 Chord DHT — Student Tutor (Fixed 0..31)")
     st.caption("Step 1: Assign nodes → Step 2: Build finger table → Step 3: Search/route. Non-listed IDs are grey placeholders.")
 with r:
-    projector = st.toggle("Projector mode", value=False, help="Bigger fonts & thicker lines for classroom screens.")
-    colorblind = st.toggle("Color-blind palette", value=True, help="Use high-contrast, colorblind-friendly colors.")
+    st.session_state.projector = st.toggle("Projector mode", value=st.session_state.projector, help="Bigger fonts & thicker lines.")
+    st.session_state.colorblind = st.toggle("Color-blind palette", value=st.session_state.colorblind, help="High-contrast colors.")
+    st.session_state.show_sectors = st.toggle("Show sectors", value=st.session_state.show_sectors, help="Shade each node's responsibility interval.")
+
+projector = st.session_state.projector
+colorblind = st.session_state.colorblind
+show_sectors = st.session_state.show_sectors
 
 # Stepper chips
 chips = []
@@ -272,14 +350,13 @@ for i, label in [(1, "1 Assign"), (2, "2 Fingers"), (3, "3 Search")]:
     chips.append(f'<span class="{cls}">{label}</span>')
 st.markdown(" ".join(chips), unsafe_allow_html=True)
 
-# Nav buttons
+# Nav + presets
 cnav1, cnav2, cnav3, cnav4 = st.columns([1, 1, 1.5, 6])
 with cnav1:
     if st.button("← Prev"): st.session_state.step = max(1, st.session_state.step - 1)
 with cnav2:
     if st.button("Next →"): st.session_state.step = min(3, st.session_state.step + 1)
 with cnav3:
-    # Presets for instant demos
     st.markdown("**Presets**")
     cpa, cpb = st.columns(2)
     with cpa:
@@ -288,26 +365,34 @@ with cnav3:
             st.session_state.selected = 28
             st.session_state.key_id = 12
             st.session_state.k = 5
-            path, reasons = chord_lookup_full(28, 12, st.session_state.active_nodes, M)
-            st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_idx = path, reasons, len(path)-1
+            path, reasons_latex, reasons_text = chord_lookup_full(28, 12, st.session_state.active_nodes, M)
+            st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons_latex, reasons_text
+            st.session_state.route_idx = len(path)-1
     with cpb:
         if st.button("k=26 from 1", use_container_width=True):
             st.session_state.active_nodes = [1,4,9,11,14,18,20,21,28]
             st.session_state.selected = 1
             st.session_state.key_id = 26
             st.session_state.k = 5
-            path, reasons = chord_lookup_full(1, 26, st.session_state.active_nodes, M)
-            st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_idx = path, reasons, len(path)-1)
+            path, reasons_latex, reasons_text = chord_lookup_full(1, 26, st.session_state.active_nodes, M)
+            st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons_latex, reasons_text
+            st.session_state.route_idx = len(path)-1
 
 # ----------------- STEP 1 — Assign nodes -----------------
 if st.session_state.step == 1:
     left, right = st.columns([0.56, 0.44])
     with left:
         fig = ring_figure(
-            active_nodes=st.session_state.active_nodes, width=720 if projector else 680,
-            height=720 if projector else 680, projector=projector, colorblind=colorblind
+            active_nodes=st.session_state.active_nodes,
+            width=720 if projector else 680,
+            height=720 if projector else 680,
+            projector=projector, colorblind=colorblind, show_sectors=show_sectors
         )
         st.plotly_chart(fig, use_container_width=False)
+        # Export PNG
+        png = fig.to_image(format="png", scale=2)  # requires kaleido
+        st.download_button("⬇️ Download ring as PNG", data=png, file_name="chord_ring.png", mime="image/png")
+
         st.markdown(
             f"""
             <div class="legend">
@@ -321,7 +406,7 @@ if st.session_state.step == 1:
 
     with right:
         st.markdown("### Step 1 — Assign the nodes")
-        st.markdown('<div class="hint">Enter IDs (0–31). Others appear as disabled placeholders.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="hint">Enter IDs (0–31). Others appear as disabled placeholders. Toggle <b>Show sectors</b> to visualize responsibility intervals.</div>', unsafe_allow_html=True)
         ids_text = st.text_area(
             "Active node IDs",
             value=", ".join(str(n) for n in st.session_state.active_nodes),
@@ -370,9 +455,11 @@ elif st.session_state.step == 2:
                 active_nodes=st.session_state.active_nodes, selected=selected,
                 fingers=fingers_shown, highlight_start=current_start, show_radial=True,
                 width=720 if projector else 680, height=720 if projector else 680,
-                projector=projector, colorblind=colorblind
+                projector=projector, colorblind=colorblind, show_sectors=show_sectors
             )
             st.plotly_chart(fig, use_container_width=False)
+            png = fig.to_image(format="png", scale=2)
+            st.download_button("⬇️ Download ring as PNG", data=png, file_name="chord_fingers.png", mime="image/png")
 
         with right:
             st.markdown("### Step 2 — Build the finger table")
@@ -403,23 +490,27 @@ elif st.session_state.step == 3:
             st.session_state.key_id = st.number_input("Key k", 0, 31, st.session_state.key_id, 1)
         with ctr[2]:
             if st.button("Start lookup"):
-                path, reasons = chord_lookup_full(start_node, st.session_state.key_id, st.session_state.active_nodes, M)
-                st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_idx = path, reasons, 0
+                path, reasons_latex, reasons_text = chord_lookup_full(start_node, st.session_state.key_id, st.session_state.active_nodes, M)
+                st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons_latex, reasons_text
+                st.session_state.route_idx = 0
         with ctr[3]:
             if st.button("Next hop"):
                 if st.session_state.route_path:
                     st.session_state.route_idx = min(len(st.session_state.route_path)-1, st.session_state.route_idx + 1)
                 else:
-                    path, reasons = chord_lookup_full(start_node, st.session_state.key_id, st.session_state.active_nodes, M)
-                    st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_idx = path, reasons, 0
+                    path, reasons_latex, reasons_text = chord_lookup_full(start_node, st.session_state.key_id, st.session_state.active_nodes, M)
+                    st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons_latex, reasons_text
+                    st.session_state.route_idx = 0
 
         # Ensure route exists
         if not st.session_state.route_path:
-            path, reasons = chord_lookup_full(start_node, st.session_state.key_id, st.session_state.active_nodes, M)
-            st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_idx = path, reasons, 0
+            path, reasons_latex, reasons_text = chord_lookup_full(start_node, st.session_state.key_id, st.session_state.active_nodes, M)
+            st.session_state.route_path, st.session_state.route_reasons, st.session_state.route_texts = path, reasons_latex, reasons_text
+            st.session_state.route_idx = 0
 
         route_path = st.session_state.route_path
         route_reasons = st.session_state.route_reasons
+        route_texts = st.session_state.route_texts
         route_hops_to_show = st.session_state.route_idx
         succ_k = successor_of(st.session_state.key_id, st.session_state.active_nodes)
 
@@ -432,15 +523,18 @@ elif st.session_state.step == 3:
             fig = ring_figure(
                 active_nodes=st.session_state.active_nodes, selected=selected,
                 fingers=fingers_shown, highlight_start=current_start, show_radial=True,
-                route_path=route_path, route_hops_to_show=route_hops_to_show, key=st.session_state.key_id,
+                route_path=route_path, route_hops_to_show=route_hops_to_show, route_texts=route_texts,
+                key=st.session_state.key_id,
                 width=720 if projector else 680, height=720 if projector else 680,
-                projector=projector, colorblind=colorblind
+                projector=projector, colorblind=colorblind, show_sectors=show_sectors
             )
             st.plotly_chart(fig, use_container_width=False)
+            png = fig.to_image(format="png", scale=2)
+            st.download_button("⬇️ Download ring as PNG", data=png, file_name="chord_route.png", mime="image/png")
 
         with right:
             st.markdown("### Step 3 — Search / Find the route")
-            st.markdown('<div class="hint">Use <b>Start lookup</b>, then click <b>Next hop</b> to step through the route.</div>',
+            st.markdown('<div class="hint">Use <b>Start lookup</b>, then click <b>Next hop</b> to step through the route. Hover a hop line for the interval equation.</div>',
                         unsafe_allow_html=True)
             metr = st.container()
             with metr:
@@ -450,7 +544,7 @@ elif st.session_state.step == 3:
                 m3.metric("succ(k)", succ_k)
             st.markdown("**Path**")
             st.code(" → ".join(str(n) for n in route_path), language="text")
-            st.markdown("**Reasoning**")
+            st.markdown("**Reasoning (LaTeX)**")
             max_to_show = min(route_hops_to_show + 1, len(route_reasons))
             for i in range(max_to_show):
                 st.latex(route_reasons[i])
@@ -463,10 +557,10 @@ elif st.session_state.step == 3:
                     if len(st.session_state.active_nodes) >= 2:
                         q_start = random.choice(st.session_state.active_nodes)
                         q_key = random.randint(0, 31)
-                        q_route, q_reasons = chord_lookup_full(q_start, q_key, st.session_state.active_nodes, M)
+                        q_route, q_reasons_latex, _ = chord_lookup_full(q_start, q_key, st.session_state.active_nodes, M)
                         st.session_state.quiz = {"start": q_start, "key": q_key, "show": True,
                                                  "answer": successor_of(q_key, st.session_state.active_nodes),
-                                                 "route": q_route, "reasons": q_reasons}
+                                                 "route": q_route, "reasons": q_reasons_latex}
             else:
                 q = st.session_state.quiz
                 st.markdown(
