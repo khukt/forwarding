@@ -1,21 +1,46 @@
-# app_small.py
-# Chord DHT — small, fixed ring (0..31) for teaching (matches the style of the 0–31 diagram)
+# app_stepper.py
+# Chord DHT • Click-through Tutor: Key Space → Assign Nodes → Build Finger Table
+# -----------------------------------------------------------------------------
+# Streamlit Community Cloud ready.
 
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
-import hashlib
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ---- ring size fixed to 0..31 ----
-M = 5
-SPACE = 2 ** M  # 32
+# ---------------------------
+# Session helpers
+# ---------------------------
+def init_state():
+    if "step" not in st.session_state:
+        st.session_state.step = 1           # 1: key space, 2: nodes, 3: fingers
+    if "m" not in st.session_state:
+        st.session_state.m = 5              # default 0..31
+    if "mode" not in st.session_state:
+        st.session_state.mode = "Manual IDs (0..2^m-1)"
+    if "nodes_sorted" not in st.session_state:
+        st.session_state.nodes_sorted = []
+    if "node_map" not in st.session_state:
+        st.session_state.node_map = {}      # label -> id (if hash mode)
+    if "selected_node" not in st.session_state:
+        st.session_state.selected_node = None
+    if "finger_k" not in st.session_state:
+        st.session_state.finger_k = 0       # how many fingers revealed (0..m)
 
-# ---------- helpers ----------
+def reset_all():
+    for k in ["step", "m", "mode", "nodes_sorted", "node_map", "selected_node", "finger_k"]:
+        if k in st.session_state:
+            del st.session_state[k]
+    init_state()
+
+# ---------------------------
+# Core math
+# ---------------------------
 def sha1_mod(s: str, space: int) -> int:
     h = hashlib.sha1(s.encode("utf-8")).hexdigest()
     return int(h, 16) % space
@@ -39,94 +64,26 @@ class FingerEntry:
     start: int
     node: int
 
-def build_finger_table(n: int, nodes_sorted: List[int]) -> List[FingerEntry]:
+def build_finger_table(n: int, nodes_sorted: List[int], m: int) -> List[FingerEntry]:
+    space = 2 ** m
     entries = []
-    for i in range(1, M + 1):
-        start = (n + 2 ** (i - 1)) % SPACE
+    for i in range(1, m + 1):
+        start = (n + 2 ** (i - 1)) % space
         succ = successor_of(start, nodes_sorted)
         entries.append(FingerEntry(i=i, start=start, node=succ))
     return entries
 
-def finger_equations(n: int, entries: List[FingerEntry]) -> List[str]:
-    lines = []
-    for fe in entries:
-        i = fe.i
-        lines.append(
-            rf"\text{{finger}}[{i}]:\; "
-            rf"\text{{start}}[{i}] = ({n} + 2^{{{i-1}}}) \bmod 2^{{{M}}} = {fe.start},\; "
-            rf"\text{{node}} = \operatorname{{succ}}({fe.start}) = {fe.node}"
-        )
-    return lines
-
-def closest_preceding_finger(n: int, fingers: List[int], target: int) -> int:
-    for f in reversed(fingers):
-        if f != n and mod_interval_contains(n, target, f, SPACE, inclusive_right=False):
-            return f
-    return n
-
-def chord_lookup_with_reasons(start_node: int, key: int, nodes_sorted: List[int], max_steps: int = 64):
-    visited = [start_node]
-    reasons: List[str] = []
-    if len(nodes_sorted) == 0:
-        return visited, [r"\text{No nodes in the ring.}"]
-    succ_key = successor_of(key, nodes_sorted)
-
-    finger_map: Dict[int, List[int]] = {
-        n: [fe.node for fe in build_finger_table(n, nodes_sorted)]
-        for n in nodes_sorted
-    }
-
-    while len(visited) < max_steps:
-        curr = visited[-1]
-        if curr == succ_key:
-            reasons.append(rf"\mathbf{{Stop:}}\; \text{{current}}={curr}=\operatorname{{succ}}({key})")
-            break
-
-        curr_idx = nodes_sorted.index(curr)
-        curr_succ = nodes_sorted[(curr_idx + 1) % len(nodes_sorted)]
-
-        in_interval = mod_interval_contains(curr, curr_succ, key, SPACE, inclusive_right=True)
-        if in_interval:
-            reasons.append(
-                rf"\text{{Since }} {key}\in({curr},{curr_succ}] \Rightarrow "
-                rf"\text{{next}}=\operatorname{{succ}}({curr})={curr_succ}"
-            )
-            visited.append(curr_succ)
-            if curr_succ == succ_key:
-                reasons.append(rf"\mathbf{{Arrived}}\ \text{{at}}\ \operatorname{{succ}}({key})={succ_key}")
-                break
-            continue
-
-        cpf = closest_preceding_finger(curr, finger_map[curr], key)
-        if cpf == curr:
-            reasons.append(
-                rf"\text{{No finger in }}({curr},{key}) \Rightarrow "
-                rf"\text{{fallback to }} \operatorname{{succ}}({curr})={curr_succ}"
-            )
-            visited.append(curr_succ)
-        else:
-            reasons.append(
-                rf"\text{{Choose closest preceding finger of }}{curr}\ \text{{toward }}{key}: "
-                rf"{cpf}\in({curr},{key})"
-            )
-            visited.append(cpf)
-
-        if visited[-1] == succ_key:
-            reasons.append(rf"\mathbf{{Arrived}}\ \text{{at}}\ \operatorname{{succ}}({key})={succ_key}")
-            break
-
-    return visited, reasons
-
-# ---------- viz ----------
-def node_xy(id_val: int, radius: float = 1.0) -> Tuple[float, float]:
-    theta = 2 * math.pi * (id_val / SPACE)
+# ---------------------------
+# Visualization
+# ---------------------------
+def node_xy(id_val: int, space: int, radius: float = 1.0) -> Tuple[float, float]:
+    theta = 2 * math.pi * (id_val / space)
     return radius * math.cos(theta), radius * math.sin(theta)
 
-def ring_figure(nodes_sorted: List[int],
+def ring_figure(space: int,
+                nodes_sorted: List[int],
                 selected: int = None,
-                key: int = None,
-                finger_entries: List[FingerEntry] = None,
-                lookup_path: List[int] = None) -> go.Figure:
+                fingers_to_draw: List[FingerEntry] = None) -> go.Figure:
     R = 1.0
     circle_angles = np.linspace(0, 2*np.pi, 361)
 
@@ -134,17 +91,13 @@ def ring_figure(nodes_sorted: List[int],
     fig.add_trace(go.Scatter(x=np.cos(circle_angles), y=np.sin(circle_angles),
                              mode="lines", name="Hash ring", hoverinfo="skip"))
 
-    succ_key = successor_of(key, nodes_sorted) if (key is not None and nodes_sorted) else None
-
     xs, ys, labels, colors, sizes = [], [], [], [], []
     for nid in nodes_sorted:
-        x, y = node_xy(nid, R)
+        x, y = node_xy(nid, space, R)
         xs.append(x); ys.append(y)
         label = f"{nid}"
         if selected is not None and nid == selected:
             colors.append("crimson"); sizes.append(14); label += " (selected)"
-        elif succ_key is not None and nid == succ_key:
-            colors.append("orange"); sizes.append(12); label += " (succ(key))"
         else:
             colors.append("royalblue"); sizes.append(10)
         labels.append(label)
@@ -157,10 +110,10 @@ def ring_figure(nodes_sorted: List[int],
             hovertext=labels, hoverinfo="text", name="Nodes"
         ))
 
-    if selected is not None and finger_entries:
-        sx, sy = node_xy(selected, R)
-        for fe in finger_entries:
-            tx, ty = node_xy(fe.node, R)
+    if selected is not None and fingers_to_draw:
+        sx, sy = node_xy(selected, space, R)
+        for fe in fingers_to_draw:
+            tx, ty = node_xy(fe.node, space, R)
             fig.add_trace(go.Scatter(
                 x=[sx, tx], y=[sy, ty], mode="lines",
                 line=dict(width=2, dash="dot"),
@@ -170,132 +123,205 @@ def ring_figure(nodes_sorted: List[int],
                 showlegend=False
             ))
 
-    if lookup_path and len(lookup_path) > 1:
-        for i in range(len(lookup_path) - 1):
-            ax, ay = node_xy(lookup_path[i], R)
-            bx, by = node_xy(lookup_path[i+1], R)
-            fig.add_trace(go.Scatter(
-                x=[ax, bx], y=[ay, by], mode="lines+markers",
-                line=dict(width=3), marker=dict(size=6),
-                name=f"hop {i+1}", hoverinfo="skip", showlegend=False
-            ))
-            fig.add_annotation(
-                x=bx, y=by, ax=ax, ay=ay,
-                xref="x", yref="y", axref="x", ayref="y",
-                showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=2
-            )
-
     fig.update_layout(
         width=820, height=820,
         xaxis=dict(visible=False), yaxis=dict(visible=False),
         margin=dict(l=10, r=10, t=40, b=10),
         plot_bgcolor="white",
-        title="Chord (m=5) • Ring 0..31 • Finger Table • Lookup",
+        title="Chord • Ring • Nodes • Fingers (revealed)",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
     )
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
     return fig
 
-# ---------- UI ----------
-st.set_page_config(page_title="Chord DHT • Small Ring (0..31)", layout="wide")
-st.title("🔗 Chord DHT — Small Ring (0..31)")
-st.caption("Use Manual IDs to reproduce textbook figures exactly; or Hash mode to demonstrate mapping.")
+# ---------------------------
+# UI helpers
+# ---------------------------
+def step_header(current: int):
+    st.markdown(
+        f"""
+**Steps**
+1. {'**Key space** ✅' if current > 1 else ('**Key space** ⬅️' if current == 1 else 'Key space')}
+2. {'**Assign nodes** ✅' if current > 2 else ('**Assign nodes** ⬅️' if current == 2 else 'Assign nodes')}
+3. {'**Build finger table** ⬅️' if current == 3 else 'Build finger table'}
+        """
+    )
+
+# ---------------------------
+# App
+# ---------------------------
+st.set_page_config(page_title="Chord DHT • Step-by-Step Tutor", layout="wide")
+init_state()
+
+st.title("🔗 Chord DHT — Step-by-Step Tutor")
+step_header(st.session_state.step)
 
 with st.sidebar:
-    mode = st.radio("Node placement mode",
-                    ["Manual IDs (0..31)", "Hash labels → IDs (mod 32)"],
-                    index=0)
-    if mode == "Manual IDs (0..31)":
-        ids_text = st.text_area("Node IDs (comma/space separated)",
-                                value="1, 4, 9, 11, 14, 18, 20, 21, 28")
-        raw = [t.strip() for t in ids_text.replace(",", " ").split()]
-        try:
-            nodes_sorted = sorted(set(int(x) % SPACE for x in raw if x != ""))
-        except ValueError:
-            st.error("Invalid IDs. Please enter integers in 0..31.")
-            st.stop()
-        st.markdown("**Ring size:**")
-        st.latex(rf"2^{{{M}}} = {SPACE}\ \Rightarrow\ \text{{IDs}}=0..{SPACE-1}")
-    else:
-        node_labels_text = st.text_area("Node labels (1 per line)", value="nodeA\nnodeB\nnodeC\nnodeD")
-        node_labels = [s.strip() for s in node_labels_text.splitlines() if s.strip()]
-        node_map = {lbl: sha1_mod(lbl, SPACE) for lbl in node_labels}
-        nodes_sorted = sorted(set(node_map.values()))
-        st.markdown("**Hashing equation:**")
-        st.latex(rf"\text{{node\_id}} = \operatorname{{SHA1}}(\text{{label}}) \bmod 2^{{{M}}} = 32")
+    st.button("🔄 Reset", on_click=reset_all)
+    st.caption("Click **Reset** to start fresh.")
 
-    key_id = st.number_input("Key ID (0..31)", min_value=0, max_value=31, value=26, step=1)
-    show_fingers = st.checkbox("Show selected node's finger chords", value=True)
-    show_lookup = st.checkbox("Show lookup path & reasons", value=True)
-    show_eq = st.checkbox("Show equations/explanations", value=True)
+# === STEP 1: Key space =======================================================
+if st.session_state.step == 1:
+    st.subheader("Step 1 — Choose the key space size")
+    m = st.slider("m (identifier bits)", min_value=3, max_value=10, value=st.session_state.m,
+                  help="The identifier space has size 2^m (IDs 0..2^m−1).")
+    st.session_state.m = m
+    space = 2 ** m
 
-if not nodes_sorted:
-    st.warning("Add at least two nodes to proceed.")
-    st.stop()
+    st.markdown("**Equation:**")
+    st.latex(rf"\text{{ID space size}} = 2^{m} = {space}")
+    st.latex(rf"\text{{IDs}} \in \{{0,1,\dots,{space-1}\}}")
 
-selected_node = st.selectbox("Selected node (by ID)", options=nodes_sorted, index=0)
-
-# Compute
-finger_entries = build_finger_table(selected_node, nodes_sorted)
-lookup_path, hop_reasons = ([], [])
-if show_lookup:
-    lookup_path, hop_reasons = chord_lookup_with_reasons(selected_node, key_id, nodes_sorted)
-
-# Layout
-left, right = st.columns([0.58, 0.42], gap="large")
-
-with left:
-    fig = ring_figure(
-        nodes_sorted=nodes_sorted,
-        selected=selected_node,
-        key=key_id,
-        finger_entries=finger_entries if show_fingers else None,
-        lookup_path=lookup_path if show_lookup else None
-    )
+    # Empty ring preview with tick labels every 2^(m-1)/something would be noisy; we just draw the circle.
+    fig = ring_figure(space=space, nodes_sorted=[], selected=None, fingers_to_draw=None)
     st.plotly_chart(fig, use_container_width=True)
 
-with right:
-    st.subheader("📍 Node placements")
-    if mode == "Manual IDs (0..31)":
-        df_nodes = pd.DataFrame([{"node_id": n} for n in nodes_sorted])
+    st.info("Proceed to Step 2 to place nodes on the ring.")
+    st.button("Next → Assign nodes", type="primary", on_click=lambda: st.session_state.update(step=2))
+
+# === STEP 2: Assign Nodes ====================================================
+elif st.session_state.step == 2:
+    st.subheader("Step 2 — Assign nodes to the ring")
+    space = 2 ** st.session_state.m
+
+    # Placement mode
+    mode = st.radio("Node placement mode",
+                    ["Manual IDs (0..2^m-1)", "Hash labels → IDs (SHA-1 mod 2^m)"],
+                    index=0 if st.session_state.mode.startswith("Manual") else 1)
+    st.session_state.mode = mode
+
+    nodes_sorted = []
+    node_map: Dict[str, int] = {}
+
+    if mode.startswith("Manual"):
+        default_ids = "1, 4, 9, 11, 14, 18, 20, 21, 28" if st.session_state.m == 5 else "1, 3, 6, 8, 12"
+        ids_text = st.text_area("Node IDs (comma/space separated)",
+                                value=", ".join(str(n) for n in (st.session_state.nodes_sorted or [])) or default_ids)
+        raw = [t.strip() for t in ids_text.replace(",", " ").split()]
+        try:
+            nodes_sorted = sorted(set(int(x) % space for x in raw if x != ""))
+        except ValueError:
+            st.error("Invalid IDs. Please enter integers.")
+            nodes_sorted = []
+        st.markdown("**No hashing used in Manual mode** — you place nodes directly on 0..2^m−1.")
     else:
-        df_nodes = pd.DataFrame(
-            [{"node_label": lbl, "node_id": nid} for lbl, nid in sorted(node_map.items(), key=lambda x: x[1])],
-            columns=["node_label", "node_id"]
+        labels_text = st.text_area("Node labels (one per line)", value="nodeA\nnodeB\nnodeC\nnodeD")
+        labels = [s.strip() for s in labels_text.splitlines() if s.strip()]
+        node_map = {lbl: sha1_mod(lbl, space) for lbl in labels}
+        nodes_sorted = sorted(set(node_map.values()))
+        st.markdown("**Hashing equation:**")
+        st.latex(rf"\text{{node\_id}} = \operatorname{{SHA1}}(\text{{label}}) \bmod 2^{{{st.session_state.m}}}")
+
+    st.session_state.nodes_sorted = nodes_sorted
+    st.session_state.node_map = node_map
+
+    if not nodes_sorted:
+        st.warning("Add at least two nodes.")
+    else:
+        # pick default selected node
+        if st.session_state.selected_node not in nodes_sorted:
+            st.session_state.selected_node = nodes_sorted[0]
+
+        # Show ring with nodes
+        fig = ring_figure(space=space, nodes_sorted=nodes_sorted, selected=st.session_state.selected_node)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Show a table
+        if mode.startswith("Manual"):
+            df_nodes = pd.DataFrame([{"node_id": n} for n in nodes_sorted])
+        else:
+            df_nodes = pd.DataFrame(
+                [{"node_label": lbl, "node_id": nid} for lbl, nid in sorted(node_map.items(), key=lambda x: x[1])],
+                columns=["node_label", "node_id"]
+            )
+        st.subheader("📍 Node placements")
+        st.dataframe(df_nodes, use_container_width=True, hide_index=True)
+
+    cols = st.columns([1, 1, 8])
+    with cols[0]:
+        st.button("← Back", on_click=lambda: st.session_state.update(step=1))
+    with cols[1]:
+        st.button("Next → Build finger table", type="primary",
+                  disabled=(len(nodes_sorted) < 2),
+                  on_click=lambda: st.session_state.update(step=3, finger_k=0))
+
+# === STEP 3: Build Finger Table =============================================
+elif st.session_state.step == 3:
+    st.subheader("Step 3 — Build the finger table (click to reveal each entry)")
+    m = st.session_state.m
+    space = 2 ** m
+    nodes_sorted = st.session_state.nodes_sorted or []
+    if len(nodes_sorted) < 2:
+        st.warning("Go back and add at least two nodes.")
+    else:
+        selected_node = st.selectbox("Selected node (by ID)", options=nodes_sorted,
+                                     index=max(0, nodes_sorted.index(st.session_state.selected_node)
+                                               if st.session_state.selected_node in nodes_sorted else 0))
+        st.session_state.selected_node = selected_node
+
+        # Compute full finger table
+        all_entries = build_finger_table(selected_node, nodes_sorted, m)
+
+        # How many entries are revealed?
+        k = st.session_state.finger_k
+        st.markdown(
+            f"**Reveal progress:** {k}/{m} entries "
+            "(click **Next entry** to compute the next start & successor)."
         )
-    st.dataframe(df_nodes, use_container_width=True, hide_index=True)
 
-    st.subheader("📇 Finger table (selected node)")
-    df_ft = pd.DataFrame(
-        [{"i": fe.i, "start": fe.start, "successor": fe.node} for fe in finger_entries],
-        columns=["i", "start", "successor"]
-    )
-    st.dataframe(df_ft, use_container_width=True, hide_index=True)
+        # Buttons to control reveal
+        c1, c2, c3, c4 = st.columns([1,1,1,6])
+        with c1:
+            st.button("Reset entries", on_click=lambda: st.session_state.update(finger_k=0))
+        with c2:
+            st.button("Next entry", type="primary",
+                      disabled=(k >= m),
+                      on_click=lambda: st.session_state.update(finger_k=min(m, st.session_state.finger_k + 1)))
+        with c3:
+            st.button("Reveal all", disabled=(k >= m),
+                      on_click=lambda: st.session_state.update(finger_k=m))
 
-    if show_eq:
-        st.markdown("**Finger definition (m=5):**")
-        st.latex(rf"\text{{start}}[i] = (n + 2^{{i-1}}) \bmod 2^{{{M}}}")
+        # Build the list to draw/show
+        shown_entries = all_entries[:k]
+        fig = ring_figure(space=space, nodes_sorted=nodes_sorted, selected=selected_node,
+                          fingers_to_draw=shown_entries)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Table for shown entries
+        st.subheader("📇 Finger table (revealed so far)")
+        df_ft = pd.DataFrame(
+            [{"i": fe.i, "start": fe.start, "successor": fe.node} for fe in shown_entries],
+            columns=["i", "start", "successor"]
+        )
+        st.dataframe(df_ft, use_container_width=True, hide_index=True)
+
+        # Equations
+        st.markdown("**Finger definition:**")
+        st.latex(rf"\text{{start}}[i] = (n + 2^{{i-1}}) \bmod 2^{{{m}}}")
         st.latex(r"\text{finger}[i] = \operatorname{succ}(\text{start}[i])")
-        with st.expander("Show per-entry substitutions"):
-            for line in finger_equations(selected_node, finger_entries):
-                st.latex(line)
 
-    st.subheader("🧭 Lookup")
-    succ_k = successor_of(key_id, nodes_sorted)
-    st.markdown("**Summary:**")
-    st.latex(rf"\text{{Target key }}k={key_id}\,,\quad \operatorname{{succ}}(k)={succ_k}")
-    if lookup_path:
-        st.code(" → ".join(str(n) for n in lookup_path), language="text")
-    if show_eq and hop_reasons:
-        with st.expander("Show hop-by-hop reasoning"):
-            for r in hop_reasons:
-                st.latex(r)
+        if k == 0:
+            st.info("Click **Next entry** to compute finger[1].")
+        else:
+            st.subheader("🧮 Equation updates (per revealed entry)")
+            for fe in shown_entries:
+                i = fe.i
+                st.latex(
+                    rf"\text{{finger}}[{i}]:\;"
+                    rf"\text{{start}}[{i}] = ({selected_node} + 2^{{{i-1}}}) \bmod 2^{{{m}}} = {fe.start},\;"
+                    rf"\text{{node}} = \operatorname{{succ}}({fe.start}) = {fe.node}"
+                )
 
-st.divider()
-with st.expander("📘 Teaching tips"):
-    st.markdown("""
-- Use **Manual IDs** to reproduce the 0–31 example exactly.
-- Start with a few nodes (e.g., `1, 4, 9, 11, 14, 18, 20, 21, 28`) to match textbook figures.
-- Ask students to compute `start[i]` by hand for one node, then reveal with the expander.
-- Try lookups like **k = 12** from node **28** and **k = 26** from node **1**, mirroring the diagram.
-""")
+        # Full table (optional)
+        with st.expander("Show full finger table (all m entries)"):
+            df_full = pd.DataFrame(
+                [{"i": fe.i, "start": fe.start, "successor": fe.node} for fe in all_entries],
+                columns=["i", "start", "successor"]
+            )
+            st.dataframe(df_full, use_container_width=True, hide_index=True)
+
+    cols = st.columns([1, 1, 8])
+    with cols[0]:
+        st.button("← Back", on_click=lambda: st.session_state.update(step=2))
+    with cols[1]:
+        st.button("Restart", on_click=reset_all)
