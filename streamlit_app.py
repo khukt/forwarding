@@ -1,7 +1,8 @@
 # -------------------------------------------------------------
-# ENSURE-6G • TMS Dashboard — PyDeck (deck.gl) Smooth Animation
+# ENSURE-6G • TMS Dashboard — PyDeck (deck.gl) Smooth + Visible Layers
 # Sundsvall → Stockholm • RAW vs SEMANTIC vs HYBRID
 # Dynamic bearer (5G→LTE→3G→GSM-R), channel model, Sankey flow
+# Trains via IconLayer (+ fallback dot), Sensors & BS via ScatterplotLayer
 # -------------------------------------------------------------
 import math, time
 import numpy as np
@@ -26,7 +27,7 @@ def haversine(p1, p2):
     return R * (2*math.atan2(math.sqrt(a), math.sqrt(1-a)))
 
 def per_from_snr(snr_db):
-    x0, k = 2.0, -1.1  # threshold-ish
+    x0, k = 2.0, -1.1
     per = 1/(1+math.exp(k*(snr_db-x0)))
     return max(1e-5, min(0.99, per))
 
@@ -39,10 +40,9 @@ ROUTE = [
     (59.3293, 18.0686),  # Stockholm
 ]
 route_ls = LineString([(p[1], p[0]) for p in ROUTE])  # (lon,lat)
-seg_len = [haversine(ROUTE[i], ROUTE[i+1]) for i in range(len(ROUTE)-1)]
+seg_len = [haversine(ROUTE[i], ROJ := ROUTE[i+1]) for i in range(len(ROUTE)-1)]
 route_len = float(sum(seg_len))
 
-# ---------- Sensors & BS ----------
 def interp_point_by_dist(dist_m):
     if dist_m <= 0: return ROUTE[0]
     if dist_m >= route_len: return ROUTE[-1]
@@ -56,21 +56,22 @@ def interp_point_by_dist(dist_m):
         rem -= L
     return ROUTE[-1]
 
+# ---------- Sensors & BS ----------
 N_SENS = 22
 sensor_pts = []
 for i in range(N_SENS):
     frac = i/(N_SENS-1)
     if 0.35 < frac < 0.55:
-        frac = 0.45 + (frac-0.45)*0.6
+        frac = 0.45 + (frac-0.45)*0.6   # denser near Gävle
     d = frac*route_len
     sensor_pts.append(interp_point_by_dist(d))
 
-# NOTE: 'tech' is a set (not JSON-serializable) — we will NOT pass it to pydeck layers
+# NOTE: keep 'tech' off pydeck data frames (not JSON-serializable)
 BS = [
     dict(name="Sundsvall",   lat=62.3913, lon=17.3063, tech={"5G","LTE","3G","GSMR"}),
     dict(name="Mid-North",   lat=61.80,   lon=17.10,   tech={"5G","LTE","3G","GSMR"}),
     dict(name="Gävle",       lat=60.6749, lon=17.1413, tech={"5G","LTE","3G","GSMR"}),
-    dict(name="Mid-South",   lat=60.25,   lon=17.40,   tech={"LTE","3G","GSMR"}),  # no 5G
+    dict(name="Mid-South",   lat=60.25,   lon=17.40,   tech={"LTE","3G","GSMR"}),
     dict(name="Uppsala",     lat=59.8586, lon=17.6389, tech={"5G","LTE","3G","GSMR"}),
     dict(name="Near-Stock",  lat=59.55,   lon=17.85,   tech={"5G","LTE","3G","GSMR"}),
     dict(name="Stockholm",   lat=59.3293, lon=18.0686, tech={"5G","LTE","3G","GSMR"}),
@@ -79,7 +80,7 @@ BS = [
 RISK_CENTER = (60.6749, 17.1413)
 RISK_RADIUS_M = 15000
 
-# ---------- Sidebar Controls ----------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Scenario Controls (TMS)")
     mode = st.radio("Communication Mode", ["RAW","SEMANTIC","HYBRID"], index=2)
@@ -95,9 +96,9 @@ with st.sidebar:
     show_sens = st.checkbox("Show Sensor Nodes", True)
     show_bs   = st.checkbox("Show Base Stations", True)
     show_sankey = st.checkbox("Show Communication Flow (Sankey)", True)
-    colpp1, colpp2 = st.columns(2)
-    if colpp1.button("⏯ Play/Pause"): st.session_state.playing = not st.session_state.get("playing", True)
-    if colpp2.button("⏮ Reset"): st.session_state.t_sim = 0.0
+    c1, c2 = st.columns(2)
+    if c1.button("⏯ Play/Pause"): st.session_state.playing = not st.session_state.get("playing", True)
+    if c2.button("⏮ Reset"): st.session_state.t_sim = 0.0
 
 # ---------- Animation State ----------
 if "playing" not in st.session_state: st.session_state.playing = True
@@ -105,16 +106,14 @@ if "t_sim" not in st.session_state: st.session_state.t_sim = 0.0
 if "last_tick" not in st.session_state: st.session_state.last_tick = time.time()
 if "bearer" not in st.session_state: st.session_state.bearer = "5G"
 if "bearer_prev" not in st.session_state: st.session_state.bearer_prev = "5G"
-if "bearer_ttt" not in st.session_state: st.session_state.bearer_ttt = 0.0  # ms accumulator
+if "bearer_ttt" not in st.session_state: st.session_state.bearer_ttt = 0.0
 
-# Smooth rerun timer
-if st.session_state.playing and anim_fps > 0:
+if st.session_state.playing and anim_fps>0:
     st_autorefresh(interval=int(1000/anim_fps), key="tick", limit=None)
 
-# Advance simulated time
 now = time.time()
 elapsed = now - st.session_state.last_tick
-if st.session_state.playing and anim_fps > 0:
+if st.session_state.playing and anim_fps>0:
     st.session_state.t_sim += elapsed
 st.session_state.last_tick = now
 if st.session_state.t_sim > sim_minutes_total*60:
@@ -185,7 +184,6 @@ def serving_bs(lat, lon):
     return BS[i], dists[i]
 
 def distance_along(latlon):
-    # sample route to find closest arc-length for correlated shadowing
     samples = 300; best_i=0; best_d=1e12
     for i in range(samples+1):
         f = i/samples; d = f*route_len
@@ -214,11 +212,9 @@ for b in ["5G","LTE","3G","GSMR"]:
 def pick_bearer(snr_table, caps, curr_bearer):
     order = ["5G","LTE","3G","GSMR"]
     avail = [b for b in order if b in caps]
-    # prefer highest tier meeting snr_ok
     for b in avail:
         if snr_table.get(b,-99) >= TECH[b]["snr_ok"]:
             return b, True
-    # fallback: best SNR
     if avail:
         best = max(avail, key=lambda x: snr_table.get(x,-99))
         return best, True
@@ -292,7 +288,7 @@ raw_bps = raw_points*BYTES_RAW
 alert_bps = len(laneA_alerts)*BYTES_ALERT
 laneB_bps = len(laneB_msgs)*BYTES_SUM
 bps_total = raw_bps + alert_bps + laneB_bps
-lat_ms += (bps_total/1000)  # tiny jitter
+lat_ms += (bps_total/1000)
 
 # ---------- UI: Map (PyDeck) ----------
 col1, col2 = st.columns([2.2, 1.8])
@@ -300,41 +296,39 @@ col1, col2 = st.columns([2.2, 1.8])
 with col1:
     st.subheader("Live Map • Deck.gl (TMS view)")
 
-    # 1) Route PathLayer
+    # 0) Common view state
+    view_state = pdk.ViewState(latitude=60.1, longitude=17.7, zoom=6)
+
+    # 1) Route PathLayer (thicker so it's obvious)
     path_data = [{"path": [[p[1], p[0]] for p in ROUTE]}]
     route_layer = pdk.Layer(
         "PathLayer",
         data=path_data,
         get_path="path",
-        get_width=4,
-        width_min_pixels=2,
-        get_color=[0, 102, 255, 200],
+        get_width=6,
+        width_min_pixels=3,
+        get_color=[0, 102, 255, 220],
     )
 
-    # 2) Risk zone PolygonLayer (circle approximation)
+    # 2) Risk zone PolygonLayer (semi-transparent red)
     def circle_polygon(center, radius_m, n=80):
         lat0, lon0 = center
         m2deg_lat = 1/111111.0
         m2deg_lon = 1/(111111.0*math.cos(math.radians(lat0)))
-        verts = []
-        for th in np.linspace(0, 2*math.pi, n):
-            lat = lat0 + (radius_m*math.sin(th))*m2deg_lat
-            lon = lon0 + (radius_m*math.cos(th))*m2deg_lon
-            verts.append([lon, lat])
-        return verts
+        return [[lon0 + (radius_m*math.cos(th))*m2deg_lon,
+                 lat0 + (radius_m*math.sin(th))*m2deg_lat] for th in np.linspace(0, 2*math.pi, n)]
     risk_poly = [{"polygon": circle_polygon(RISK_CENTER, RISK_RADIUS_M)}]
     risk_layer = pdk.Layer(
         "PolygonLayer",
         data=risk_poly,
         get_polygon="polygon",
-        get_fill_color=[255, 51, 51, 40],
-        get_line_color=[255, 51, 51],
+        get_fill_color=[255, 80, 80, 60],
+        get_line_color=[255, 80, 80],
         line_width_min_pixels=1,
-        pickable=False,
     )
 
-    # 3) Sensors ScatterplotLayer colored by risk (only serializable columns)
-    colors = {"low":[0,170,0,200], "medium":[255,140,0,200], "high":[220,0,0,220]}
+    # 3) Sensors ScatterplotLayer — BIGGER & bright colors
+    colors = {"low":[0,170,0,220], "medium":[255,160,0,220], "high":[230,0,0,240]}
     sens_df = pd.DataFrame({
         "lat": sdf["lat"], "lon": sdf["lon"],
         "color": sdf["risk_label"].map(lambda x: colors[x]),
@@ -346,53 +340,67 @@ with col1:
         data=sens_df if show_sens else sens_df.iloc[0:0],
         get_position="[lon, lat]",
         get_fill_color="color",
-        get_radius=1200,
+        get_radius=2200,              # larger to stand out at zoom 6
+        radius_units="meters",
         pickable=True,
     )
 
-    # 4) Base Stations ScatterplotLayer (DROP non-serializable 'tech')
-    bs_df = pd.DataFrame(BS)
-    bs_df_layer = bs_df[["lat","lon","name"]].copy()
-    bs_df_layer["tooltip"] = [f"{row['name']} ({'/'.join(sorted(BS[i]['tech']))})" for i, row in bs_df_layer.reset_index().iterrows()]
+    # 4) Base Stations ScatterplotLayer — BIG & blue
+    bs_df = pd.DataFrame([{"lat": b["lat"], "lon": b["lon"], "name": b["name"],
+                           "tooltip": f"{b['name']} ({'/'.join(sorted(b['tech']))})"} for b in BS])
     bs_layer = pdk.Layer(
         "ScatterplotLayer",
-        data=bs_df_layer if show_bs else bs_df_layer.iloc[0:0],
+        data=bs_df if show_bs else bs_df.iloc[0:0],
         get_position="[lon, lat]",
-        get_fill_color=[30, 144, 255, 220],
-        get_radius=1800,
+        get_fill_color=[30, 144, 255, 240],
+        get_radius=3000,              # nice and visible
+        radius_units="meters",
         pickable=True,
     )
 
-    # 5) Trains as TextLayer with emoji (🚆)
+    # 5) Trains — IconLayer (robust) + tiny white dot fallback
+    # Public icon (32x32). Replace URL with your own if desired.
+    TRAIN_ICON_URL = "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-large.png"
     trains_df = pd.DataFrame([
-        dict(lat=trainA[0], lon=trainA[1], label="🚆"),
-        dict(lat=trainB[0], lon=trainB[1], label="🚆"),
+        {"lat": trainA[0], "lon": trainA[1], "name": "Train A"},
+        {"lat": trainB[0], "lon": trainB[1], "name": "Train B"},
     ])
-    train_layer = pdk.Layer(
-        "TextLayer",
-        trains_df,
-        get_position='[lon, lat]',
-        get_text='label',
-        get_size=24,
-        get_text_anchor='middle',
-        get_alignment_baseline='center',
+    trains_df["icon_data"] = [{
+        "url": TRAIN_ICON_URL, "width": 128, "height": 128, "anchorY": 128
+    } for _ in range(len(trains_df))]
+
+    train_icon_layer = pdk.Layer(
+        "IconLayer",
+        data=trains_df,
+        get_icon="icon_data",
+        get_size=3.6,                 # scale factor
+        size_units="meters",
+        size_min_pixels=24,           # ensure visibility regardless of zoom
+        size_max_pixels=48,
+        get_position="[lon, lat]",
+        pickable=True,
+    )
+    train_fallback_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=trains_df,
+        get_position="[lon, lat]",
+        get_fill_color=[255, 255, 255, 255],
+        get_radius=800,
+        radius_units="meters",
+        pickable=False,
     )
 
-    view_state = pdk.ViewState(latitude=60.1, longitude=17.7, zoom=6, bearing=0, pitch=0)
     deck = pdk.Deck(
         map_provider="carto", map_style="light",
         initial_view_state=view_state,
-        layers=[route_layer, risk_layer, sensor_layer, bs_layer, train_layer],
+        layers=[route_layer, risk_layer, sensor_layer, bs_layer, train_fallback_layer, train_icon_layer],
         tooltip={"html":"<b>{tooltip}</b>", "style":{"color":"white"}}
     )
     st.pydeck_chart(deck, use_container_width=True)
-    st.caption("Deck.gl updates smoothly. Trains (🚆) via TextLayer; sensors & BS ScatterplotLayers; route PathLayer; risk zone PolygonLayer.")
+    st.caption("If the icon URL fails, the white dot still shows the train. Sensors are green/orange/red; base stations are bright blue.")
 
 with col2:
     st.subheader("Comms, Channel & Safety Status")
-    # Work out serving BS again for display
-    bsA, dA = serving_bs(*trainA)
-    envA = env_class(*trainA)
     st.markdown(f"**Serving BS:** {bsA['name']} • env **{envA}** • dist **{int(haversine(trainA,(bsA['lat'],bsA['lon']))/1000)} km**")
     st.markdown(
         f"**Bearer:** {bearer} (prev: {st.session_state.bearer_prev}, TTT: {int(st.session_state.bearer_ttt)} ms)  | "
@@ -404,7 +412,7 @@ with col2:
     c1.metric("RAW (bps)", f"{raw_bps:,.0f}")
     c2.metric("Lane A (bps)", f"{alert_bps:,.0f}")
     c3.metric("Lane B (bps)", f"{laneB_bps:,.0f}")
-    c4.metric("Total (bps)", f"{(raw_bps+alert_bps+laneB_bps):,.0f}")
+    c4.metric("Total (bps)", f"{bps_total:,.0f}")
 
     st.markdown("---")
     st.markdown("**Lane A (Safety Alerts)**")
@@ -412,7 +420,7 @@ with col2:
     st.markdown("**Lane B (Ops/Maintenance)**")
     st.json(laneB_msgs if laneB_msgs else [])
 
-# ---------- Sankey Communication Flow (Plotly) ----------
+# ---------- Sankey Communication Flow ----------
 if show_sankey:
     st.markdown("---")
     st.subheader("Communication Flow (This Tick)")
@@ -436,8 +444,7 @@ if show_sankey:
 
 # ---------- Footnote ----------
 st.caption(
-    "Fix: removed non-serializable columns (e.g., 'tech' sets) from pydeck layer data. "
-    "Channel model: FSPL + env offset (UMa/RMa), log-normal shadowing (σ≈7 dB), Rician (RMa)/Rayleigh (UMa) fading. "
-    "Dynamic bearer with hysteresis/time-to-trigger (5G→LTE→3G→GSM-R). "
-    "Lane A repetition for reliability; latency = bearer base + light load jitter. HYBRID = Lane A alerts + sparse RAW."
+    "Trains now use IconLayer (public PNG) + fallback dot, so they’re always visible. "
+    "Sensors and BS use bigger radii and high-contrast colors. "
+    "We keep dynamic bearer (5G→LTE→3G→GSM-R) with hysteresis/TTT, plus channel→SNR→PER and RAW/SEMANTIC/HYBRID flows."
 )
