@@ -1,4 +1,4 @@
-import json, zlib, math, time, os
+import json, zlib, math, os
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 
@@ -8,10 +8,11 @@ import streamlit as st
 from sklearn.cluster import KMeans
 import cbor2
 import pydeck as pdk
+from streamlit_autorefresh import st_autorefresh
 
 # ========= Page / session =========
-st.set_page_config(page_title="ENSURE-6G • Semantic Rail Demo (OSM Map)", layout="wide")
-st.title("ENSURE-6G: Semantic Communication — Live Rail Demo (OpenStreetMap)")
+st.set_page_config(page_title="ENSURE-6G • Semantic Rail Demo (OSM + Autoplay)", layout="wide")
+st.title("ENSURE-6G: Semantic Communication — Live Rail Demo (OpenStreetMap + Autoplay)")
 st.caption("OpenStreetMap basemap • Approximated railway Sundsvall→Stockholm • Base stations + coverage • Moving train • Safety vs Ops semantics")
 
 if "t_idx" not in st.session_state: st.session_state.t_idx = 0
@@ -225,8 +226,23 @@ with tab_map:
         c1,c2=st.columns(2)
         if c1.button("▶ Simulate", use_container_width=True): st.session_state.playing=True
         if c2.button("⏸ Pause", use_container_width=True): st.session_state.playing=False
-        t_idx = st.slider("Time (s)", 0, SECS-1, value=st.session_state.t_idx, key="time_slider", disabled=st.session_state.playing)
+
+        # --- Autoplay tick: refresh every 800 ms when playing ---
+        if st.session_state.playing:
+            st_autorefresh(interval=800, key="autoplay_tick")
+            # advance one second per refresh (cap at end)
+            st.session_state.t_idx = min(st.session_state.t_idx + 1, SECS - 1)
+            if st.session_state.t_idx >= SECS - 1:
+                st.session_state.playing = False
+
+        # Time slider (disabled while playing)
+        t_idx = st.slider("Time (s)", 0, SECS-1,
+                          value=st.session_state.t_idx,
+                          key="time_slider",
+                          disabled=st.session_state.playing)
         st.session_state.t_idx = t_idx
+
+        # KPIs at current time
         st.metric("Segment", route_df.loc[t_idx,"segment"])
         st.metric("Nearest BS", str(near_bs[t_idx]))
         st.metric("Link quality", str(quality[t_idx]))
@@ -242,7 +258,7 @@ with tab_map:
             min_zoom=0, max_zoom=19, tile_size=256,
         )
 
-        # Railway path (downsample for rendering)
+        # Railway path
         step = max(1, SECS//300)
         path_coords = [[route_df.loc[i,"lon"], route_df.loc[i,"lat"]] for i in range(0, SECS, step)]
         path_layer = pdk.Layer(
@@ -264,12 +280,11 @@ with tab_map:
             pickable=True,
         )
 
-        # Train: IconLayer for visibility
+        # Train: IconLayer + colored halo by quality
         qcol = {"GOOD":[0,170,0], "PATCHY":[255,165,0], "POOR":[200,0,0]}
         cur = pd.DataFrame([{
             "lat": route_df.loc[st.session_state.t_idx,"lat"],
             "lon": route_df.loc[st.session_state.t_idx,"lon"],
-            "quality": str(quality[st.session_state.t_idx]),
             "icon_data": {
                 "url": "https://img.icons8.com/emoji/48/train-emoji.png",
                 "width": 128, "height": 128, "anchorY": 128
@@ -284,13 +299,12 @@ with tab_map:
             get_size=4, size_scale=15,
             pickable=False,
         )
-        # colored halo for quality
         halo_layer = pdk.Layer(
             "ScatterplotLayer",
             data=cur,
             get_position='[lon, lat]',
             get_fill_color='color',
-            get_radius=5000,  # bigger so it's obvious
+            get_radius=5000,
             stroked=True, get_line_color=[0,0,0], line_width_min_pixels=1
         )
 
@@ -298,34 +312,18 @@ with tab_map:
         deck = pdk.Deck(
             layers=[tile_layer, path_layer, bs_layer, halo_layer, train_icon_layer],
             initial_view_state=view_state,
-            map_style=None,  # IMPORTANT: no Mapbox style; we supply our own OSM tiles
+            map_style=None,  # IMPORTANT: use OSM tiles, not Mapbox styles
             tooltip={"text":"{name}"}
         )
         st.pydeck_chart(deck)
         st.caption("OpenStreetMap tiles. ▶ to animate. Train icon + colored halo shows link quality to nearest base station.")
 
-    # Animation loop
-    if st.session_state.playing:
-        next_t = st.session_state.t_idx + 1
-        if next_t >= SECS:
-            st.session_state.playing = False
-        else:
-            st.session_state.t_idx = next_t
-            time.sleep(0.08)  # ~12.5 fps feel
-            st.experimental_rerun()
-
 with tab_packets:
     st.subheader("Packet Inspector")
     example_t = min(SECS-1, max(0, SECS//3))
-    # Lane A
-    def laneA_adhesion_state(f):
-        mu=max(0.0,min(0.6,0.6-0.5*f.slip_ratio))
-        return {"mu_q7_9":int(mu*(1<<9)),"conf_pct":int(max(0,min(100,100-120*abs(0.2-f.slip_ratio)))),
-                "slip":int(f.slip_ratio>=0.18),"wsp":int(min(255,f.wsp_count)),"valid_ms":500}
     pktA = laneA_adhesion_state(features[example_t]); bA = enc_laneA(pktA, 123)
     st.markdown("**Lane A (safety) adhesion_state**"); st.code(json.dumps(pktA, indent=2))
     st.write(f"Encoded size: {len(bA)} bytes (CBOR + CRC32)")
-    # Lane B
     ev = next((e for e in events if e.t >= example_t), None)
     if ev is None: ev = Event(example_t,"ride_degradation",{"segment":features[example_t].segment,"rms":0.41,"dwell_s":160})
     bB_json = enc_laneB(ev, tokens[example_t], labels[tokens[example_t]], use_cbor=False)
