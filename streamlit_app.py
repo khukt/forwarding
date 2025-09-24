@@ -65,11 +65,12 @@ for i in range(N_SENS):
     d = frac*route_len
     sensor_pts.append(interp_point_by_dist(d))
 
+# NOTE: 'tech' is a set (not JSON-serializable) — we will NOT pass it to pydeck layers
 BS = [
     dict(name="Sundsvall",   lat=62.3913, lon=17.3063, tech={"5G","LTE","3G","GSMR"}),
     dict(name="Mid-North",   lat=61.80,   lon=17.10,   tech={"5G","LTE","3G","GSMR"}),
     dict(name="Gävle",       lat=60.6749, lon=17.1413, tech={"5G","LTE","3G","GSMR"}),
-    dict(name="Mid-South",   lat=60.25,   lon=17.40,   tech={"LTE","3G","GSMR"}),
+    dict(name="Mid-South",   lat=60.25,   lon=17.40,   tech={"LTE","3G","GSMR"}),  # no 5G
     dict(name="Uppsala",     lat=59.8586, lon=17.6389, tech={"5G","LTE","3G","GSMR"}),
     dict(name="Near-Stock",  lat=59.55,   lon=17.85,   tech={"5G","LTE","3G","GSMR"}),
     dict(name="Stockholm",   lat=59.3293, lon=18.0686, tech={"5G","LTE","3G","GSMR"}),
@@ -83,7 +84,7 @@ with st.sidebar:
     st.header("Scenario Controls (TMS)")
     mode = st.radio("Communication Mode", ["RAW","SEMANTIC","HYBRID"], index=2)
     train_speed_kmh = st.slider("Train Speed (km/h)", 60, 200, 140, 10)
-    anim_fps = st.slider("Animation FPS", 1, 15, 5, 1, help="UI refresh rate (frames per second).")
+    anim_fps = st.slider("Animation FPS", 1, 20, 6, 1, help="UI refresh rate (frames per second).")
     sim_minutes_total = st.number_input("Sim Length (minutes)", 5, 180, 30, 5)
     st.markdown("---")
     st.subheader("Lane A QoS")
@@ -299,7 +300,6 @@ col1, col2 = st.columns([2.2, 1.8])
 with col1:
     st.subheader("Live Map • Deck.gl (TMS view)")
 
-    # Build layers
     # 1) Route PathLayer
     path_data = [{"path": [[p[1], p[0]] for p in ROUTE]}]
     route_layer = pdk.Layer(
@@ -333,11 +333,11 @@ with col1:
         pickable=False,
     )
 
-    # 3) Sensors ScatterplotLayer colored by risk
+    # 3) Sensors ScatterplotLayer colored by risk (only serializable columns)
     colors = {"low":[0,170,0,200], "medium":[255,140,0,200], "high":[220,0,0,220]}
     sens_df = pd.DataFrame({
         "lat": sdf["lat"], "lon": sdf["lon"],
-        "risk": sdf["risk_label"].map(lambda x: colors[x]),
+        "color": sdf["risk_label"].map(lambda x: colors[x]),
         "tooltip": [f"{r.id} • {r.rail_temp_C}°C • {r.strain_kN}kN • {r.risk_label}"
                     for r in sdf.itertuples()]
     })
@@ -345,17 +345,18 @@ with col1:
         "ScatterplotLayer",
         data=sens_df if show_sens else sens_df.iloc[0:0],
         get_position="[lon, lat]",
-        get_fill_color="risk",
+        get_fill_color="color",
         get_radius=1200,
         pickable=True,
     )
 
-    # 4) Base Stations ScatterplotLayer
+    # 4) Base Stations ScatterplotLayer (DROP non-serializable 'tech')
     bs_df = pd.DataFrame(BS)
-    bs_df["tooltip"] = [f"{b['name']} ({'/'.join(sorted(b['tech']))})" for _, b in bs_df.iterrows()]
+    bs_df_layer = bs_df[["lat","lon","name"]].copy()
+    bs_df_layer["tooltip"] = [f"{row['name']} ({'/'.join(sorted(BS[i]['tech']))})" for i, row in bs_df_layer.reset_index().iterrows()]
     bs_layer = pdk.Layer(
         "ScatterplotLayer",
-        data=bs_df if show_bs else bs_df.iloc[0:0],
+        data=bs_df_layer if show_bs else bs_df_layer.iloc[0:0],
         get_position="[lon, lat]",
         get_fill_color=[30, 144, 255, 220],
         get_radius=1800,
@@ -378,7 +379,6 @@ with col1:
     )
 
     view_state = pdk.ViewState(latitude=60.1, longitude=17.7, zoom=6, bearing=0, pitch=0)
-
     deck = pdk.Deck(
         map_provider="carto", map_style="light",
         initial_view_state=view_state,
@@ -386,10 +386,13 @@ with col1:
         tooltip={"html":"<b>{tooltip}</b>", "style":{"color":"white"}}
     )
     st.pydeck_chart(deck, use_container_width=True)
-    st.caption("Deck.gl (pydeck) updates smoothly without tile flashing. Trains (🚆) are TextLayer markers; sensors & BS are ScatterplotLayers; route is PathLayer; risk zone is PolygonLayer.")
+    st.caption("Deck.gl updates smoothly. Trains (🚆) via TextLayer; sensors & BS ScatterplotLayers; route PathLayer; risk zone PolygonLayer.")
 
 with col2:
     st.subheader("Comms, Channel & Safety Status")
+    # Work out serving BS again for display
+    bsA, dA = serving_bs(*trainA)
+    envA = env_class(*trainA)
     st.markdown(f"**Serving BS:** {bsA['name']} • env **{envA}** • dist **{int(haversine(trainA,(bsA['lat'],bsA['lon']))/1000)} km**")
     st.markdown(
         f"**Bearer:** {bearer} (prev: {st.session_state.bearer_prev}, TTT: {int(st.session_state.bearer_ttt)} ms)  | "
@@ -401,7 +404,7 @@ with col2:
     c1.metric("RAW (bps)", f"{raw_bps:,.0f}")
     c2.metric("Lane A (bps)", f"{alert_bps:,.0f}")
     c3.metric("Lane B (bps)", f"{laneB_bps:,.0f}")
-    c4.metric("Total (bps)", f"{bps_total:,.0f}")
+    c4.metric("Total (bps)", f"{(raw_bps+alert_bps+laneB_bps):,.0f}")
 
     st.markdown("---")
     st.markdown("**Lane A (Safety Alerts)**")
@@ -432,6 +435,9 @@ if show_sankey:
     st.plotly_chart(sankey, use_container_width=True, config={"displayModeBar": False})
 
 # ---------- Footnote ----------
-st.caption("Channel model: FSPL + env offset (UMa/RMa), log-normal shadowing (σ≈7 dB), Rician (RMa)/Rayleigh (UMa) fading. "
-           "Dynamic bearer with hysteresis/time-to-trigger (5G→LTE→3G→GSM-R). "
-           "Lane A reliability via repetition; latency = bearer base + light load jitter. HYBRID = Lane A alerts + sparse RAW telemetry.")
+st.caption(
+    "Fix: removed non-serializable columns (e.g., 'tech' sets) from pydeck layer data. "
+    "Channel model: FSPL + env offset (UMa/RMa), log-normal shadowing (σ≈7 dB), Rician (RMa)/Rayleigh (UMa) fading. "
+    "Dynamic bearer with hysteresis/time-to-trigger (5G→LTE→3G→GSM-R). "
+    "Lane A repetition for reliability; latency = bearer base + light load jitter. HYBRID = Lane A alerts + sparse RAW."
+)
