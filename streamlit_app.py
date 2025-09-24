@@ -1,6 +1,8 @@
-# ENSURE-6G • TMS Rail Demo — PyDeck (robust rendering, no basemap dependency)
+# ENSURE-6G • TMS Rail Demo — PyDeck (robust) + PHY + Macro Capacity Model
 # Raw vs Semantic vs Hybrid • Dynamic bearer (5G→LTE→3G→GSM-R)
-# Channel model • Sankey comm flow • Trains/Sensors/BS clearly visible
+# PHY: path loss + shadowing + fading → SNR→PER
+# Macro: GOOD/PATCHY/POOR → capacity (bps) + random loss → overload queuing
+# Deck.gl map (no basemap dependency), Sankey flow, TMS metrics
 
 import math, time
 import numpy as np
@@ -11,93 +13,122 @@ from shapely.geometry import LineString
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="ENSURE-6G • TMS Rail Demo (PyDeck, robust)", layout="wide")
+st.set_page_config(page_title="ENSURE-6G • TMS Rail Demo (PHY + Capacity)", layout="wide")
 st.title("🚆 ENSURE-6G: Raw vs Semantic vs Hybrid — Control Center (TMS) Dashboard")
-st.caption("Sundsvall → Stockholm • Sensors + Base Stations • Channel model • Dynamic bearer (5G/LTE/3G/GSM-R) • Deck.gl without tile dependency")
+st.caption("Sundsvall → Stockholm • PHY (SNR→PER, handover) + Macro capacity (GOOD/PATCHY/POOR) • Deck.gl map (no tiles needed)")
 
-# ---------- Helpers ----------
-def haversine(p1, p2):
-    R = 6371000.0
-    lat1, lon1 = map(math.radians, (p1[0], p1[1]))
-    lat2, lon2 = map(math.radians, (p2[0], p2[1]))
-    dlat, dlon = lat2-lat1, lon2-lon1
-    a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
-    return R * (2*math.atan2(math.sqrt(a), math.sqrt(1-a)))
+# =================== Geography & helpers ===================
+R_EARTH = 6371000.0
 
-def per_from_snr(snr_db):
-    x0, k = 2.0, -1.1
-    per = 1/(1+math.exp(k*(snr_db-x0)))
-    return max(1e-5, min(0.99, per))
+def haversine_m(lat1, lon1, lat2, lon2):
+    p = math.pi/180.0
+    dlat = (lat2-lat1)*p
+    dlon = (lon2-lon1)*p
+    a = math.sin(dlat/2)**2 + math.cos(lat1*p)*math.cos(lat2*p)*math.sin(dlon/2)**2
+    return 2*R_EARTH*math.asin(min(1.0, math.sqrt(a)))
 
-# ---------- Route ----------
-ROUTE = [
-    (62.3913, 17.3063),  # Sundsvall
-    (61.3039, 17.0600),  # Hudiksvall vicinity
-    (60.6749, 17.1413),  # Gävle
-    (59.8586, 17.6389),  # Uppsala
-    (59.3293, 18.0686),  # Stockholm
-]
-route_ls = LineString([(lon, lat) for lat, lon in ROUTE])  # (lon,lat)
-seg_len = [haversine(ROUTE[i], ROUTE[i+1]) for i in range(len(ROUTE)-1)]
-route_len = float(sum(seg_len))
-
-def interp_point_by_dist(dist_m):
-    if dist_m <= 0: return ROUTE[0]
-    if dist_m >= route_len: return ROUTE[-1]
-    rem = dist_m
-    for i, L in enumerate(seg_len):
-        if rem <= L:
-            f = rem / L
-            lat = ROUTE[i][0] + f*(ROUTE[i+1][0]-ROUTE[i][0])
-            lon = ROUTE[i][1] + f*(ROUTE[i+1][1]-ROUTE[i][1])
-            return (lat, lon)
-        rem -= L
-    return ROUTE[-1]
-
-# ---------- Sensors & BS ----------
-N_SENS = 22
-sensor_pts = []
-for i in range(N_SENS):
-    frac = i/(N_SENS-1)
-    if 0.35 < frac < 0.55:
-        frac = 0.45 + (frac-0.45)*0.6
-    d = frac*route_len
-    sensor_pts.append(interp_point_by_dist(d))
-
-BS = [
-    dict(name="Sundsvall",   lat=62.3913, lon=17.3063, tech={"5G","LTE","3G","GSMR"}),
-    dict(name="Mid-North",   lat=61.80,   lon=17.10,   tech={"5G","LTE","3G","GSMR"}),
-    dict(name="Gävle",       lat=60.6749, lon=17.1413, tech={"5G","LTE","3G","GSMR"}),
-    dict(name="Mid-South",   lat=60.25,   lon=17.40,   tech={"LTE","3G","GSMR"}),
-    dict(name="Uppsala",     lat=59.8586, lon=17.6389, tech={"5G","LTE","3G","GSMR"}),
-    dict(name="Near-Stock",  lat=59.55,   lon=17.85,   tech={"5G","LTE","3G","GSMR"}),
-    dict(name="Stockholm",   lat=59.3293, lon=18.0686, tech={"5G","LTE","3G","GSMR"}),
+# Sundsvall -> Stockholm with intermediate bends (lat, lon)
+RAIL_WAYPOINTS = [
+    (62.3930,17.3070),(62.1200,17.1500),(61.8600,17.1400),(61.7300,17.1100),
+    (61.5600,17.0800),(61.3900,17.0700),(61.3000,17.0600),(61.0700,17.1000),
+    (60.8500,17.1600),(60.6749,17.1413),(60.3800,17.3300),(60.2000,17.4500),
+    (60.0500,17.5200),(59.9300,17.6100),(59.8586,17.6389),(59.7500,17.8200),
+    (59.6600,17.9400),(59.6100,17.9900),(59.5500,18.0300),(59.4800,18.0400),
+    (59.4200,18.0600),(59.3700,18.0700),(59.3293,18.0686),
 ]
 
-RISK_CENTER = (60.6749, 17.1413)
-RISK_RADIUS_M = 15000
+# name, lat, lon, radius_of_good_service_m
+BASE_STATIONS = [
+    ("BS-Sundsvall",62.386,17.325,16000),("BS-Njurunda",62.275,17.354,14000),
+    ("BS-Harmånger",61.897,17.170,14000),("BS-Hudiksvall",61.728,17.103,15000),
+    ("BS-Söderhamn",61.303,17.058,15000),("BS-Axmar",61.004,17.190,14000),
+    ("BS-Gävle",60.675,17.141,16000),("BS-Tierp",60.345,17.513,14000),
+    ("BS-Skyttorp",60.030,17.580,14000),("BS-Uppsala",59.858,17.639,16000),
+    ("BS-Märsta",59.620,17.860,15000),("BS-Stockholm",59.330,18.070,18000),
+]
 
-# ---------- Sidebar ----------
+def interpolate_polyline(points, n_pts):
+    """Resample a polyline to n_pts evenly spaced by arc length."""
+    lat = np.array([p[0] for p in points], dtype=float)
+    lon = np.array([p[1] for p in points], dtype=float)
+    seg = np.zeros(len(points), dtype=float)
+    for i in range(1, len(points)):
+        seg[i] = haversine_m(lat[i-1], lon[i-1], lat[i], lon[i])
+    cum = np.cumsum(seg)
+    total = float(cum[-1])
+    if total <= 0:
+        return pd.DataFrame({"lat":[lat[0]], "lon":[lon[0]], "s_m":[0.0]})
+    tgt = np.linspace(0.0, total, int(n_pts))
+    idx = np.searchsorted(cum, tgt, side="right")
+    idx[idx==0] = 1
+    i0 = idx-1; i1 = idx
+    d0 = cum[i0]; d1 = cum[i1]
+    w = np.divide(tgt - d0, np.maximum(d1-d0, 1e-9))
+    latp = lat[i0] + (lat[i1]-lat[i0])*w
+    lonp = lon[i0] + (lon[i1]-lon[i0])*w
+    return pd.DataFrame({"lat":latp, "lon":lonp, "s_m":tgt})
+
+def label_segments(route_len_sec):
+    SEG_NAMES = ["Sundsvall→Hudiksvall","Hudiksvall→Söderhamn","Söderhamn→Gävle","Gävle→Uppsala","Uppsala→Stockholm"]
+    bounds = np.linspace(0, route_len_sec, len(SEG_NAMES)+1).astype(int)
+    labels = np.empty(route_len_sec, dtype=object)
+    for i in range(len(SEG_NAMES)):
+        labels[bounds[i]:bounds[i+1]] = SEG_NAMES[i]
+    return labels
+
+def nearest_bs_quality(lat, lon):
+    """
+    Return (bs_name, distance_m, quality) with a simple 3-bin metric:
+    GOOD (<=R), PATCHY (<=2.2R), POOR (>2.2R)
+    """
+    best = None
+    for name, blat, blon, R in BASE_STATIONS:
+        d = haversine_m(lat, lon, blat, blon)
+        if d <= R:
+            q = "GOOD"
+        elif d <= 2.2*R:
+            q = "PATCHY"
+        else:
+            q = "POOR"
+        rank = {"GOOD":0, "PATCHY":1, "POOR":2}[q]
+        if best is None or rank < best[3]:
+            best = (name, d, q, rank)
+    return best[0], best[1], best[2]
+
+def cap_loss(quality, t_sec, base_capacity_kbps=800, burst_factor=1.4,
+             good_loss_pct=0.5, bad_loss_pct=10.0):
+    """Map quality to capacity (bps) & random loss."""
+    cap_bps = int(base_capacity_kbps * 1000)
+    if quality == "GOOD":
+        cap_bps = int(cap_bps * burst_factor)
+        loss = good_loss_pct / 100.0
+    elif quality == "PATCHY":
+        wobble = 0.6 + 0.2 * math.sin(2*math.pi * (t_sec % 30) / 30.0)
+        cap_bps = max(int(cap_bps * wobble * 0.9), 1)
+        loss = min(0.4, (bad_loss_pct * 0.5) / 100.0)
+    else:
+        cap_bps = int(cap_bps * 0.25)
+        loss = bad_loss_pct / 100.0
+    return max(1, cap_bps), float(loss)
+
+# =================== Sidebar (controls) ===================
 with st.sidebar:
     st.header("Scenario Controls (TMS)")
     mode = st.radio("Communication Mode", ["RAW","SEMANTIC","HYBRID"], index=2)
     train_speed_kmh = st.slider("Train Speed (km/h)", 60, 200, 140, 10)
-    anim_fps = st.slider("Animation FPS", 1, 20, 6, 1, help="UI refresh rate (frames per second).")
+    anim_fps = st.slider("Animation FPS", 1, 20, 6, 1)
     sim_minutes_total = st.number_input("Sim Length (minutes)", 5, 180, 30, 5)
     st.markdown("---")
     st.subheader("Lane A QoS")
-    laneA_target_ms = st.slider("Target latency (ms)", 20, 500, 100, 10)
     laneA_reps = st.slider("Repetitions (reliability)", 1, 3, 2, 1)
     st.markdown("---")
     st.subheader("Display")
-    show_sens = st.checkbox("Show Sensor Nodes", True)
-    show_bs   = st.checkbox("Show Base Stations", True)
     show_sankey = st.checkbox("Show Communication Flow (Sankey)", True)
     c1, c2 = st.columns(2)
     if c1.button("⏯ Play/Pause"): st.session_state.playing = not st.session_state.get("playing", True)
     if c2.button("⏮ Reset"): st.session_state.t_sim = 0.0
 
-# ---------- Animation State ----------
+# =================== Simulation state ===================
 if "playing" not in st.session_state: st.session_state.playing = True
 if "t_sim" not in st.session_state: st.session_state.t_sim = 0.0
 if "last_tick" not in st.session_state: st.session_state.last_tick = time.time()
@@ -105,9 +136,19 @@ if "bearer" not in st.session_state: st.session_state.bearer = "5G"
 if "bearer_prev" not in st.session_state: st.session_state.bearer_prev = "5G"
 if "bearer_ttt" not in st.session_state: st.session_state.bearer_ttt = 0.0
 
+# Build route once (one sample per sim-second)
+if "route_df" not in st.session_state or st.session_state.get("route_secs") != int(sim_minutes_total*60):
+    SECS = int(sim_minutes_total * 60)
+    st.session_state.route_df = interpolate_polyline(RAIL_WAYPOINTS, SECS)
+    st.session_state.seg_labels = label_segments(SECS)
+    st.session_state.route_secs = SECS
+
+route_df = st.session_state.route_df
+seg_labels = st.session_state.seg_labels
+
+# Animation tick
 if st.session_state.playing and anim_fps>0:
     st_autorefresh(interval=int(1000/anim_fps), key="tick", limit=None)
-
 now = time.time()
 elapsed = now - st.session_state.last_tick
 if st.session_state.playing and anim_fps>0:
@@ -116,21 +157,19 @@ st.session_state.last_tick = now
 if st.session_state.t_sim > sim_minutes_total*60:
     st.session_state.t_sim = 0.0
 
-# ---------- Train positions ----------
-def route_position(dist_m):
-    pt = route_ls.interpolate(dist_m % route_len)
-    return (pt.y, pt.x)
+# =================== Train positions (from route_df) ===================
+idx = int(st.session_state.t_sim) % len(route_df)
+trainA = (float(route_df.lat.iloc[idx]), float(route_df.lon.iloc[idx]))
+idx_nb = (len(route_df) - idx) % len(route_df)
+trainB = (float(route_df.lat.iloc[idx_nb]), float(route_df.lon.iloc[idx_nb]))
+segment_name = seg_labels[int(st.session_state.t_sim) % len(seg_labels)]
 
-v_mps = train_speed_kmh/3.6
-dist_travelled = (v_mps * st.session_state.t_sim) % route_len
-trainA = route_position(dist_travelled)
-trainB = route_position(route_len - dist_travelled)
-
-# ---------- Channel & Bearer ----------
+# =================== PHY model (SNR→PER, handover) ===================
 def env_class(lat, lon):
-    cities = [(p[0],p[1]) for p in [ROUTE[0], ROUTE[2], ROUTE[3], ROUTE[4]]]
+    # city proximity → UMa else RMa
+    cities = [(62.3913,17.3063),(60.6749,17.1413),(59.8586,17.6389),(59.3293,18.0686)]
     for c in cities:
-        if haversine((lat,lon), c) < 15000: return "UMa"
+        if haversine_m(lat,lon,c[0],c[1]) < 15000: return "UMa"
     return "RMa"
 
 def pathloss_db(freq_GHz, d_m, env):
@@ -176,34 +215,17 @@ TECH = {
 P_TX = 43  # dBm
 
 def serving_bs(lat, lon):
-    dists = [haversine((lat,lon), (b["lat"],b["lon"])) for b in BS]
+    # nearest site from hard-coded grid
+    dists = [haversine_m(lat, lon, b[1], b[2]) for b in BASE_STATIONS]
     i = int(np.argmin(dists))
-    return BS[i], dists[i]
+    # full capabilities everywhere for simplicity
+    caps = {"5G","LTE","3G","GSMR"} if BASE_STATIONS[i][0] != "BS-Mid-South" else {"LTE","3G","GSMR"}
+    return dict(name=BASE_STATIONS[i][0], lat=BASE_STATIONS[i][1], lon=BASE_STATIONS[i][2], tech=caps), dists[i]
 
-def distance_along(latlon):
-    samples = 300; best_i=0; best_d=1e12
-    for i in range(samples+1):
-        f = i/samples; d = f*route_len
-        p = route_ls.interpolate(d)
-        hd = haversine((p.y,p.x), latlon)
-        if hd < best_d: best_d, best_i = hd, i
-    return (best_i/samples)*route_len
-
-def snr_for(lat, lon, tech, env, d_bs_m, s_along_m):
-    pl = pathloss_db(TECH[tech]["freq"], d_bs_m, env)
-    sh = shadow.sample(s_along_m)
-    fad = rician_db(8) if env=="RMa" else rayleigh_db()
-    rx = P_TX - pl + sh + fad
-    n = noise_dbm(TECH[tech]["bw"])
-    return rx - n, rx, n
-
-bsA, dA = serving_bs(*trainA)
-envA = env_class(*trainA)
-s_along = distance_along(trainA)
-snr_table = {}
-for b in ["5G","LTE","3G","GSMR"]:
-    if b in bsA["tech"]:
-        snr_table[b] = snr_for(trainA[0], trainA[1], b, envA, dA, s_along)[0]
+def per_from_snr(snr_db):
+    x0, k = 2.0, -1.1
+    per = 1/(1+math.exp(k*(snr_db-x0)))
+    return max(1e-5, min(0.99, per))
 
 def pick_bearer(snr_table, caps, curr_bearer):
     order = ["5G","LTE","3G","GSMR"]
@@ -216,6 +238,20 @@ def pick_bearer(snr_table, caps, curr_bearer):
         return best, True
     return curr_bearer, False
 
+# SNR table at Train A
+bsA, dA = serving_bs(*trainA)
+envA = env_class(*trainA)
+# use route_df.s_m for correlated shadowing
+s_along = float(route_df.s_m.iloc[idx])
+snr_table = {}
+for b in ["5G","LTE","3G","GSMR"]:
+    if b in bsA["tech"]:
+        pl = pathloss_db(TECH[b]["freq"], dA, envA)
+        sh = shadow.sample(s_along)
+        fad = rician_db(8) if envA=="RMa" else rayleigh_db()
+        rx = P_TX - pl + sh + fad
+        snr_table[b] = rx - noise_dbm(TECH[b]["bw"])
+
 cand, valid = pick_bearer(snr_table, bsA["tech"], st.session_state.bearer)
 TTT_MS = 1200
 if valid and cand != st.session_state.bearer:
@@ -227,19 +263,32 @@ if valid and cand != st.session_state.bearer:
 else:
     st.session_state.bearer_ttt = 0.0
 bearer = st.session_state.bearer
-
 snr_use = snr_table.get(bearer, -20)
 per_single = per_from_snr(snr_use)
 per_reps = per_single**laneA_reps
-lat_ms = TECH[bearer]["base_lat"]
+lat_ms_phy = TECH[bearer]["base_lat"]
 
-# ---------- Sensors & Messages ----------
+# =================== Macro capacity/loss layer ===================
+bs_macro_name, bs_macro_dist, quality = nearest_bs_quality(*trainA)
+cap_bps, rand_loss = cap_loss(quality, int(st.session_state.t_sim))
+badge = {"GOOD":"🟢","PATCHY":"🟠","POOR":"🔴"}[quality]
+
+# =================== Traffic & semantics ===================
+RAW_HZ, HYB_HZ = 2.0, 0.2
+BYTES_RAW, BYTES_ALERT, BYTES_SUM = 24, 280, 180
+
+# sensors (synthetic) and Lane A/B messages
 def synth_sensors(t_sec):
     base = 24 + 10*math.sin(2*math.pi*((t_sec/60)%1440)/1440)
     data = []
-    for i, (la,lo) in enumerate(sensor_pts):
-        d_risk = haversine((la,lo), RISK_CENTER)
-        boost = max(0, 1 - d_risk/RISK_RADIUS_M) * 14
+    # place 22 sensors evenly along route_df
+    N_SENS = 22
+    idxs = np.linspace(0, len(route_df)-1, N_SENS).astype(int)
+    for i, j in enumerate(idxs):
+        la, lo = float(route_df.lat.iloc[j]), float(route_df.lon.iloc[j])
+        # risk hotspot near Gävle
+        d_risk = haversine_m(la, lo, 60.6749, 17.1413)
+        boost = max(0, 1 - d_risk/15000) * 14
         temp = base + np.random.normal(0,0.6) + boost
         strain = max(0.0, (temp-35)*0.8 + np.random.normal(0,0.5))
         ballast = max(0.0, np.random.normal(0.3,0.1) + 0.02*boost)
@@ -256,12 +305,8 @@ def synth_sensors(t_sec):
 
 sdf = synth_sensors(st.session_state.t_sim)
 
-RAW_HZ, HYB_HZ = 2.0, 0.2
-BYTES_RAW, BYTES_ALERT, BYTES_SUM = 24, 280, 180
-
 raw_points = 0
 laneA_alerts, laneB_msgs = [], []
-
 for _, row in sdf.iterrows():
     if mode in ("RAW","HYBRID"):
         raw_points += int(RAW_HZ if mode=="RAW" else HYB_HZ)
@@ -281,149 +326,124 @@ if mode in ("SEMANTIC","HYBRID"):
                            window=f"t={int(st.session_state.t_sim)}s"))
 
 raw_bps = raw_points*BYTES_RAW
-alert_bps = len(laneA_alerts)*BYTES_ALERT
+laneA_bps = len(laneA_alerts)*BYTES_ALERT
 laneB_bps = len(laneB_msgs)*BYTES_SUM
-bps_total = raw_bps + alert_bps + laneB_bps
-lat_ms += (bps_total/1000)
+bps_total = raw_bps + laneA_bps + laneB_bps
 
-# ---------- UI ----------
+# =================== Fuse PHY + Macro into E2E ===================
+# Base latency from PHY bearer + tiny load jitter
+lat_ms = lat_ms_phy + (bps_total/1000)
+
+# Capacity pressure → queueing penalty (nonlinear clamp) and best-effort drops
+if bps_total > cap_bps:
+    overload = bps_total / cap_bps
+    lat_ms *= min(4.0, 1.0 + 0.35*(overload-1))  # extra queueing
+    overflow_drop = min(0.5, 0.10*(overload-1))
+else:
+    overflow_drop = 0.0
+
+# Random loss applies to best-effort streams (RAW, Lane B); Lane A uses repetition on PHY
+loss_be = max(0.0, min(0.8, rand_loss + overflow_drop))
+effective_raw_bps   = int(raw_bps   * (1.0 - loss_be))
+effective_laneB_bps = int(laneB_bps * (1.0 - loss_be))
+effective_total_bps = effective_raw_bps + laneA_bps + effective_laneB_bps
+
+# Lane-A end-to-end success probability (from PHY PER & repetition)
+laneA_success = (1 - per_single) ** laneA_reps
+
+# =================== UI: Map (Deck.gl, no tiles) ===================
 col1, col2 = st.columns([2.2, 1.8])
 
 with col1:
     st.subheader("Live Map • Deck.gl (no basemap dependency)")
 
-    # View centered between Uppsala & Gävle
     view_state = pdk.ViewState(latitude=60.1, longitude=17.7, zoom=6)
 
-    # Route path as many points (guaranteed to draw even without tiles)
+    # Route Path
     path_points = np.linspace(0, 1, 200)
+    route_ls = LineString([(lon, lat) for lat,lon in RAIL_WAYPOINTS])
+    route_len = float(np.sum([haversine_m(RAIL_WAYPOINTS[i][0],RAIL_WAYPOINTS[i][1],
+                                          RAIL_WAYPOINTS[i+1][0],RAIL_WAYPOINTS[i+1][1])
+                              for i in range(len(RAIL_WAYPOINTS)-1)]))
     route_xy = [[route_ls.interpolate(f*route_len).x, route_ls.interpolate(f*route_len).y] for f in path_points]
-    route_layer = pdk.Layer(
-        "PathLayer",
-        data=[{"path": route_xy}],
-        get_path="path",
-        get_color=[0, 102, 255, 255],
-        width_scale=1,
-        width_min_pixels=4,
-    )
+    route_layer = pdk.Layer("PathLayer", data=[{"path": route_xy}],
+                            get_path="path", get_color=[0,102,255,255], width_scale=1, width_min_pixels=4)
 
-    # Risk zone polygon
+    # Risk circle around Gävle
     def circle_polygon(center, radius_m, n=100):
         lat0, lon0 = center
         m2deg_lat = 1/111111.0
         m2deg_lon = 1/(111111.0*math.cos(math.radians(lat0)))
         return [[lon0 + (radius_m*math.cos(th))*m2deg_lon,
                  lat0 + (radius_m*math.sin(th))*m2deg_lat] for th in np.linspace(0, 2*math.pi, n)]
-    risk_poly = pdk.Layer(
-        "PolygonLayer",
-        data=[{"polygon": circle_polygon(RISK_CENTER, RISK_RADIUS_M)}],
-        get_polygon="polygon",
-        get_fill_color=[255, 80, 80, 70],
-        get_line_color=[255, 80, 80],
-        line_width_min_pixels=1,
-    )
+    risk_layer = pdk.Layer("PolygonLayer",
+                           data=[{"polygon": circle_polygon((60.6749, 17.1413), 15000)}],
+                           get_polygon="polygon", get_fill_color=[255,80,80,70],
+                           get_line_color=[255,80,80], line_width_min_pixels=1)
 
-    # Sensors (big & bright)
+    # Sensors
     colors = {"low":[0,170,0,230], "medium":[255,160,0,230], "high":[230,0,0,255]}
-    sens_df = pd.DataFrame({
-        "lon": sdf["lon"], "lat": sdf["lat"],
-        "color": sdf["risk_label"].map(lambda x: colors[x])
-    })
-    sensors_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=(sens_df if show_sens else sens_df.iloc[0:0]),
-        get_position='[lon, lat]',
-        get_fill_color='color',
-        get_radius=3000,
-    )
+    sens_df = pd.DataFrame({"lon": sdf["lon"], "lat": sdf["lat"],
+                            "color": sdf["risk_label"].map(lambda x: colors[x])})
+    sensors_layer = pdk.Layer("ScatterplotLayer", data=sens_df,
+                              get_position='[lon, lat]', get_fill_color='color', get_radius=3000)
 
-    # Base Stations (big & blue)
-    bs_df = pd.DataFrame([{"lon": b["lon"], "lat": b["lat"], "name": b["name"]} for b in BS])
-    bs_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=(bs_df if show_bs else bs_df.iloc[0:0]),
-        get_position='[lon, lat]',
-        get_fill_color=[30,144,255,255],
-        get_radius=4000,
-    )
+    # Base Stations
+    bs_df = pd.DataFrame([{"lon": b[2], "lat": b[1], "name": b[0]} for b in BASE_STATIONS])
+    bs_layer = pdk.Layer("ScatterplotLayer", data=bs_df,
+                         get_position='[lon, lat]', get_fill_color=[30,144,255,255], get_radius=4000)
 
-    # Trains as two layers: fallback dot (always draws) + icon if available
-    trains_df = pd.DataFrame([
-        {"lon": trainA[1], "lat": trainA[0], "name": "Train A"},
-        {"lon": trainB[1], "lat": trainB[0], "name": "Train B"},
-    ])
-    train_dot = pdk.Layer(
-        "ScatterplotLayer",
-        data=trains_df,
-        get_position='[lon, lat]',
-        get_fill_color=[255,255,255,255],
-        get_radius=4500,
-    )
-    # IconLayer parameters that are universally supported
-    TRAIN_ICON_URL = "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas.png"
-    # Use atlas + mapping for reliability
-    icon_mapping = {
-        "marker": {"x": 0, "y": 0, "width": 128, "height": 128, "anchorY": 128}
-    }
+    # Trains (white dot + icon atlas)
+    trains_df = pd.DataFrame([{"lon": trainA[1], "lat": trainA[0], "name": "Train A"},
+                              {"lon": trainB[1], "lat": trainB[0], "name": "Train B"}])
+    train_dot = pdk.Layer("ScatterplotLayer", data=trains_df,
+                          get_position='[lon, lat]', get_fill_color=[255,255,255,255], get_radius=4500)
+    icon_atlas = "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas.png"
+    icon_mapping = {"marker": {"x": 0, "y": 0, "width": 128, "height": 128, "anchorY": 128}}
     trains_df["icon"] = "marker"
-    train_icon = pdk.Layer(
-        "IconLayer",
-        data=trains_df,
-        get_icon="icon",
-        icon_atlas=TRAIN_ICON_URL,
-        icon_mapping=icon_mapping,
-        get_position='[lon, lat]',
-        size_scale=12,
-        get_size=4,            # multiplies by size_scale
-    )
+    train_icon = pdk.Layer("IconLayer", data=trains_df, get_icon="icon",
+                           icon_atlas=icon_atlas, icon_mapping=icon_mapping,
+                           get_position='[lon, lat]', size_scale=12, get_size=4)
 
-    deck = pdk.Deck(
-        initial_view_state=view_state,
-        map_provider=None,     # <- no tiles required; guarantees rendering anywhere
-        map_style=None,
-        layers=[route_layer, risk_poly, sensors_layer, bs_layer, train_dot, train_icon],
-    )
+    deck = pdk.Deck(initial_view_state=view_state, map_provider=None, map_style=None,
+                    layers=[route_layer, risk_layer, sensors_layer, bs_layer, train_dot, train_icon])
     st.pydeck_chart(deck, use_container_width=True, height=540)
-    st.caption("No basemap required. Route (blue), risk zone (red), sensors (green/orange/red), BS (blue), trains (white dot + icon).")
+    st.caption("Route (blue), risk (red), sensors (green/orange/red), BS (blue), trains (white + icon). No map tiles needed.")
 
 with col2:
     st.subheader("Comms, Channel & Safety Status")
-    st.markdown(f"**Serving BS:** {bsA['name']} • env **{envA}** • dist **{int(haversine(trainA,(bsA['lat'],bsA['lon']))/1000)} km**")
     st.markdown(
-        f"**Bearer:** {bearer} (prev: {st.session_state.bearer_prev}, TTT: {int(st.session_state.bearer_ttt)} ms)  | "
-        f"**SNR:** {snr_use:.1f} dB  | **PER(single):** {per_single:.2%}  | **PER(x{laneA_reps}):** {per_reps:.2%}  | "
-        f"**Lane A latency:** ~{int(lat_ms)} ms"
+        f"**Segment:** {segment_name}  \n"
+        f"**Serving BS (PHY):** {bsA['name']} • env **{envA}** • dist **{int(dA/1000)} km**  \n"
+        f"**Bearer:** {bearer} (prev: {st.session_state.bearer_prev}, TTT: {int(st.session_state.bearer_ttt)} ms)  \n"
+        f"**SNR:** {snr_use:.1f} dB | **PER(single):** {per_single:.2%} | **PER(x{laneA_reps}):** {per_reps:.2%} | **PHY base latency:** ~{int(lat_ms_phy)} ms  \n"
+        f"**Macro BS:** {bs_macro_name} • dist **{int(bs_macro_dist/1000)} km** • quality {badge} **{quality}**  \n"
+        f"**Capacity budget:** ~{cap_bps/1000:.0f} kbps | **Random loss (best-effort):** {rand_loss*100:.1f}%"
     )
     st.markdown("---")
-    RAW_HZ, HYB_HZ = 2.0, 0.2
-    BYTES_RAW, BYTES_ALERT, BYTES_SUM = 24, 280, 180
-    raw_points = 0  # already used above but recount for metrics display
-    for _ in sdf.itertuples():
-        if mode in ("RAW","HYBRID"):
-            raw_points += int(RAW_HZ if mode=="RAW" else HYB_HZ)
-    raw_bps = raw_points*BYTES_RAW
-    alert_bps = len([1 for x in laneA_alerts])*BYTES_ALERT
-    laneB_bps = len([1 for x in laneB_msgs])*BYTES_SUM
-    bps_total = raw_bps + alert_bps + laneB_bps
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("RAW (bps)", f"{raw_bps:,.0f}")
-    c2.metric("Lane A (bps)", f"{alert_bps:,.0f}")
+    c2.metric("Lane A (bps)", f"{laneA_bps:,.0f}")
     c3.metric("Lane B (bps)", f"{laneB_bps:,.0f}")
     c4.metric("Total (bps)", f"{bps_total:,.0f}")
-
+    st.markdown(
+        f"**Effective best-effort (after loss):** {effective_raw_bps + effective_laneB_bps:,.0f} bps  \n"
+        f"**E2E Lane-A success prob (PHY):** {(laneA_success*100):.1f}%  \n"
+        f"**E2E latency (PHY + capacity):** ~{int(lat_ms)} ms"
+    )
     st.markdown("---")
     st.markdown("**Lane A (Safety Alerts)**")
     st.json(laneA_alerts[:6] if laneA_alerts else [])
     st.markdown("**Lane B (Ops/Maintenance)**")
     st.json(laneB_msgs if laneB_msgs else [])
 
-# ---------- Sankey Communication Flow ----------
+# =================== Sankey Communication Flow ===================
 if show_sankey:
     st.markdown("---")
     st.subheader("Communication Flow (This Tick)")
-    sensors_to_bs = max(1, raw_bps + alert_bps + laneB_bps)
+    sensors_to_bs = max(1, raw_bps + laneA_bps + laneB_bps)
     bs_to_net = sensors_to_bs
-    net_to_tms = alert_bps + laneB_bps + (raw_bps if mode!="SEMANTIC" else 0)
+    net_to_tms = laneA_bps + laneB_bps + (raw_bps if mode!="SEMANTIC" else 0)
     tms_to_train = max(1, len(laneA_alerts)*100)
     tms_to_maint = max(1, len(laneB_msgs)*100)
 
@@ -441,4 +461,9 @@ if show_sankey:
     sankey.update_layout(height=360, margin=dict(l=10,r=10,t=10,b=10))
     st.plotly_chart(sankey, use_container_width=True, config={"displayModeBar": False})
 
-st.caption("This version draws layers even with map tiles disabled (map_provider=None). If you want OSM tiles, set map_provider='carto', map_style='light' (requires external tile access).")
+# =================== Footnote ===================
+st.caption(
+    "Hybrid model: PHY (FSPL + shadowing + Rayleigh/Rician) → SNR→PER, with handover & repetition for Lane-A; "
+    "Macro capacity (GOOD/PATCHY/POOR) gates throughput with random loss & queueing under overload; "
+    "Lane-A never best-effort-dropped (relies on repetition), while RAW/Lane-B absorb loss."
+)
