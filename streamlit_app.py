@@ -195,9 +195,14 @@ FS_ACCEL=200; FS_FORCE=500; BITS_PER_SAMPLE=16
 RAW_BITS_PER_SEC = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BITS_PER_SAMPLE + 400)
 
 def run_strategy(strategy_name:str):
+    """Run whole trip and return arrays + KPIs. Includes raw_bits in totals."""
     np.random.seed(int(seed))
-    laneA_bits=np.zeros(SECS,dtype=np.int64); laneB_bits=np.zeros(SECS,dtype=np.int64)
-    cap_bits=np.zeros(SECS,dtype=np.int64); quality=np.empty(SECS,dtype=object); near_bs=np.empty(SECS,dtype=object)
+    laneA_bits=np.zeros(SECS,dtype=np.int64)
+    laneB_bits=np.zeros(SECS,dtype=np.int64)
+    raw_bits  =np.zeros(SECS,dtype=np.int64)  # NEW: track raw stream load
+    cap_bits=np.zeros(SECS,dtype=np.int64)
+    quality=np.empty(SECS,dtype=object)
+    near_bs=np.empty(SECS,dtype=object)
     ev_by_t={}
     for e in events: ev_by_t.setdefault(e.t,[]).append(e)
     seqA=0
@@ -205,37 +210,51 @@ def run_strategy(strategy_name:str):
         lat,lon=route_df.loc[t,"lat"],route_df.loc[t,"lon"]
         bs_name,_,q=nearest_bs_quality(lat,lon); near_bs[t]=bs_name; quality[t]=q
         cap,loss=cap_loss(q,t); cap_bits[t]=cap
+
         # Lane A (always)
         pa=laneA_adhesion_state(features[t]); A=enc_laneA(pa,seqA); seqA+=1
         szA=len(A)*8
-        if cap>=szA and (np.random.random()>loss): cap-=szA; laneA_bits[t]+=szA
-        # Raw background
+        if cap>=szA and (np.random.random()>loss):
+            cap-=szA; laneA_bits[t]+=szA
+
+        # Raw background (now counted)
         if strategy_name=="Raw only":
             raw_use=min(RAW_BITS_PER_SEC, int(cap*0.95))
-            cap=max(0,cap-raw_use)
+            cap=max(0,cap-raw_use); raw_bits[t]=raw_use
         elif strategy_name=="Hybrid (Adaptive)":
             desired = RAW_BITS_PER_SEC if q=="GOOD" else int(RAW_BITS_PER_SEC*0.35)
-            raw_use = min(desired, int(cap*0.60))
-            cap = max(0, cap - raw_use)
+            raw_use = min(desired, int(cap*0.60))  # leave headroom for events
+            cap=max(0,cap-raw_use); raw_bits[t]=raw_use
+        else:  # "Semantic only"
+            raw_bits[t]=0
+
         # Lane B events
         if t in ev_by_t:
             for ev in ev_by_t[t]:
                 B=enc_laneB(ev,tokens[t],labels[tokens[t]],use_cbor); szB=len(B)*8
                 if cap>=szB and (np.random.random()>loss):
                     cap-=szB; laneB_bits[t]+=szB
+
+    # KPIs
     laneA_pkts_delivered = int((laneA_bits > 0).sum())
     laneB_pkts_delivered = int((laneB_bits > 0).sum())
     laneA_pkts_attempted = SECS
     laneB_pkts_attempted = len(events)
+    total_bits = int(laneA_bits.sum() + laneB_bits.sum() + raw_bits.sum())
+
     return {
-        "laneA_bits": laneA_bits, "laneB_bits": laneB_bits,
-        "cap_bits": cap_bits, "quality": quality, "near_bs": near_bs,
+        "laneA_bits": laneA_bits,
+        "laneB_bits": laneB_bits,
+        "raw_bits": raw_bits,               # return raw
+        "cap_bits": cap_bits,
+        "quality": quality,
+        "near_bs": near_bs,
         "kpis": {
             "laneA_deliv": laneA_pkts_delivered,
             "laneA_attempt": laneA_pkts_attempted,
             "laneB_deliv": laneB_pkts_delivered,
             "laneB_attempt": laneB_pkts_attempted,
-            "total_bits": int(laneA_bits.sum() + laneB_bits.sum()),
+            "total_bits": total_bits,
         }
     }
 
@@ -244,6 +263,9 @@ res_raw     = run_strategy("Raw only")
 res_hybrid  = run_strategy("Hybrid (Adaptive)")
 res_sem     = run_strategy("Semantic only")
 res_map = {"Raw only":res_raw, "Hybrid (Adaptive)":res_hybrid, "Semantic only":res_sem}[live_strategy]
+
+# Baseline for "Saved vs Raw": use the actual Raw-only run (includes Lane A + Raw + delivered events)
+BASELINE_RAW_BITS = max(1, res_raw["kpis"]["total_bits"])
 
 # ========= Tabs =========
 tab_map, tab_packets, tab_metrics, tab_compare, tab_why = st.tabs(
@@ -266,15 +288,9 @@ with tab_map:
             st.session_state.t_idx = min(st.session_state.t_idx + 1, SECS - 1)
             if st.session_state.t_idx >= SECS - 1:
                 st.session_state.playing = False
-            st.slider("Time (s)", 0, SECS - 1,
-                      value=st.session_state.t_idx,
-                      key="time_slider",
-                      disabled=True)
+            st.slider("Time (s)", 0, SECS - 1, value=st.session_state.t_idx, key="time_slider", disabled=True)
         else:
-            t_idx = st.slider("Time (s)", 0, SECS - 1,
-                              value=st.session_state.t_idx,
-                              key="time_slider",
-                              disabled=False)
+            t_idx = st.slider("Time (s)", 0, SECS - 1, value=st.session_state.t_idx, key="time_slider", disabled=False)
             st.session_state.t_idx = t_idx
 
         t_idx = st.session_state.t_idx
@@ -284,6 +300,7 @@ with tab_map:
         st.metric("Link quality", str(res_map["quality"][t_idx]))
         st.metric("Lane A bits this second", int(res_map["laneA_bits"][t_idx]))
         st.metric("Lane B bits this second", int(res_map["laneB_bits"][t_idx]))
+        st.metric("Raw bits this second", int(res_map["raw_bits"][t_idx]))
         st.metric("Capacity (kbps)", int(res_map["cap_bits"][t_idx]/1000))
 
     with colL:
@@ -318,9 +335,11 @@ with tab_map:
 with tab_packets:
     st.subheader("Packet examples")
     example_t = min(SECS-1, max(0, SECS//3))
+    # Lane A
     pktA = laneA_adhesion_state(features[example_t]); bA = enc_laneA(pktA, 123)
     st.markdown("**Lane A (safety) adhesion_state**"); st.code(json.dumps(pktA, indent=2))
     st.write(f"Encoded size: {len(bA)} bytes (CBOR + CRC32)")
+    # Lane B
     ev = next((e for e in events if e.t >= example_t), None)
     if ev is None: ev = Event(example_t,"ride_degradation",{"segment":features[example_t].segment,"rms":0.41,"dwell_s":160})
     bB_json = enc_laneB(ev, tokens[example_t], labels[tokens[example_t]], use_cbor=False)
@@ -329,48 +348,53 @@ with tab_packets:
     st.code(json.dumps({"i":ev.intent,"ts":ev.t,"s":ev.slots,"z":int(tokens[example_t]),"zl":labels[tokens[example_t]]}, indent=2))
     st.write(f"JSON size: {len(bB_json)} bytes • CBOR size: {len(bB_cbor)} bytes (both include CRC32)")
 
-# ===================== PER-LANE METRICS =====================
+# ===================== PER-LANE METRICS (for live strategy) =====================
 with tab_metrics:
     st.subheader(f"Per-lane metrics — {live_strategy}")
     df = pd.DataFrame({"t":np.arange(SECS),
                        "Capacity_bps": res_map["cap_bits"],
+                       "Raw_bps": res_map["raw_bits"],
                        "LaneA_bps": res_map["laneA_bits"],
                        "LaneB_bps": res_map["laneB_bits"]})
     base = alt.Chart(df).encode(x="t:Q")
-    cap_line = base.mark_line(color="#2ca02c").encode(y=alt.Y("Capacity_bps:Q", title="Capacity (bps)"))
+    cap_line  = base.mark_line(color="#2ca02c").encode(y=alt.Y("Capacity_bps:Q", title="Capacity / Raw (bps)"))
+    raw_line  = base.mark_line(color="#9467bd").encode(y=alt.Y("Raw_bps:Q"))
+    # Right axis for lanes
     right_scale = alt.Scale(domain=[0, max(1, int(max(df["LaneA_bps"].max(), df["LaneB_bps"].max())*1.4))])
     laneA_line = base.mark_line(color="#1f77b4").encode(y=alt.Y("LaneA_bps:Q", axis=alt.Axis(title="Lane A/B (bps)", orient="right"), scale=right_scale))
     laneB_line = base.mark_line(color="#d62728").encode(y=alt.Y("LaneB_bps:Q", axis=alt.Axis(title=None, orient="right"), scale=right_scale))
-    st.altair_chart(alt.layer(cap_line, laneA_line, laneB_line).resolve_scale(y="independent").properties(height=340), use_container_width=True)
+    st.altair_chart(alt.layer(cap_line, raw_line, laneA_line, laneB_line).resolve_scale(y="independent").properties(height=360), use_container_width=True)
 
-    raw_total_bits = RAW_BITS_PER_SEC * SECS
+    # KPIs for the selected strategy
     total_bits = res_map["kpis"]["total_bits"]
-    saved = 1.0 - (total_bits / max(raw_total_bits,1))
+    saved = 1.0 - (total_bits / BASELINE_RAW_BITS)
     c1,c2,c3,c4 = st.columns(4)
     with c1: st.metric("Lane A delivered / attempted", f'{res_map["kpis"]["laneA_deliv"]}/{res_map["kpis"]["laneA_attempt"]}')
     with c2: st.metric("Lane B delivered / attempted", f'{res_map["kpis"]["laneB_deliv"]}/{res_map["kpis"]["laneB_attempt"]}')
     with c3: st.metric("Actual sent (MB)", f"{total_bits/(8*1024*1024):.2f}")
-    with c4: st.metric("Saved vs Raw", f"{100*saved:.1f}%")
+    with c4: st.metric("Saved vs Raw-only", f"{100*saved:.1f}%")
 
 # ===================== STRATEGY COMPARISON =====================
 with tab_compare:
     st.subheader("Raw-only vs Hybrid (Adaptive) vs Semantic-only — whole-run summary")
+
     def kpi_row(name, res):
-        raw_total_bits = RAW_BITS_PER_SEC * SECS
-        tot = res["kpis"]["total_bits"]; saved = 1.0 - (tot / max(raw_total_bits,1))
+        tot = res["kpis"]["total_bits"]
+        saved = 1.0 - (tot / BASELINE_RAW_BITS)
         return {
             "Strategy": name,
             "Lane A success %": 100*res["kpis"]["laneA_deliv"]/max(1,res["kpis"]["laneA_attempt"]),
             "Lane B success %": 100*res["kpis"]["laneB_deliv"]/max(1,res["kpis"]["laneB_attempt"]),
             "Total sent (MB)": tot/(8*1024*1024),
-            "Saved vs Raw (%)": 100*saved
+            "Saved vs Raw-only (%)": 100*saved
         }
+
     table = pd.DataFrame([kpi_row("Raw only", res_raw),
                           kpi_row("Hybrid (Adaptive)", res_hybrid),
                           kpi_row("Semantic only", res_sem)])
     st.dataframe(table.style.format({
         "Lane A success %":"{:.1f}", "Lane B success %":"{:.1f}",
-        "Total sent (MB)":"{:.2f}", "Saved vs Raw (%)":"{:.1f}"
+        "Total sent (MB)":"{:.2f}", "Saved vs Raw-only (%)":"{:.1f}"
     }), use_container_width=True)
 
 # ===================== WHEN TO USE RAW VS SEMANTIC =====================
@@ -379,9 +403,9 @@ with tab_why:
     st.markdown("""
 - **Lane A (Safety)** — always **structured & tiny** (telegram each second) regardless of strategy.
 - **Lane B (Operational)**:
-  - **Raw only**: stream raw features (lab/offline analysis); high bandwidth.
-  - **Semantic only**: send compact events/tokens; best under poor coverage.
-  - **Hybrid (Adaptive)** *(recommended)*: allow some raw when **GOOD**, throttle raw when **PATCHY/POOR** to protect event delivery.
+  - **Raw only**: stream raw sensors continuously; best for lab/offline analytics; highest bandwidth.
+  - **Semantic only**: send compact events/tokens; best under poor coverage; lowest bandwidth.
+  - **Hybrid (Adaptive)** *(recommended)*: allow some raw when **GOOD**, throttle raw when **PATCHY/POOR** to protect event delivery and save bandwidth.
 """)
 
 st.markdown("---")
