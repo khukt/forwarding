@@ -115,7 +115,6 @@ def cap_loss(quality, t):
         cap=int(cap*burst_factor); loss=good_loss_pct/100.0
     elif quality=="PATCHY":
         cap=int(cap*(0.6+0.2*math.sin(2*math.pi*t/30))); loss=min(0.4,(bad_loss_pct*0.5)/100.0)
-        # small floor so PATCHY isn't identical to GOOD
         cap=max(int(cap*0.9), 1)
     else:
         cap=int(cap*0.25); loss=bad_loss_pct/100.0
@@ -201,7 +200,7 @@ RAW_BITS_PER_SEC = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BI
 
 def run_strategy(strategy_name:str):
     """Run whole trip and return arrays + KPIs. Uses seeded RNG so runs are comparable."""
-    np.random.seed(int(seed))  # deterministic loss samples per strategy
+    np.random.seed(int(seed))
     laneA_bits=np.zeros(SECS,dtype=np.int64); laneB_bits=np.zeros(SECS,dtype=np.int64)
     cap_bits=np.zeros(SECS,dtype=np.int64); quality=np.empty(SECS,dtype=object); near_bs=np.empty(SECS,dtype=object)
     ev_by_t={}
@@ -267,18 +266,29 @@ with tab_map:
         if c1.button("▶ Simulate", use_container_width=True): st.session_state.playing=True
         if c2.button("⏸ Pause", use_container_width=True): st.session_state.playing=False
 
+        # --- AUTOPLAY: variable interval, fixed +1 step per tick ---
         if st.session_state.playing:
-            refresh_ms = max(50, int(1000 / sim_speed))  # cap at 20 fps for stability
-            st_autorefresh(interval=refresh_ms, key="autoplay_tick")
-            st.session_state.t_idx = min(st.session_state.t_idx + sim_speed, SECS - 1)
-            if st.session_state.t_idx >= SECS - 1: st.session_state.playing = False
+            refresh_ms = max(100, int(1000 / sim_speed))  # linear: 1..10 steps/sec
+            st_autorefresh(interval=refresh_ms, key=f"autoplay_tick_{sim_speed}")
+            # advance exactly 1 simulated second per tick
+            st.session_state.t_idx = min(st.session_state.t_idx + 1, SECS - 1)
+            if st.session_state.t_idx >= SECS - 1:
+                st.session_state.playing = False
 
-        t_idx = st.slider("Time (s)", 0, SECS-1,
-                          value=st.session_state.t_idx,
-                          key="time_slider",
-                          disabled=st.session_state.playing)
-        st.session_state.t_idx = t_idx
+            # Show a disabled slider but DO NOT overwrite t_idx while playing
+            st.slider("Time (s)", 0, SECS-1,
+                      value=st.session_state.t_idx,
+                      key="time_slider",
+                      disabled=True)
+        else:
+            # Only write back when not playing
+            t_idx = st.slider("Time (s)", 0, SECS-1,
+                              value=st.session_state.t_idx,
+                              key="time_slider",
+                              disabled=False)
+            st.session_state.t_idx = t_idx
 
+        t_idx = st.session_state.t_idx
         st.metric("Strategy (map)", live_strategy)
         st.metric("Segment", route_df.loc[t_idx,"segment"])
         st.metric("Nearest BS", str(res_map["near_bs"][t_idx]))
