@@ -1,22 +1,20 @@
 # -------------------------------------------------------------
-# ENSURE-6G • TMS Dashboard — Smooth Plotly OSM Animation
-# - Persistent Plotly figure in session_state
-# - uirevision to avoid map re-draw (no flashing)
-# - Dynamic bearer: 5G→LTE→3G→GSM-R with hysteresis + TTT
-# - Channel model, RAW/SEMANTIC/HYBRID, Sankey comm flow
+# ENSURE-6G • TMS Dashboard — PyDeck (deck.gl) Smooth Animation
+# Sundsvall → Stockholm • RAW vs SEMANTIC vs HYBRID
+# Dynamic bearer (5G→LTE→3G→GSM-R), channel model, Sankey flow
 # -------------------------------------------------------------
 import math, time
-from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
+import pydeck as pdk
 from shapely.geometry import LineString
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="ENSURE-6G • TMS Rail Demo (Smooth)", layout="wide")
+st.set_page_config(page_title="ENSURE-6G • TMS Rail Demo (PyDeck)", layout="wide")
 st.title("🚆 ENSURE-6G: Raw vs Semantic vs Hybrid — Control Center (TMS) Dashboard")
-st.caption("Sundsvall → Stockholm • Sensors + Base Stations • Lane A safety alerts vs Lane B ops • Channel model • Dynamic bearer (5G/LTE/3G/GSM-R) • Smooth OSM animation")
+st.caption("Sundsvall → Stockholm • Sensors + Base Stations • Lane A safety alerts vs Lane B ops • Channel model • Dynamic bearer (5G/LTE/3G/GSM-R) • Smooth Deck.gl animation")
 
 # ---------- Helpers ----------
 def haversine(p1, p2):
@@ -28,7 +26,7 @@ def haversine(p1, p2):
     return R * (2*math.atan2(math.sqrt(a), math.sqrt(1-a)))
 
 def per_from_snr(snr_db):
-    x0, k = 2.0, -1.1
+    x0, k = 2.0, -1.1  # threshold-ish
     per = 1/(1+math.exp(k*(snr_db-x0)))
     return max(1e-5, min(0.99, per))
 
@@ -58,7 +56,7 @@ def interp_point_by_dist(dist_m):
         rem -= L
     return ROUTE[-1]
 
-N_SENS = 20
+N_SENS = 22
 sensor_pts = []
 for i in range(N_SENS):
     frac = i/(N_SENS-1)
@@ -85,7 +83,7 @@ with st.sidebar:
     st.header("Scenario Controls (TMS)")
     mode = st.radio("Communication Mode", ["RAW","SEMANTIC","HYBRID"], index=2)
     train_speed_kmh = st.slider("Train Speed (km/h)", 60, 200, 140, 10)
-    anim_fps = st.slider("Animation FPS", 1, 10, 3, 1, help="UI refresh rate (frames per second).")
+    anim_fps = st.slider("Animation FPS", 1, 15, 5, 1, help="UI refresh rate (frames per second).")
     sim_minutes_total = st.number_input("Sim Length (minutes)", 5, 180, 30, 5)
     st.markdown("---")
     st.subheader("Lane A QoS")
@@ -107,7 +105,6 @@ if "last_tick" not in st.session_state: st.session_state.last_tick = time.time()
 if "bearer" not in st.session_state: st.session_state.bearer = "5G"
 if "bearer_prev" not in st.session_state: st.session_state.bearer_prev = "5G"
 if "bearer_ttt" not in st.session_state: st.session_state.bearer_ttt = 0.0  # ms accumulator
-if "fig" not in st.session_state: st.session_state.fig = None  # Plotly figure (persistent)
 
 # Smooth rerun timer
 if st.session_state.playing and anim_fps > 0:
@@ -117,7 +114,7 @@ if st.session_state.playing and anim_fps > 0:
 now = time.time()
 elapsed = now - st.session_state.last_tick
 if st.session_state.playing and anim_fps > 0:
-    st.session_state.t_sim += elapsed   # time is “real seconds”; train motion scales speed only
+    st.session_state.t_sim += elapsed
 st.session_state.last_tick = now
 if st.session_state.t_sim > sim_minutes_total*60:
     st.session_state.t_sim = 0.0
@@ -129,8 +126,8 @@ def route_position(dist_m):
 
 v_mps = train_speed_kmh/3.6
 dist_travelled = (v_mps * st.session_state.t_sim) % route_len
-trainA = route_position(dist_travelled)
-trainB = route_position(route_len - dist_travelled)
+trainA = route_position(dist_travelled)             # southbound
+trainB = route_position(route_len - dist_travelled) # northbound
 
 # ---------- Channel & Bearer ----------
 def env_class(lat, lon):
@@ -187,11 +184,10 @@ def serving_bs(lat, lon):
     return BS[i], dists[i]
 
 def distance_along(latlon):
-    samples = 300
-    best_i, best_d = 0, 1e12
+    # sample route to find closest arc-length for correlated shadowing
+    samples = 300; best_i=0; best_d=1e12
     for i in range(samples+1):
-        f = i/samples
-        d = f*route_len
+        f = i/samples; d = f*route_len
         p = route_ls.interpolate(d)
         hd = haversine((p.y,p.x), latlon)
         if hd < best_d: best_d, best_i = hd, i
@@ -205,10 +201,10 @@ def snr_for(lat, lon, tech, env, d_bs_m, s_along_m):
     n = noise_dbm(TECH[tech]["bw"])
     return rx - n, rx, n
 
+# compute SNR table at Train A
 bsA, dA = serving_bs(*trainA)
 envA = env_class(*trainA)
 s_along = distance_along(trainA)
-
 snr_table = {}
 for b in ["5G","LTE","3G","GSMR"]:
     if b in bsA["tech"]:
@@ -217,12 +213,14 @@ for b in ["5G","LTE","3G","GSMR"]:
 def pick_bearer(snr_table, caps, curr_bearer):
     order = ["5G","LTE","3G","GSMR"]
     avail = [b for b in order if b in caps]
+    # prefer highest tier meeting snr_ok
     for b in avail:
-        if snr_table.get(b, -99) >= TECH[b]["snr_ok"]:
+        if snr_table.get(b,-99) >= TECH[b]["snr_ok"]:
             return b, True
-    # else pick max SNR
+    # fallback: best SNR
     if avail:
-        bbest = max(avail, key=lambda x: snr_table.get(x,-99)); return bbest, True
+        best = max(avail, key=lambda x: snr_table.get(x,-99))
+        return best, True
     return curr_bearer, False
 
 cand, valid = pick_bearer(snr_table, bsA["tech"], st.session_state.bearer)
@@ -239,7 +237,7 @@ bearer = st.session_state.bearer
 
 snr_use = snr_table.get(bearer, -20)
 per_single = per_from_snr(snr_use)
-per_reps = per_single**st.session_state.get("laneA_reps", 2)  # filled below after sidebar parse
+per_reps = per_single**laneA_reps
 lat_ms = TECH[bearer]["base_lat"]
 
 # ---------- Sensors & Messages ----------
@@ -293,111 +291,125 @@ raw_bps = raw_points*BYTES_RAW
 alert_bps = len(laneA_alerts)*BYTES_ALERT
 laneB_bps = len(laneB_msgs)*BYTES_SUM
 bps_total = raw_bps + alert_bps + laneB_bps
-lat_ms += (bps_total/1000)  # tiny load-induced jitter
-st.session_state.laneA_reps = laneA_reps
-per_reps = per_single**laneA_reps
+lat_ms += (bps_total/1000)  # tiny jitter
 
-# ---------- UI Layout ----------
+# ---------- UI: Map (PyDeck) ----------
 col1, col2 = st.columns([2.2, 1.8])
 
-# --- Persistent Plotly Map (NO FLASH) ---
-def build_base_map():
-    mid = ROUTE[len(ROUTE)//2]
-    fig = go.Figure()
-    # Route
-    fig.add_trace(go.Scattermapbox(
-        lat=[p[0] for p in ROUTE], lon=[p[1] for p in ROUTE],
-        mode="lines", line=dict(width=4), name="Route"))
-    # Risk zone polygon
-    lat0, lon0 = RISK_CENTER
-    m2deg_lat = 1/111111.0
-    m2deg_lon = 1/(111111.0*math.cos(math.radians(lat0)))
-    theta = np.linspace(0, 2*math.pi, 120)
-    circ_lat = lat0 + (RISK_RADIUS_M*np.sin(theta))*m2deg_lat
-    circ_lon = lon0 + (RISK_RADIUS_M*np.cos(theta))*m2deg_lon
-    fig.add_trace(go.Scattermapbox(
-        lat=circ_lat, lon=circ_lon, mode="lines", line=dict(width=2),
-        name="Risk zone", fill="toself", opacity=0.15))
-    # Sensors (static positions; we only recolor occasionally)
-    fig.add_trace(go.Scattermapbox(
-        lat=[p[0] for p in sensor_pts], lon=[p[1] for p in sensor_pts], mode="markers",
-        marker=dict(size=8, color="green"),
-        text=[f"S{i:02d}" for i in range(len(sensor_pts))], hoverinfo="text", name="Sensors"))
-    # Base Stations (static)
-    fig.add_trace(go.Scattermapbox(
-        lat=[b["lat"] for b in BS], lon=[b["lon"] for b in BS], mode="markers",
-        marker=dict(size=11, symbol="triangle"), name="Base Stations",
-        text=[f"{b['name']} ({'/'.join(sorted(b['tech']))})" for b in BS], hoverinfo="text"))
-    # Train A (dynamic)
-    fig.add_trace(go.Scattermapbox(
-        lat=[trainA[0]], lon=[trainA[1]], mode="text",
-        text=["🚆"], textfont=dict(size=24), name="Train A (southbound)"))
-    # Train B (dynamic)
-    fig.add_trace(go.Scattermapbox(
-        lat=[trainB[0]], lon=[trainB[1]], mode="text",
-        text=["🚆"], textfont=dict(size=24), name="Train B (northbound)"))
-
-    fig.update_layout(
-        mapbox_style="open-street-map",
-        mapbox=dict(center=dict(lat=mid[0], lon=mid[1]), zoom=6),
-        margin=dict(l=0,r=0,t=0,b=0), height=520,
-        legend=dict(orientation="h", yanchor="bottom", y=0.01),
-        uirevision="KEEP"  # <- prevent full redraw/flash
-    )
-    return fig
-
 with col1:
-    st.subheader("Live Map • Plotly OSM (TMS view)")
-    # Initialize base fig once
-    if st.session_state.fig is None:
-        st.session_state.fig = build_base_map()
+    st.subheader("Live Map • Deck.gl (TMS view)")
 
-    # Update only what moves/changes:
-    # Trace indices: 0 route, 1 risk, 2 sensors, 3 BS, 4 TrainA, 5 TrainB
-    fig = st.session_state.fig
+    # Build layers
+    # 1) Route PathLayer
+    path_data = [{"path": [[p[1], p[0]] for p in ROUTE]}]
+    route_layer = pdk.Layer(
+        "PathLayer",
+        data=path_data,
+        get_path="path",
+        get_width=4,
+        width_min_pixels=2,
+        get_color=[0, 102, 255, 200],
+    )
 
-    # Update trains
-    fig.data[4].lat = (trainA[0],)
-    fig.data[4].lon = (trainA[1],)
-    fig.data[5].lat = (trainB[0],)
-    fig.data[5].lon = (trainB[1],)
+    # 2) Risk zone PolygonLayer (circle approximation)
+    def circle_polygon(center, radius_m, n=80):
+        lat0, lon0 = center
+        m2deg_lat = 1/111111.0
+        m2deg_lon = 1/(111111.0*math.cos(math.radians(lat0)))
+        verts = []
+        for th in np.linspace(0, 2*math.pi, n):
+            lat = lat0 + (radius_m*math.sin(th))*m2deg_lat
+            lon = lon0 + (radius_m*math.cos(th))*m2deg_lon
+            verts.append([lon, lat])
+        return verts
+    risk_poly = [{"polygon": circle_polygon(RISK_CENTER, RISK_RADIUS_M)}]
+    risk_layer = pdk.Layer(
+        "PolygonLayer",
+        data=risk_poly,
+        get_polygon="polygon",
+        get_fill_color=[255, 51, 51, 40],
+        get_line_color=[255, 51, 51],
+        line_width_min_pixels=1,
+        pickable=False,
+    )
 
-    # Optionally recolor sensors by risk (cheap update)
-    if show_sens:
-        colors = dict(low="green", medium="orange", high="red")
-        fig.data[2].marker.color = [colors[r] for r in sdf["risk_label"]]
-    else:
-        fig.data[2].marker.size = [0]*len(sensor_pts)  # hide by size==0
+    # 3) Sensors ScatterplotLayer colored by risk
+    colors = {"low":[0,170,0,200], "medium":[255,140,0,200], "high":[220,0,0,220]}
+    sens_df = pd.DataFrame({
+        "lat": sdf["lat"], "lon": sdf["lon"],
+        "risk": sdf["risk_label"].map(lambda x: colors[x]),
+        "tooltip": [f"{r.id} • {r.rail_temp_C}°C • {r.strain_kN}kN • {r.risk_label}"
+                    for r in sdf.itertuples()]
+    })
+    sensor_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=sens_df if show_sens else sens_df.iloc[0:0],
+        get_position="[lon, lat]",
+        get_fill_color="risk",
+        get_radius=1200,
+        pickable=True,
+    )
 
-    # Show/hide BS
-    fig.data[3].marker.size = 11 if show_bs else 0
+    # 4) Base Stations ScatterplotLayer
+    bs_df = pd.DataFrame(BS)
+    bs_df["tooltip"] = [f"{b['name']} ({'/'.join(sorted(b['tech']))})" for _, b in bs_df.iterrows()]
+    bs_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=bs_df if show_bs else bs_df.iloc[0:0],
+        get_position="[lon, lat]",
+        get_fill_color=[30, 144, 255, 220],
+        get_radius=1800,
+        pickable=True,
+    )
 
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-    st.caption("No flashing: map base is persistent (uirevision). We only update train coordinates (and optional sensor colors).")
+    # 5) Trains as TextLayer with emoji (🚆)
+    trains_df = pd.DataFrame([
+        dict(lat=trainA[0], lon=trainA[1], label="🚆"),
+        dict(lat=trainB[0], lon=trainB[1], label="🚆"),
+    ])
+    train_layer = pdk.Layer(
+        "TextLayer",
+        trains_df,
+        get_position='[lon, lat]',
+        get_text='label',
+        get_size=24,
+        get_text_anchor='middle',
+        get_alignment_baseline='center',
+    )
+
+    view_state = pdk.ViewState(latitude=60.1, longitude=17.7, zoom=6, bearing=0, pitch=0)
+
+    deck = pdk.Deck(
+        map_provider="carto", map_style="light",
+        initial_view_state=view_state,
+        layers=[route_layer, risk_layer, sensor_layer, bs_layer, train_layer],
+        tooltip={"html":"<b>{tooltip}</b>", "style":{"color":"white"}}
+    )
+    st.pydeck_chart(deck, use_container_width=True)
+    st.caption("Deck.gl (pydeck) updates smoothly without tile flashing. Trains (🚆) are TextLayer markers; sensors & BS are ScatterplotLayers; route is PathLayer; risk zone is PolygonLayer.")
 
 with col2:
     st.subheader("Comms, Channel & Safety Status")
     st.markdown(f"**Serving BS:** {bsA['name']} • env **{envA}** • dist **{int(haversine(trainA,(bsA['lat'],bsA['lon']))/1000)} km**")
     st.markdown(
-        f"**Bearer:** {bearer} (prev: {st.session_state.bearer_prev}, TTT: {int(st.session_state.bearer_ttt)} ms)  "
-        f"| **SNR:** {snr_use:.1f} dB  | **PER(single):** {per_single:.2%}  | **PER(x{laneA_reps}):** {per_reps:.2%}  "
-        f"| **Lane A latency:** ~{int(lat_ms)} ms"
+        f"**Bearer:** {bearer} (prev: {st.session_state.bearer_prev}, TTT: {int(st.session_state.bearer_ttt)} ms)  | "
+        f"**SNR:** {snr_use:.1f} dB  | **PER(single):** {per_single:.2%}  | **PER(x{laneA_reps}):** {per_reps:.2%}  | "
+        f"**Lane A latency:** ~{int(lat_ms)} ms"
     )
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("RAW (bps)", f"{(raw_points*24):,.0f}")
-    c2.metric("Lane A (bps)", f"{(len(laneA_alerts)*280):,.0f}")
-    c3.metric("Lane B (bps)", f"{(len(laneB_msgs)*180):,.0f}")
-    c4.metric("Total (bps)", f"{(raw_bps+alert_bps+laneB_bps):,.0f}")
+    c1.metric("RAW (bps)", f"{raw_bps:,.0f}")
+    c2.metric("Lane A (bps)", f"{alert_bps:,.0f}")
+    c3.metric("Lane B (bps)", f"{laneB_bps:,.0f}")
+    c4.metric("Total (bps)", f"{bps_total:,.0f}")
 
     st.markdown("---")
     st.markdown("**Lane A (Safety Alerts)**")
     st.json(laneA_alerts[:6] if laneA_alerts else [])
-
     st.markdown("**Lane B (Ops/Maintenance)**")
     st.json(laneB_msgs if laneB_msgs else [])
 
-# ---------- Sankey Communication Flow ----------
+# ---------- Sankey Communication Flow (Plotly) ----------
 if show_sankey:
     st.markdown("---")
     st.subheader("Communication Flow (This Tick)")
@@ -416,12 +428,10 @@ if show_sankey:
         label=["telemetry/alerts","uplink","ctrl+data","advisories","work orders"]
     )
     sankey = go.Figure(data=[go.Sankey(node=dict(label=nodes), link=link)])
-    sankey.update_layout(height=360, margin=dict(l=10,r=10,t=10,b=10), uirevision="KEEP")
+    sankey.update_layout(height=360, margin=dict(l=10,r=10,t=10,b=10))
     st.plotly_chart(sankey, use_container_width=True, config={"displayModeBar": False})
 
 # ---------- Footnote ----------
-st.caption(
-    "Smooth animation via persistent Plotly figure + uirevision=KEEP (avoids tile reload). "
-    "Channel: FSPL+env offset, log-normal shadowing, Rician (RMa)/Rayleigh (UMa) fading. "
-    "Dynamic bearer with hysteresis/time-to-trigger; Lane A repetition for reliability; Sankey shows end-to-end flow."
-)
+st.caption("Channel model: FSPL + env offset (UMa/RMa), log-normal shadowing (σ≈7 dB), Rician (RMa)/Rayleigh (UMa) fading. "
+           "Dynamic bearer with hysteresis/time-to-trigger (5G→LTE→3G→GSM-R). "
+           "Lane A reliability via repetition; latency = bearer base + light load jitter. HYBRID = Lane A alerts + sparse RAW telemetry.")
