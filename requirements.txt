@@ -9,5 +9,3 @@ cbor2
 scikit-learn
 pydeck
 streamlit-autorefresh
-altair 
-numpy
