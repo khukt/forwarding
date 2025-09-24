@@ -10,3 +10,10 @@ scikit-learn
 pydeck
 streamlit-autorefresh
 altair
+streamlit-folium
+folium
+pandas
+geopy
+shapely
+altair
+graphviz
