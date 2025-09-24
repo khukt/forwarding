@@ -48,11 +48,6 @@ with st.sidebar:
     st.subheader("Live map strategy")
     live_strategy = st.radio("Map playback uses…", ["Raw only", "Hybrid (Adaptive)", "Semantic only"], index=1)
 
-    st.markdown("---")
-    st.subheader("Playback speed")
-    # Linear speed: ticks/sec = slider value
-    sim_speed = st.slider("Simulation speed (steps/sec)", 1, 10, 3, 1)
-
 # ========= Geography =========
 RAIL_WAYPOINTS = [
     (62.3930, 17.3070), (62.12, 17.15), (61.86, 17.14), (61.73, 17.11),
@@ -116,7 +111,7 @@ def cap_loss(quality, t):
         cap=int(cap*burst_factor); loss=good_loss_pct/100.0
     elif quality=="PATCHY":
         cap=int(cap*(0.6+0.2*math.sin(2*math.pi*t/30))); loss=min(0.4,(bad_loss_pct*0.5)/100.0)
-        cap=max(int(cap*0.9), 1)  # keep a small floor
+        cap=max(int(cap*0.9), 1)
     else:
         cap=int(cap*0.25); loss=bad_loss_pct/100.0
     return max(0,cap), loss
@@ -200,7 +195,6 @@ FS_ACCEL=200; FS_FORCE=500; BITS_PER_SAMPLE=16
 RAW_BITS_PER_SEC = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BITS_PER_SAMPLE + 400)
 
 def run_strategy(strategy_name:str):
-    """Run whole trip and return arrays + KPIs. Uses seeded RNG so runs are comparable."""
     np.random.seed(int(seed))
     laneA_bits=np.zeros(SECS,dtype=np.int64); laneB_bits=np.zeros(SECS,dtype=np.int64)
     cap_bits=np.zeros(SECS,dtype=np.int64); quality=np.empty(SECS,dtype=object); near_bs=np.empty(SECS,dtype=object)
@@ -215,13 +209,13 @@ def run_strategy(strategy_name:str):
         pa=laneA_adhesion_state(features[t]); A=enc_laneA(pa,seqA); seqA+=1
         szA=len(A)*8
         if cap>=szA and (np.random.random()>loss): cap-=szA; laneA_bits[t]+=szA
-        # Raw policy
+        # Raw background
         if strategy_name=="Raw only":
             raw_use=min(RAW_BITS_PER_SEC, int(cap*0.95))
             cap=max(0,cap-raw_use)
         elif strategy_name=="Hybrid (Adaptive)":
             desired = RAW_BITS_PER_SEC if q=="GOOD" else int(RAW_BITS_PER_SEC*0.35)
-            raw_use = min(desired, int(cap*0.60))  # protect semantics
+            raw_use = min(desired, int(cap*0.60))
             cap = max(0, cap - raw_use)
         # Lane B events
         if t in ev_by_t:
@@ -229,7 +223,6 @@ def run_strategy(strategy_name:str):
                 B=enc_laneB(ev,tokens[t],labels[tokens[t]],use_cbor); szB=len(B)*8
                 if cap>=szB and (np.random.random()>loss):
                     cap-=szB; laneB_bits[t]+=szB
-    # KPIs
     laneA_pkts_delivered = int((laneA_bits > 0).sum())
     laneB_pkts_delivered = int((laneB_bits > 0).sum())
     laneA_pkts_attempted = SECS
@@ -246,7 +239,7 @@ def run_strategy(strategy_name:str):
         }
     }
 
-# Run strategies & pick which powers the live map
+# Run strategies & choose live map set
 res_raw     = run_strategy("Raw only")
 res_hybrid  = run_strategy("Hybrid (Adaptive)")
 res_sem     = run_strategy("Semantic only")
@@ -267,22 +260,17 @@ with tab_map:
         if c1.button("▶ Simulate", use_container_width=True): st.session_state.playing = True
         if c2.button("⏸ Pause", use_container_width=True):   st.session_state.playing = False
 
-        # --- AUTOPLAY: variable interval, fixed +1 step per tick ---
+        # --- AUTOPLAY: fixed interval, +1 second per tick ---
         if st.session_state.playing:
-            refresh_ms = max(100, int(1000 / sim_speed))  # linear: 1..10 steps/sec
-            st_autorefresh(interval=refresh_ms, key=f"autoplay_tick_{sim_speed}")
-
+            st_autorefresh(interval=700, key="autoplay_tick_fixed")
             st.session_state.t_idx = min(st.session_state.t_idx + 1, SECS - 1)
             if st.session_state.t_idx >= SECS - 1:
                 st.session_state.playing = False
-
-            # Show slider but DO NOT overwrite t_idx while playing
             st.slider("Time (s)", 0, SECS - 1,
                       value=st.session_state.t_idx,
                       key="time_slider",
                       disabled=True)
         else:
-            # Only write back when not playing
             t_idx = st.slider("Time (s)", 0, SECS - 1,
                               value=st.session_state.t_idx,
                               key="time_slider",
@@ -324,17 +312,15 @@ with tab_map:
         view_state = pdk.ViewState(latitude=60.7, longitude=17.5, zoom=6.2, pitch=0)
         st.pydeck_chart(pdk.Deck(layers=[tile_layer, path_layer, bs_layer, halo_layer, train_icon_layer],
                                  initial_view_state=view_state, map_style=None, tooltip={"text":"{name}"}))
-        st.caption("OSM tiles. Train halo color shows link quality to nearest BS. Use the sidebar **Simulation speed** to fast-forward.")
+        st.caption("OSM tiles. Train halo color shows link quality to nearest BS. Click ▶ to animate; slider scrubs when paused.")
 
 # ===================== PACKETS =====================
 with tab_packets:
     st.subheader("Packet examples")
     example_t = min(SECS-1, max(0, SECS//3))
-    # Lane A
     pktA = laneA_adhesion_state(features[example_t]); bA = enc_laneA(pktA, 123)
     st.markdown("**Lane A (safety) adhesion_state**"); st.code(json.dumps(pktA, indent=2))
     st.write(f"Encoded size: {len(bA)} bytes (CBOR + CRC32)")
-    # Lane B
     ev = next((e for e in events if e.t >= example_t), None)
     if ev is None: ev = Event(example_t,"ride_degradation",{"segment":features[example_t].segment,"rms":0.41,"dwell_s":160})
     bB_json = enc_laneB(ev, tokens[example_t], labels[tokens[example_t]], use_cbor=False)
@@ -343,7 +329,7 @@ with tab_packets:
     st.code(json.dumps({"i":ev.intent,"ts":ev.t,"s":ev.slots,"z":int(tokens[example_t]),"zl":labels[tokens[example_t]]}, indent=2))
     st.write(f"JSON size: {len(bB_json)} bytes • CBOR size: {len(bB_cbor)} bytes (both include CRC32)")
 
-# ===================== PER-LANE METRICS (for live strategy) =====================
+# ===================== PER-LANE METRICS =====================
 with tab_metrics:
     st.subheader(f"Per-lane metrics — {live_strategy}")
     df = pd.DataFrame({"t":np.arange(SECS),
