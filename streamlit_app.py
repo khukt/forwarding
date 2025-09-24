@@ -1,6 +1,6 @@
 import json, zlib, math
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 import numpy as np
 import pandas as pd
@@ -14,7 +14,7 @@ import altair as alt
 # ========= Page / session =========
 st.set_page_config(page_title="ENSURE-6G • Raw vs Semantic vs Hybrid", layout="wide")
 st.title("ENSURE-6G: Raw vs Semantic vs Hybrid — Live Rail Demo (OpenStreetMap)")
-st.caption("OpenStreetMap basemap • Sundsvall→Stockholm • Base stations + coverage • Moving train • Lane A (safety) vs Lane B (ops) • Strategy comparison")
+st.caption("OpenStreetMap • Sundsvall→Stockholm • Base stations + coverage • Moving train • Lane A (safety) vs Lane B (ops) • Strategy comparison")
 
 if "t_idx" not in st.session_state: st.session_state.t_idx = 0
 if "playing" not in st.session_state: st.session_state.playing = False
@@ -47,6 +47,10 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Live map strategy")
     live_strategy = st.radio("Map playback uses…", ["Raw only", "Hybrid (Adaptive)", "Semantic only"], index=1)
+
+    st.markdown("---")
+    st.subheader("Playback speed")
+    sim_speed = st.slider("Simulation speed (steps/sec)", 1, 10, 3, 1)
 
 # ========= Geography =========
 RAIL_WAYPOINTS = [
@@ -111,6 +115,8 @@ def cap_loss(quality, t):
         cap=int(cap*burst_factor); loss=good_loss_pct/100.0
     elif quality=="PATCHY":
         cap=int(cap*(0.6+0.2*math.sin(2*math.pi*t/30))); loss=min(0.4,(bad_loss_pct*0.5)/100.0)
+        # small floor so PATCHY isn't identical to GOOD
+        cap=max(int(cap*0.9), 1)
     else:
         cap=int(cap*0.25); loss=bad_loss_pct/100.0
     return max(0,cap), loss
@@ -194,12 +200,13 @@ FS_ACCEL=200; FS_FORCE=500; BITS_PER_SAMPLE=16
 RAW_BITS_PER_SEC = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BITS_PER_SAMPLE + 400)
 
 def run_strategy(strategy_name:str):
-    """Return dict of arrays and KPIs for given strategy."""
+    """Run whole trip and return arrays + KPIs. Uses seeded RNG so runs are comparable."""
+    np.random.seed(int(seed))  # deterministic loss samples per strategy
     laneA_bits=np.zeros(SECS,dtype=np.int64); laneB_bits=np.zeros(SECS,dtype=np.int64)
     cap_bits=np.zeros(SECS,dtype=np.int64); quality=np.empty(SECS,dtype=object); near_bs=np.empty(SECS,dtype=object)
     ev_by_t={}
     for e in events: ev_by_t.setdefault(e.t,[]).append(e)
-    seqA=0; laneB_delivered=0
+    seqA=0
     for t in range(SECS):
         lat,lon=route_df.loc[t,"lat"],route_df.loc[t,"lon"]
         bs_name,_,q=nearest_bs_quality(lat,lon); near_bs[t]=bs_name; quality[t]=q
@@ -210,11 +217,11 @@ def run_strategy(strategy_name:str):
         if cap>=szA and (np.random.random()>loss): cap-=szA; laneA_bits[t]+=szA
         # Raw policy
         if strategy_name=="Raw only":
-            raw_use=min(RAW_BITS_PER_SEC, int(cap*0.95))  # consume
+            raw_use=min(RAW_BITS_PER_SEC, int(cap*0.95))
             cap=max(0,cap-raw_use)
         elif strategy_name=="Hybrid (Adaptive)":
             desired = RAW_BITS_PER_SEC if q=="GOOD" else int(RAW_BITS_PER_SEC*0.35)
-            raw_use = min(desired, int(cap*0.60))  # leave headroom for semantics
+            raw_use = min(desired, int(cap*0.60))  # protect semantics
             cap = max(0, cap - raw_use)
         # Semantic-only: no raw background
         # Lane B events
@@ -222,7 +229,7 @@ def run_strategy(strategy_name:str):
             for ev in ev_by_t[t]:
                 B=enc_laneB(ev,tokens[t],labels[tokens[t]],use_cbor); szB=len(B)*8
                 if cap>=szB and (np.random.random()>loss):
-                    cap-=szB; laneB_bits[t]+=szB; laneB_delivered += 1
+                    cap-=szB; laneB_bits[t]+=szB
     # KPIs
     laneA_pkts_delivered = int((laneA_bits > 0).sum())
     laneB_pkts_delivered = int((laneB_bits > 0).sum())
@@ -240,12 +247,10 @@ def run_strategy(strategy_name:str):
         }
     }
 
-# Run the three strategies for comparison (fast; O(seconds))
+# Run strategies
 res_raw     = run_strategy("Raw only")
 res_hybrid  = run_strategy("Hybrid (Adaptive)")
 res_sem     = run_strategy("Semantic only")
-
-# Choose which set powers the live map
 res_map = {"Raw only":res_raw, "Hybrid (Adaptive)":res_hybrid, "Semantic only":res_sem}[live_strategy]
 
 # ========= Tabs =========
@@ -261,11 +266,17 @@ with tab_map:
         c1,c2=st.columns(2)
         if c1.button("▶ Simulate", use_container_width=True): st.session_state.playing=True
         if c2.button("⏸ Pause", use_container_width=True): st.session_state.playing=False
+
         if st.session_state.playing:
-            st_autorefresh(interval=800, key="autoplay_tick")
-            st.session_state.t_idx = min(st.session_state.t_idx + 1, SECS - 1)
+            refresh_ms = max(50, int(1000 / sim_speed))  # cap at 20 fps for stability
+            st_autorefresh(interval=refresh_ms, key="autoplay_tick")
+            st.session_state.t_idx = min(st.session_state.t_idx + sim_speed, SECS - 1)
             if st.session_state.t_idx >= SECS - 1: st.session_state.playing = False
-        t_idx = st.slider("Time (s)", 0, SECS-1, value=st.session_state.t_idx, key="time_slider", disabled=st.session_state.playing)
+
+        t_idx = st.slider("Time (s)", 0, SECS-1,
+                          value=st.session_state.t_idx,
+                          key="time_slider",
+                          disabled=st.session_state.playing)
         st.session_state.t_idx = t_idx
 
         st.metric("Strategy (map)", live_strategy)
@@ -277,14 +288,18 @@ with tab_map:
         st.metric("Capacity (kbps)", int(res_map["cap_bits"][t_idx]/1000))
 
     with colL:
-        tile_layer = pdk.Layer("TileLayer", data="https://tile.openstreetmap.org/{z}/{x}/{y}.png", min_zoom=0, max_zoom=19, tile_size=256)
+        tile_layer = pdk.Layer("TileLayer",
+                               data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                               min_zoom=0, max_zoom=19, tile_size=256)
         step = max(1, SECS//300)
         path_coords = [[route_df.loc[i,"lon"], route_df.loc[i,"lat"]] for i in range(0, SECS, step)]
-        path_layer = pdk.Layer("PathLayer", data=[{"path": path_coords, "name":"Sundsvall→Stockholm"}], get_color=[60,60,160], width_scale=4, width_min_pixels=2)
+        path_layer = pdk.Layer("PathLayer",
+                               data=[{"path": path_coords, "name":"Sundsvall→Stockholm"}],
+                               get_color=[60,60,160], width_scale=4, width_min_pixels=2)
         bs_df = pd.DataFrame(BASE_STATIONS, columns=["name","lat","lon","r_m"])
-        bs_layer = pdk.Layer("ScatterplotLayer", data=bs_df, get_position="[lon, lat]", get_radius="r_m",
-                             get_fill_color="[0,150,0,40]", stroked=True, get_line_color=[0,150,0], line_width_min_pixels=1, pickable=True)
-
+        bs_layer = pdk.Layer("ScatterplotLayer", data=bs_df, get_position="[lon, lat]",
+                             get_radius="r_m", get_fill_color="[0,150,0,40]",
+                             stroked=True, get_line_color=[0,150,0], line_width_min_pixels=1, pickable=True)
         qcol = {"GOOD":[0,170,0], "PATCHY":[255,165,0], "POOR":[200,0,0]}
         cur = pd.DataFrame([{
             "lat": route_df.loc[t_idx,"lat"],
@@ -293,18 +308,18 @@ with tab_map:
             "color": qcol[res_map["quality"][t_idx]],
         }])
         train_icon_layer = pdk.Layer("IconLayer", data=cur, get_position='[lon, lat]', get_icon='icon_data', get_size=4, size_scale=15)
-        halo_layer = pdk.Layer("ScatterplotLayer", data=cur, get_position='[lon, lat]', get_fill_color='color', get_radius=5000,
-                               stroked=True, get_line_color=[0,0,0], line_width_min_pixels=1)
-
+        halo_layer = pdk.Layer("ScatterplotLayer", data=cur, get_position='[lon, lat]', get_fill_color='color',
+                               get_radius=5000, stroked=True, get_line_color=[0,0,0], line_width_min_pixels=1)
         view_state = pdk.ViewState(latitude=60.7, longitude=17.5, zoom=6.2, pitch=0)
         st.pydeck_chart(pdk.Deck(layers=[tile_layer, path_layer, bs_layer, halo_layer, train_icon_layer],
                                  initial_view_state=view_state, map_style=None, tooltip={"text":"{name}"}))
-        st.caption("OSM tiles. Train halo color shows link quality to nearest BS. The map uses the strategy selected in the sidebar.")
+        st.caption("OSM tiles. Train halo color shows link quality to nearest BS. Use the sidebar **Simulation speed** to fast-forward.")
 
-# ===================== PACKETS (examples) =====================
+# ===================== PACKETS =====================
 with tab_packets:
     st.subheader("Packet examples")
     example_t = min(SECS-1, max(0, SECS//3))
+    # Lane A
     pktA = laneA_adhesion_state(features[example_t]); bA = enc_laneA(pktA, 123)
     st.markdown("**Lane A (safety) adhesion_state**"); st.code(json.dumps(pktA, indent=2))
     st.write(f"Encoded size: {len(bA)} bytes (CBOR + CRC32)")
@@ -331,7 +346,6 @@ with tab_metrics:
     laneB_line = base.mark_line(color="#d62728").encode(y=alt.Y("LaneB_bps:Q", axis=alt.Axis(title=None, orient="right"), scale=right_scale))
     st.altair_chart(alt.layer(cap_line, laneA_line, laneB_line).resolve_scale(y="independent").properties(height=340), use_container_width=True)
 
-    # KPIs
     raw_total_bits = RAW_BITS_PER_SEC * SECS
     total_bits = res_map["kpis"]["total_bits"]
     saved = 1.0 - (total_bits / max(raw_total_bits,1))
@@ -344,7 +358,6 @@ with tab_metrics:
 # ===================== STRATEGY COMPARISON =====================
 with tab_compare:
     st.subheader("Raw-only vs Hybrid (Adaptive) vs Semantic-only — whole-run summary")
-
     def kpi_row(name, res):
         raw_total_bits = RAW_BITS_PER_SEC * SECS
         tot = res["kpis"]["total_bits"]; saved = 1.0 - (tot / max(raw_total_bits,1))
@@ -362,21 +375,15 @@ with tab_compare:
         "Lane A success %":"{:.1f}", "Lane B success %":"{:.1f}", "Total sent (MB)":"{:.2f}", "Saved vs Raw (%)":"{:.1f}"
     }), use_container_width=True)
 
-    st.markdown("**Takeaway:** Hybrid keeps Lane A reliable like Raw, preserves many Lane B events, and still saves bandwidth vs raw streaming.")
-
 # ===================== WHEN TO USE RAW VS SEMANTIC =====================
 with tab_why:
     st.subheader("When do we use RAW vs SEMANTIC?")
     st.markdown("""
-- **Lane A (Safety)** — always **semantic & tiny** (structured telegram); sent every second regardless of strategy.
+- **Lane A (Safety)** — always **structured & tiny** (telegram each second) regardless of strategy.
 - **Lane B (Operational)**:
-  - **Raw only**: stream raw features continuously (for labs / offline analysis). Uses lots of bandwidth; events may still be sent if capacity remains.
-  - **Semantic only**: send **only** compact events/tokens. Best when coverage is poor or backhaul is expensive.
-  - **Hybrid (Adaptive)** *(recommended)*:
-    - **GOOD link** → allow some raw background for high-fidelity analytics.
-    - **PATCHY/POOR** → throttle raw to protect **Lane B** event delivery.
-    
-This matches real railway ops: the **vital channel** (Lane A) is deterministic; **non-vital** (Lane B) adapts to radio conditions.
+  - **Raw only**: stream raw features (lab/offline analysis); high bandwidth.
+  - **Semantic only**: send compact events/tokens; best under poor coverage.
+  - **Hybrid (Adaptive)** *(recommended)*: allow some raw when **GOOD**, throttle raw when **PATCHY/POOR** to protect event delivery.
 """)
 
 st.markdown("---")
