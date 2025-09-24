@@ -1,4 +1,4 @@
-import json, zlib, math, os
+import json, zlib, math
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 
@@ -9,19 +9,20 @@ from sklearn.cluster import KMeans
 import cbor2
 import pydeck as pdk
 from streamlit_autorefresh import st_autorefresh
+import altair as alt
 
 # ========= Page / session =========
-st.set_page_config(page_title="ENSURE-6G • Semantic Rail Demo (OSM + Autoplay)", layout="wide")
-st.title("ENSURE-6G: Semantic Communication — Live Rail Demo (OpenStreetMap + Autoplay)")
-st.caption("OpenStreetMap basemap • Approximated railway Sundsvall→Stockholm • Base stations + coverage • Moving train • Safety vs Ops semantics")
+st.set_page_config(page_title="ENSURE-6G • Raw vs Semantic vs Hybrid", layout="wide")
+st.title("ENSURE-6G: Raw vs Semantic vs Hybrid — Live Rail Demo (OpenStreetMap)")
+st.caption("OpenStreetMap basemap • Sundsvall→Stockholm • Base stations + coverage • Moving train • Lane A (safety) vs Lane B (ops) • Strategy comparison")
 
 if "t_idx" not in st.session_state: st.session_state.t_idx = 0
 if "playing" not in st.session_state: st.session_state.playing = False
 
 # ========= Sidebar =========
 with st.sidebar:
-    st.header("Simulation")
-    duration_min = st.slider("Duration (minutes)", 5, 30, 12, 1)
+    st.header("Scenario")
+    duration_min = st.slider("Duration (minutes)", 5, 20, 10, 1)
     seed = st.number_input("Random seed", value=11, step=1)
     ensure_events = st.checkbox("Guarantee visible events", value=True)
 
@@ -32,16 +33,22 @@ with st.sidebar:
     icing = st.select_slider("Icing risk", ["low","medium","high"], "high")
 
     st.markdown("---")
-    st.subheader("Link & Semantics")
+    st.subheader("Link model")
     base_capacity_kbps = st.slider("Base capacity (kbps)", 128, 2048, 512, 64)
     burst_factor = st.slider("Burst factor when GOOD", 1.0, 3.0, 2.0, 0.1)
     good_loss_pct = st.slider("Loss in GOOD (%)", 0.0, 5.0, 0.5, 0.1)
     bad_loss_pct  = st.slider("Loss in POOR (%)", 5.0, 60.0, 20.0, 1.0)
-    strategy = st.radio("Transmit strategy", ["Raw", "Semantic", "Adaptive (prefer Semantic)"], index=2)
-    k_codebook = st.select_slider("Codebook size (k-means z)", [32, 64, 128, 256], 128)
-    use_cbor = st.checkbox("Encode Lane B events as CBOR", value=True)
 
-# ========= Geography: approximated railway polyline =========
+    st.markdown("---")
+    st.subheader("Semantics")
+    k_codebook = st.select_slider("Codebook size (k-means z)", [32, 64, 128, 256], 128)
+    use_cbor = st.checkbox("Encode Lane B as CBOR (smaller than JSON)", value=True)
+
+    st.markdown("---")
+    st.subheader("Live map strategy")
+    live_strategy = st.radio("Map playback uses…", ["Raw only", "Hybrid (Adaptive)", "Semantic only"], index=1)
+
+# ========= Geography =========
 RAIL_WAYPOINTS = [
     (62.3930, 17.3070), (62.12, 17.15), (61.86, 17.14), (61.73, 17.11),
     (61.56, 17.08), (61.39, 17.07), (61.30, 17.06), (61.07, 17.10),
@@ -58,9 +65,8 @@ BASE_STATIONS = [
     ("BS-Skyttorp",60.03,17.58,14000), ("BS-Uppsala",59.858,17.639,16000),
     ("BS-Märsta",59.62,17.86,15000), ("BS-Stockholm",59.33,18.07,18000),
 ]
-CMD_CENTER = ("Trafikledning Stockholm", 59.3326, 18.0649)
-
 R_EARTH = 6371000.0
+
 def haversine_m(lat1, lon1, lat2, lon2):
     p = math.pi/180.0
     dlat = (lat2-lat1)*p; dlon = (lon2-lon1)*p
@@ -82,6 +88,14 @@ def interpolate_polyline(waypoints, n_pts):
         lonp.append(lons[i0]+(lons[i1]-lons[i0])*w)
     return pd.DataFrame({"lat":latp,"lon":lonp})
 
+SECS = duration_min*60
+route_df = interpolate_polyline(RAIL_WAYPOINTS, SECS)
+SEG_NAMES = ["Sundsvall→Hudiksvall","Hudiksvall→Söderhamn","Söderhamn→Gävle","Gävle→Uppsala","Uppsala→Stockholm"]
+seg_bounds = np.linspace(0, SECS, len(SEG_NAMES)+1).astype(int)
+seg_labels = np.empty(SECS, dtype=object)
+for i in range(len(SEG_NAMES)): seg_labels[seg_bounds[i]:seg_bounds[i+1]] = SEG_NAMES[i]
+route_df["segment"]=seg_labels
+
 def nearest_bs_quality(lat, lon):
     best=None
     for name, blat, blon, r in BASE_STATIONS:
@@ -101,15 +115,7 @@ def cap_loss(quality, t):
         cap=int(cap*0.25); loss=bad_loss_pct/100.0
     return max(0,cap), loss
 
-# ========= Simulation core =========
-SECS = duration_min*60
-route_df = interpolate_polyline(RAIL_WAYPOINTS, SECS)
-SEG_NAMES = ["Sundsvall→Hudiksvall","Hudiksvall→Söderhamn","Söderhamn→Gävle","Gävle→Uppsala","Uppsala→Stockholm"]
-seg_bounds = np.linspace(0, SECS, len(SEG_NAMES)+1).astype(int)
-seg_labels = np.empty(SECS, dtype=object)
-for i in range(len(SEG_NAMES)): seg_labels[seg_bounds[i]:seg_bounds[i+1]] = SEG_NAMES[i]
-route_df["segment"]=seg_labels
-
+# ========= Features & events =========
 rng = np.random.default_rng(int(seed))
 snow_factor = {"none":0.3,"light":0.7,"moderate":1.0,"heavy":1.5}[snowfall]
 ice_factor  = {"low":0.6,"medium":1.0,"high":1.4}[icing]
@@ -165,14 +171,14 @@ if ensure_events and len(events)==0:
                Event(t0+20,"low_adhesion_event",{"km":200.3,"slip_ratio":0.22,"duration_s":90}),
                Event(t0+40,"pantograph_ice",{"varN":95,"temp_c":ambient_c})]
 
-# Codebook tokens
+# ========= Semantics: codebook =========
 X=np.array([[f.rms,f.crest,f.band_20_50,f.band_50_120,f.jerk] for f in features],dtype=np.float32)
 kmeans=KMeans(n_clusters=int(k_codebook),n_init=5,random_state=int(seed)).fit(X)
 tokens=kmeans.predict(X); C=kmeans.cluster_centers_; labels=["smooth"]*len(C)
-order=np.argsort(C[:,0]); 
+order=np.argsort(C[:,0])
 if len(C)>=4: labels[order[-1]]="rough-snow"; labels[order[-2]]="curve-rough"; labels[order[0]]="very-smooth"
 
-# Packets
+# ========= Packets =========
 def laneA_adhesion_state(f:Feat)->Dict[str,int]:
     mu=max(0.0,min(0.6,0.6-0.5*f.slip_ratio))
     return {"mu_q7_9":int(mu*(1<<9)),"conf_pct":int(max(0,min(100,100-120*abs(0.2-f.slip_ratio)))),
@@ -183,147 +189,126 @@ def enc_laneB(ev,z,zl,use_cbor):
     b=cbor2.dumps(body) if use_cbor else json.dumps(body,separators=(",",":")).encode()
     return b+zlib.crc32(b).to_bytes(4,"big")
 
-# Channel + transmission (per second)
+# ========= Channel + per-second simulator =========
 FS_ACCEL=200; FS_FORCE=500; BITS_PER_SAMPLE=16
-raw_bits = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BITS_PER_SAMPLE + 400)
-laneA_bits=np.zeros(SECS,dtype=np.int64); laneB_bits=np.zeros(SECS,dtype=np.int64)
-cap_bits=np.zeros(SECS,dtype=np.int64); quality=np.empty(SECS,dtype=object); near_bs=np.empty(SECS,dtype=object)
+RAW_BITS_PER_SEC = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BITS_PER_SAMPLE + 400)
 
-ev_by_t={}
-for e in events: ev_by_t.setdefault(e.t,[]).append(e)
-seqA=0; laneB_table=[]
-for t in range(SECS):
-    lat,lon=route_df.loc[t,"lat"],route_df.loc[t,"lon"]
-    bs_name,_,q=nearest_bs_quality(lat,lon); near_bs[t]=bs_name; quality[t]=q
-    cap,loss=cap_loss(q,t); cap_bits[t]=cap
-    # Lane A
-    pa=laneA_adhesion_state(features[t]); A=enc_laneA(pa,seqA); seqA+=1
-    szA=len(A)*8
-    if cap>=szA and (rng.random()>loss): cap-=szA; laneA_bits[t]+=szA
-    # Raw
-    if strategy in ["Raw","Adaptive (prefer Semantic)"]:
-        add=raw_bits if (strategy=="Raw" or q=="GOOD") else int(raw_bits*0.35)
-        cap=max(0,cap-add)
-    # Lane B events
-    if t in ev_by_t:
-        for ev in ev_by_t[t]:
-            B=enc_laneB(ev,tokens[t],labels[tokens[t]],use_cbor); szB=len(B)*8
-            if cap>=szB and (rng.random()>loss):
-                cap-=szB; laneB_bits[t]+=szB
-                laneB_table.append({"t":t,"segment":features[t].segment,"intent":ev.intent,
-                                    "bytes":len(B),"encoding":"CBOR" if use_cbor else "JSON",
-                                    "token_z":int(tokens[t]),"token_label":labels[tokens[t]],
-                                    "near_bs":bs_name,"link_quality":q})
+def run_strategy(strategy_name:str):
+    """Return dict of arrays and KPIs for given strategy."""
+    laneA_bits=np.zeros(SECS,dtype=np.int64); laneB_bits=np.zeros(SECS,dtype=np.int64)
+    cap_bits=np.zeros(SECS,dtype=np.int64); quality=np.empty(SECS,dtype=object); near_bs=np.empty(SECS,dtype=object)
+    ev_by_t={}
+    for e in events: ev_by_t.setdefault(e.t,[]).append(e)
+    seqA=0; laneB_delivered=0
+    for t in range(SECS):
+        lat,lon=route_df.loc[t,"lat"],route_df.loc[t,"lon"]
+        bs_name,_,q=nearest_bs_quality(lat,lon); near_bs[t]=bs_name; quality[t]=q
+        cap,loss=cap_loss(q,t); cap_bits[t]=cap
+        # Lane A (always)
+        pa=laneA_adhesion_state(features[t]); A=enc_laneA(pa,seqA); seqA+=1
+        szA=len(A)*8
+        if cap>=szA and (np.random.random()>loss): cap-=szA; laneA_bits[t]+=szA
+        # Raw policy
+        if strategy_name=="Raw only":
+            raw_use=min(RAW_BITS_PER_SEC, int(cap*0.95))  # consume
+            cap=max(0,cap-raw_use)
+        elif strategy_name=="Hybrid (Adaptive)":
+            desired = RAW_BITS_PER_SEC if q=="GOOD" else int(RAW_BITS_PER_SEC*0.35)
+            raw_use = min(desired, int(cap*0.60))  # leave headroom for semantics
+            cap = max(0, cap - raw_use)
+        # Semantic-only: no raw background
+        # Lane B events
+        if t in ev_by_t:
+            for ev in ev_by_t[t]:
+                B=enc_laneB(ev,tokens[t],labels[tokens[t]],use_cbor); szB=len(B)*8
+                if cap>=szB and (np.random.random()>loss):
+                    cap-=szB; laneB_bits[t]+=szB; laneB_delivered += 1
+    # KPIs
+    laneA_pkts_delivered = int((laneA_bits > 0).sum())
+    laneB_pkts_delivered = int((laneB_bits > 0).sum())
+    laneA_pkts_attempted = SECS
+    laneB_pkts_attempted = len(events)
+    return {
+        "laneA_bits": laneA_bits, "laneB_bits": laneB_bits,
+        "cap_bits": cap_bits, "quality": quality, "near_bs": near_bs,
+        "kpis": {
+            "laneA_deliv": laneA_pkts_delivered,
+            "laneA_attempt": laneA_pkts_attempted,
+            "laneB_deliv": laneB_pkts_delivered,
+            "laneB_attempt": laneB_pkts_attempted,
+            "total_bits": int(laneA_bits.sum() + laneB_bits.sum()),
+        }
+    }
 
-# ========= UI: Map, Packets, Metrics =========
-tab_map, tab_packets, tab_metrics = st.tabs(["🗺️ Map (Animate, OSM)", "📦 Packets", "📈 Metrics"])
+# Run the three strategies for comparison (fast; O(seconds))
+res_raw     = run_strategy("Raw only")
+res_hybrid  = run_strategy("Hybrid (Adaptive)")
+res_sem     = run_strategy("Semantic only")
 
+# Choose which set powers the live map
+res_map = {"Raw only":res_raw, "Hybrid (Adaptive)":res_hybrid, "Semantic only":res_sem}[live_strategy]
+
+# ========= Tabs =========
+tab_map, tab_packets, tab_metrics, tab_compare, tab_why = st.tabs(
+    ["🗺️ Map (Animate, OSM)", "📦 Packets", "📈 Per-lane Metrics", "📊 Strategy Comparison", "❓ When to use Raw vs Semantic"]
+)
+
+# ===================== MAP =====================
 with tab_map:
     colL, colR = st.columns([2,1])
-
     with colR:
         st.subheader("Playback")
         c1,c2=st.columns(2)
         if c1.button("▶ Simulate", use_container_width=True): st.session_state.playing=True
         if c2.button("⏸ Pause", use_container_width=True): st.session_state.playing=False
-
-        # --- Autoplay tick: refresh every 800 ms when playing ---
         if st.session_state.playing:
             st_autorefresh(interval=800, key="autoplay_tick")
-            # advance one second per refresh (cap at end)
             st.session_state.t_idx = min(st.session_state.t_idx + 1, SECS - 1)
-            if st.session_state.t_idx >= SECS - 1:
-                st.session_state.playing = False
-
-        # Time slider (disabled while playing)
-        t_idx = st.slider("Time (s)", 0, SECS-1,
-                          value=st.session_state.t_idx,
-                          key="time_slider",
-                          disabled=st.session_state.playing)
+            if st.session_state.t_idx >= SECS - 1: st.session_state.playing = False
+        t_idx = st.slider("Time (s)", 0, SECS-1, value=st.session_state.t_idx, key="time_slider", disabled=st.session_state.playing)
         st.session_state.t_idx = t_idx
 
-        # KPIs at current time
+        st.metric("Strategy (map)", live_strategy)
         st.metric("Segment", route_df.loc[t_idx,"segment"])
-        st.metric("Nearest BS", str(near_bs[t_idx]))
-        st.metric("Link quality", str(quality[t_idx]))
-        st.metric("Lane A bits this second", int(laneA_bits[t_idx]))
-        st.metric("Lane B bits this second", int(laneB_bits[t_idx]))
-        st.metric("Capacity (kbps)", int(cap_bits[t_idx]/1000))
+        st.metric("Nearest BS", str(res_map["near_bs"][t_idx]))
+        st.metric("Link quality", str(res_map["quality"][t_idx]))
+        st.metric("Lane A bits this second", int(res_map["laneA_bits"][t_idx]))
+        st.metric("Lane B bits this second", int(res_map["laneB_bits"][t_idx]))
+        st.metric("Capacity (kbps)", int(res_map["cap_bits"][t_idx]/1000))
 
     with colL:
-        # --- OSM basemap ---
-        tile_layer = pdk.Layer(
-            "TileLayer",
-            data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-            min_zoom=0, max_zoom=19, tile_size=256,
-        )
-
-        # Railway path
+        tile_layer = pdk.Layer("TileLayer", data="https://tile.openstreetmap.org/{z}/{x}/{y}.png", min_zoom=0, max_zoom=19, tile_size=256)
         step = max(1, SECS//300)
         path_coords = [[route_df.loc[i,"lon"], route_df.loc[i,"lat"]] for i in range(0, SECS, step)]
-        path_layer = pdk.Layer(
-            "PathLayer",
-            data=[{"path": path_coords, "name":"Sundsvall→Stockholm"}],
-            get_color=[60,60,160],
-            width_scale=4, width_min_pixels=2
-        )
-
-        # Base stations (coverage discs in meters)
+        path_layer = pdk.Layer("PathLayer", data=[{"path": path_coords, "name":"Sundsvall→Stockholm"}], get_color=[60,60,160], width_scale=4, width_min_pixels=2)
         bs_df = pd.DataFrame(BASE_STATIONS, columns=["name","lat","lon","r_m"])
-        bs_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=bs_df,
-            get_position="[lon, lat]",
-            get_radius="r_m",
-            get_fill_color="[0, 150, 0, 40]",
-            stroked=True, get_line_color=[0,150,0], line_width_min_pixels=1,
-            pickable=True,
-        )
+        bs_layer = pdk.Layer("ScatterplotLayer", data=bs_df, get_position="[lon, lat]", get_radius="r_m",
+                             get_fill_color="[0,150,0,40]", stroked=True, get_line_color=[0,150,0], line_width_min_pixels=1, pickable=True)
 
-        # Train: IconLayer + colored halo by quality
         qcol = {"GOOD":[0,170,0], "PATCHY":[255,165,0], "POOR":[200,0,0]}
         cur = pd.DataFrame([{
-            "lat": route_df.loc[st.session_state.t_idx,"lat"],
-            "lon": route_df.loc[st.session_state.t_idx,"lon"],
-            "icon_data": {
-                "url": "https://img.icons8.com/emoji/48/train-emoji.png",
-                "width": 128, "height": 128, "anchorY": 128
-            },
-            "color": qcol[quality[st.session_state.t_idx]],
+            "lat": route_df.loc[t_idx,"lat"],
+            "lon": route_df.loc[t_idx,"lon"],
+            "icon_data": {"url":"https://img.icons8.com/emoji/48/train-emoji.png","width":128,"height":128,"anchorY":128},
+            "color": qcol[res_map["quality"][t_idx]],
         }])
-        train_icon_layer = pdk.Layer(
-            "IconLayer",
-            data=cur,
-            get_position='[lon, lat]',
-            get_icon='icon_data',
-            get_size=4, size_scale=15,
-            pickable=False,
-        )
-        halo_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=cur,
-            get_position='[lon, lat]',
-            get_fill_color='color',
-            get_radius=5000,
-            stroked=True, get_line_color=[0,0,0], line_width_min_pixels=1
-        )
+        train_icon_layer = pdk.Layer("IconLayer", data=cur, get_position='[lon, lat]', get_icon='icon_data', get_size=4, size_scale=15)
+        halo_layer = pdk.Layer("ScatterplotLayer", data=cur, get_position='[lon, lat]', get_fill_color='color', get_radius=5000,
+                               stroked=True, get_line_color=[0,0,0], line_width_min_pixels=1)
 
         view_state = pdk.ViewState(latitude=60.7, longitude=17.5, zoom=6.2, pitch=0)
-        deck = pdk.Deck(
-            layers=[tile_layer, path_layer, bs_layer, halo_layer, train_icon_layer],
-            initial_view_state=view_state,
-            map_style=None,  # IMPORTANT: use OSM tiles, not Mapbox styles
-            tooltip={"text":"{name}"}
-        )
-        st.pydeck_chart(deck)
-        st.caption("OpenStreetMap tiles. ▶ to animate. Train icon + colored halo shows link quality to nearest base station.")
+        st.pydeck_chart(pdk.Deck(layers=[tile_layer, path_layer, bs_layer, halo_layer, train_icon_layer],
+                                 initial_view_state=view_state, map_style=None, tooltip={"text":"{name}"}))
+        st.caption("OSM tiles. Train halo color shows link quality to nearest BS. The map uses the strategy selected in the sidebar.")
 
+# ===================== PACKETS (examples) =====================
 with tab_packets:
-    st.subheader("Packet Inspector")
+    st.subheader("Packet examples")
     example_t = min(SECS-1, max(0, SECS//3))
     pktA = laneA_adhesion_state(features[example_t]); bA = enc_laneA(pktA, 123)
     st.markdown("**Lane A (safety) adhesion_state**"); st.code(json.dumps(pktA, indent=2))
     st.write(f"Encoded size: {len(bA)} bytes (CBOR + CRC32)")
+    # Lane B
     ev = next((e for e in events if e.t >= example_t), None)
     if ev is None: ev = Event(example_t,"ride_degradation",{"segment":features[example_t].segment,"rms":0.41,"dwell_s":160})
     bB_json = enc_laneB(ev, tokens[example_t], labels[tokens[example_t]], use_cbor=False)
@@ -332,22 +317,67 @@ with tab_packets:
     st.code(json.dumps({"i":ev.intent,"ts":ev.t,"s":ev.slots,"z":int(tokens[example_t]),"zl":labels[tokens[example_t]]}, indent=2))
     st.write(f"JSON size: {len(bB_json)} bytes • CBOR size: {len(bB_cbor)} bytes (both include CRC32)")
 
+# ===================== PER-LANE METRICS (for live strategy) =====================
 with tab_metrics:
-    st.subheader("Link & Semantics Metrics")
-    df_time = pd.DataFrame({
-        "t": np.arange(SECS),
-        "LaneA_bits": laneA_bits,
-        "LaneB_bits": laneB_bits,
-        "Capacity_bits": cap_bits,
-    })
-    st.line_chart(df_time.set_index("t")[["Capacity_bits","LaneA_bits","LaneB_bits"]])
-    raw_total = raw_bits * SECS
-    actual_total = int(laneA_bits.sum() + laneB_bits.sum())
-    saved = 1.0 - (actual_total / max(raw_total,1))
-    c1,c2,c3 = st.columns(3)
-    with c1: st.metric("Raw if streamed (MB)", f"{raw_total/(8*1024*1024):.2f}")
-    with c2: st.metric("Actual sent (MB)", f"{actual_total/(8*1024*1024):.2f}")
-    with c3: st.metric("Saved vs Raw", f"{100*saved:.1f}%")
+    st.subheader(f"Per-lane metrics — {live_strategy}")
+    df = pd.DataFrame({"t":np.arange(SECS),
+                       "Capacity_bps": res_map["cap_bits"],
+                       "LaneA_bps": res_map["laneA_bits"],
+                       "LaneB_bps": res_map["laneB_bits"]})
+    base = alt.Chart(df).encode(x="t:Q")
+    cap_line = base.mark_line(color="#2ca02c").encode(y=alt.Y("Capacity_bps:Q", title="Capacity (bps)"))
+    right_scale = alt.Scale(domain=[0, max(1, int(max(df["LaneA_bps"].max(), df["LaneB_bps"].max())*1.4))])
+    laneA_line = base.mark_line(color="#1f77b4").encode(y=alt.Y("LaneA_bps:Q", axis=alt.Axis(title="Lane A/B (bps)", orient="right"), scale=right_scale))
+    laneB_line = base.mark_line(color="#d62728").encode(y=alt.Y("LaneB_bps:Q", axis=alt.Axis(title=None, orient="right"), scale=right_scale))
+    st.altair_chart(alt.layer(cap_line, laneA_line, laneB_line).resolve_scale(y="independent").properties(height=340), use_container_width=True)
+
+    # KPIs
+    raw_total_bits = RAW_BITS_PER_SEC * SECS
+    total_bits = res_map["kpis"]["total_bits"]
+    saved = 1.0 - (total_bits / max(raw_total_bits,1))
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: st.metric("Lane A delivered / attempted", f'{res_map["kpis"]["laneA_deliv"]}/{res_map["kpis"]["laneA_attempt"]}')
+    with c2: st.metric("Lane B delivered / attempted", f'{res_map["kpis"]["laneB_deliv"]}/{res_map["kpis"]["laneB_attempt"]}')
+    with c3: st.metric("Actual sent (MB)", f"{total_bits/(8*1024*1024):.2f}")
+    with c4: st.metric("Saved vs Raw", f"{100*saved:.1f}%")
+
+# ===================== STRATEGY COMPARISON =====================
+with tab_compare:
+    st.subheader("Raw-only vs Hybrid (Adaptive) vs Semantic-only — whole-run summary")
+
+    def kpi_row(name, res):
+        raw_total_bits = RAW_BITS_PER_SEC * SECS
+        tot = res["kpis"]["total_bits"]; saved = 1.0 - (tot / max(raw_total_bits,1))
+        return {
+            "Strategy": name,
+            "Lane A success %": 100*res["kpis"]["laneA_deliv"]/max(1,res["kpis"]["laneA_attempt"]),
+            "Lane B success %": 100*res["kpis"]["laneB_deliv"]/max(1,res["kpis"]["laneB_attempt"]),
+            "Total sent (MB)": tot/(8*1024*1024),
+            "Saved vs Raw (%)": 100*saved
+        }
+    table = pd.DataFrame([kpi_row("Raw only", res_raw),
+                          kpi_row("Hybrid (Adaptive)", res_hybrid),
+                          kpi_row("Semantic only", res_sem)])
+    st.dataframe(table.style.format({
+        "Lane A success %":"{:.1f}", "Lane B success %":"{:.1f}", "Total sent (MB)":"{:.2f}", "Saved vs Raw (%)":"{:.1f}"
+    }), use_container_width=True)
+
+    st.markdown("**Takeaway:** Hybrid keeps Lane A reliable like Raw, preserves many Lane B events, and still saves bandwidth vs raw streaming.")
+
+# ===================== WHEN TO USE RAW VS SEMANTIC =====================
+with tab_why:
+    st.subheader("When do we use RAW vs SEMANTIC?")
+    st.markdown("""
+- **Lane A (Safety)** — always **semantic & tiny** (structured telegram); sent every second regardless of strategy.
+- **Lane B (Operational)**:
+  - **Raw only**: stream raw features continuously (for labs / offline analysis). Uses lots of bandwidth; events may still be sent if capacity remains.
+  - **Semantic only**: send **only** compact events/tokens. Best when coverage is poor or backhaul is expensive.
+  - **Hybrid (Adaptive)** *(recommended)*:
+    - **GOOD link** → allow some raw background for high-fidelity analytics.
+    - **PATCHY/POOR** → throttle raw to protect **Lane B** event delivery.
+    
+This matches real railway ops: the **vital channel** (Lane A) is deterministic; **non-vital** (Lane B) adapts to radio conditions.
+""")
 
 st.markdown("---")
 st.caption("Tiles © OpenStreetMap contributors. Railway path is an approximation for demo purposes.")
