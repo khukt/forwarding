@@ -84,4 +84,272 @@ def interpolate_polyline(waypoints, n_pts):
 def nearest_bs_quality(lat, lon):
     best=None
     for name, blat, blon, r in BASE_STATIONS:
-        d=haversine
+        d=haversine_m(lat,lon,blat,blon)
+        q="GOOD" if d<=r else ("PATCHY" if d<=2.2*r else "POOR")
+        rank={"GOOD":0,"PATCHY":1,"POOR":2}[q]
+        if best is None or rank<best[3]: best=(name,d,q,rank)
+    return best[0], best[1], best[2]
+
+def cap_loss(quality, t):
+    cap = base_capacity_kbps*1000
+    if quality=="GOOD":
+        cap=int(cap*burst_factor); loss=good_loss_pct/100.0
+    elif quality=="PATCHY":
+        cap=int(cap*(0.6+0.2*math.sin(2*math.pi*t/30))); loss=min(0.4,(bad_loss_pct*0.5)/100.0)
+    else:
+        cap=int(cap*0.25); loss=bad_loss_pct/100.0
+    return max(0,cap), loss
+
+# ========= Simulation core =========
+SECS = duration_min*60
+route_df = interpolate_polyline(RAIL_WAYPOINTS, SECS)
+SEG_NAMES = ["Sundsvall→Hudiksvall","Hudiksvall→Söderhamn","Söderhamn→Gävle","Gävle→Uppsala","Uppsala→Stockholm"]
+seg_bounds = np.linspace(0, SECS, len(SEG_NAMES)+1).astype(int)
+seg_labels = np.empty(SECS, dtype=object)
+for i in range(len(SEG_NAMES)): seg_labels[seg_bounds[i]:seg_bounds[i+1]] = SEG_NAMES[i]
+route_df["segment"]=seg_labels
+
+rng = np.random.default_rng(int(seed))
+snow_factor = {"none":0.3,"light":0.7,"moderate":1.0,"heavy":1.5}[snowfall]
+ice_factor  = {"low":0.6,"medium":1.0,"high":1.4}[icing]
+
+@dataclass
+class Feat:
+    t:int; segment:str; rms:float; crest:float; band_20_50:float; band_50_120:float
+    jerk:float; temp_peak:float; temp_ewma:float; temp_slope_cpm:float
+    slip_ratio:float; wsp_count:int; panto_varN:float
+
+def synth_feature(t:int)->Feat:
+    seg=route_df.loc[t,"segment"]
+    base_rms=0.18+0.05*np.sin(2*np.pi*t/180)
+    rms=abs(base_rms*(1+0.6*(snow_factor-0.3))+rng.normal(0,0.02))
+    band_20_50=max(0.0,0.12*snow_factor+rng.normal(0,0.015))
+    band_50_120=max(0.0,0.08*snow_factor+rng.normal(0,0.015))
+    crest=2.2+0.2*snow_factor+rng.normal(0,0.05); jerk=0.6+0.3*snow_factor+rng.normal(0,0.05)
+    temp_base=45+0.02*t+(0 if ambient_c<-15 else 2)
+    temp_inst=temp_base+rng.normal(0,0.3)+(3.0 if snow_factor>1.2 and (t%600>300) else 0.0)
+    ewma=0.8*temp_base+0.2*temp_inst; slope_cpm=(0.8+0.4*(ice_factor-1.0))
+    temp_peak=temp_inst+max(0,rng.normal(0.5,0.2))
+    slip_ratio=max(0.0,rng.normal(0.05,0.01)+0.08*(snow_factor-0.3))
+    wsp_count=int(max(0,rng.normal(5,2)+12*(snow_factor-0.3)))
+    panto_varN=max(0.0,rng.normal(40,8)+25*(ice_factor-1.0))
+    return Feat(t,seg,float(rms),float(crest),float(band_20_50),float(band_50_120),
+                float(jerk),float(temp_peak),float(ewma),float(slope_cpm),
+                float(slip_ratio),int(wsp_count),float(panto_varN))
+
+features=[synth_feature(t) for t in range(SECS)]
+
+@dataclass
+class Event: t:int; intent:str; slots:Dict[str,object]
+RMS_HIGH=0.35; SLIP_HIGH=0.18; TEMP_HIGH=85.0; PANTO_VAR_HIGH=80.0; DWELL_S=120
+events=[]; rms_since=slip_since=temp_since=panto_since=None
+for f in features:
+    rms_since = f.t if (f.rms>=RMS_HIGH and rms_since is None) else (rms_since if f.rms>=RMS_HIGH else None)
+    if rms_since is not None and f.t-rms_since>=DWELL_S:
+        events.append(Event(f.t,"ride_degradation",{"segment":f.segment,"rms":round(f.rms,3),"dwell_s":f.t-rms_since})); rms_since=None
+    slip_since = f.t if (f.slip_ratio>=SLIP_HIGH and slip_since is None) else (slip_since if f.slip_ratio>=SLIP_HIGH else None)
+    if slip_since is not None and f.t-slip_since>=60:
+        km=round(415*(f.t/SECS),1)
+        events.append(Event(f.t,"low_adhesion_event",{"km":km,"slip_ratio":round(f.slip_ratio,3),"duration_s":f.t-slip_since})); slip_since=None
+    temp_since = f.t if (f.temp_peak>=TEMP_HIGH and temp_since is None) else (temp_since if f.temp_peak>=TEMP_HIGH else None)
+    if temp_since is not None and f.t-temp_since>=180:
+        events.append(Event(f.t,"bearing_overtemp",{"axle":"2L","peak_c":round(f.temp_peak,1),"dwell_s":f.t-temp_since})); temp_since=None
+    panto_since = f.t if (f.panto_varN>=PANTO_VAR_HIGH and ambient_c<=-8 and panto_since is None) else (panto_since if (f.panto_varN>=PANTO_VAR_HIGH and ambient_c<=-8) else None)
+    if panto_since is not None and f.t-panto_since>=90:
+        events.append(Event(f.t,"pantograph_ice",{"varN":int(f.panto_varN),"temp_c":ambient_c})); panto_since=None
+
+if ensure_events and len(events)==0:
+    t0=min(SECS-10,300)
+    events += [Event(t0,"ride_degradation",{"segment":features[t0].segment,"rms":0.42,"dwell_s":180}),
+               Event(t0+20,"low_adhesion_event",{"km":200.3,"slip_ratio":0.22,"duration_s":90}),
+               Event(t0+40,"pantograph_ice",{"varN":95,"temp_c":ambient_c})]
+
+# Codebook tokens
+X=np.array([[f.rms,f.crest,f.band_20_50,f.band_50_120,f.jerk] for f in features],dtype=np.float32)
+kmeans=KMeans(n_clusters=int(k_codebook),n_init=5,random_state=int(seed)).fit(X)
+tokens=kmeans.predict(X); C=kmeans.cluster_centers_; labels=["smooth"]*len(C)
+order=np.argsort(C[:,0]); 
+if len(C)>=4: labels[order[-1]]="rough-snow"; labels[order[-2]]="curve-rough"; labels[order[0]]="very-smooth"
+
+# Packets
+def laneA_adhesion_state(f:Feat)->Dict[str,int]:
+    mu=max(0.0,min(0.6,0.6-0.5*f.slip_ratio))
+    return {"mu_q7_9":int(mu*(1<<9)),"conf_pct":int(max(0,min(100,100-120*abs(0.2-f.slip_ratio)))),
+            "slip":int(f.slip_ratio>=SLIP_HIGH),"wsp":int(min(255,f.wsp_count)),"valid_ms":500}
+def enc_laneA(pkt,seq): b=cbor2.dumps({**pkt,"seq":seq}); return b+zlib.crc32(b).to_bytes(4,"big")
+def enc_laneB(ev,z,zl,use_cbor): 
+    body={"i":ev.intent,"ts":int(ev.t),"s":ev.slots,"z":int(z),"zl":zl}
+    b=cbor2.dumps(body) if use_cbor else json.dumps(body,separators=(",",":")).encode()
+    return b+zlib.crc32(b).to_bytes(4,"big")
+
+# Channel + transmission (per second)
+FS_ACCEL=200; FS_FORCE=500; BITS_PER_SAMPLE=16
+raw_bits = (FS_ACCEL*3*BITS_PER_SAMPLE + FS_FORCE*BITS_PER_SAMPLE + 4*BITS_PER_SAMPLE + 400)
+laneA_bits=np.zeros(SECS,dtype=np.int64); laneB_bits=np.zeros(SECS,dtype=np.int64)
+cap_bits=np.zeros(SECS,dtype=np.int64); quality=np.empty(SECS,dtype=object); near_bs=np.empty(SECS,dtype=object)
+
+ev_by_t={}
+for e in events: ev_by_t.setdefault(e.t,[]).append(e)
+seqA=0; laneB_table=[]
+for t in range(SECS):
+    lat,lon=route_df.loc[t,"lat"],route_df.loc[t,"lon"]
+    bs_name,_,q=nearest_bs_quality(lat,lon); near_bs[t]=bs_name; quality[t]=q
+    cap,loss=cap_loss(q,t); cap_bits[t]=cap
+    # Lane A
+    pa=laneA_adhesion_state(features[t]); A=enc_laneA(pa,seqA); seqA+=1
+    szA=len(A)*8
+    if cap>=szA and (rng.random()>loss): cap-=szA; laneA_bits[t]+=szA
+    # Raw
+    if strategy in ["Raw","Adaptive (prefer Semantic)"]:
+        add=raw_bits if (strategy=="Raw" or q=="GOOD") else int(raw_bits*0.35)
+        cap=max(0,cap-add)
+    # Lane B events
+    if t in ev_by_t:
+        for ev in ev_by_t[t]:
+            B=enc_laneB(ev,tokens[t],labels[tokens[t]],use_cbor); szB=len(B)*8
+            if cap>=szB and (rng.random()>loss):
+                cap-=szB; laneB_bits[t]+=szB
+                laneB_table.append({"t":t,"segment":features[t].segment,"intent":ev.intent,
+                                    "bytes":len(B),"encoding":"CBOR" if use_cbor else "JSON",
+                                    "token_z":int(tokens[t]),"token_label":labels[tokens[t]],
+                                    "near_bs":bs_name,"link_quality":q})
+
+# ========= UI: Map, Packets, Metrics =========
+tab_map, tab_packets, tab_metrics = st.tabs(["🗺️ Map (Animate, OSM)", "📦 Packets", "📈 Metrics"])
+
+with tab_map:
+    colL, colR = st.columns([2,1])
+
+    with colR:
+        st.subheader("Playback")
+        c1,c2=st.columns(2)
+        if c1.button("▶ Simulate", use_container_width=True): st.session_state.playing=True
+        if c2.button("⏸ Pause", use_container_width=True): st.session_state.playing=False
+        t_idx = st.slider("Time (s)", 0, SECS-1, value=st.session_state.t_idx, key="time_slider", disabled=st.session_state.playing)
+        st.session_state.t_idx = t_idx
+        st.metric("Segment", route_df.loc[t_idx,"segment"])
+        st.metric("Nearest BS", str(near_bs[t_idx]))
+        st.metric("Link quality", str(quality[t_idx]))
+        st.metric("Lane A bits this second", int(laneA_bits[t_idx]))
+        st.metric("Lane B bits this second", int(laneB_bits[t_idx]))
+        st.metric("Capacity (kbps)", int(cap_bits[t_idx]/1000))
+
+    with colL:
+        # --- OSM basemap ---
+        tile_layer = pdk.Layer(
+            "TileLayer",
+            data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            min_zoom=0, max_zoom=19, tile_size=256,
+        )
+
+        # Railway path (downsample for rendering)
+        step = max(1, SECS//300)
+        path_coords = [[route_df.loc[i,"lon"], route_df.loc[i,"lat"]] for i in range(0, SECS, step)]
+        path_layer = pdk.Layer(
+            "PathLayer",
+            data=[{"path": path_coords, "name":"Sundsvall→Stockholm"}],
+            get_color=[60,60,160],
+            width_scale=4, width_min_pixels=2
+        )
+
+        # Base stations (coverage discs in meters)
+        bs_df = pd.DataFrame(BASE_STATIONS, columns=["name","lat","lon","r_m"])
+        bs_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=bs_df,
+            get_position="[lon, lat]",
+            get_radius="r_m",
+            get_fill_color="[0, 150, 0, 40]",
+            stroked=True, get_line_color=[0,150,0], line_width_min_pixels=1,
+            pickable=True,
+        )
+
+        # Train: IconLayer for visibility
+        qcol = {"GOOD":[0,170,0], "PATCHY":[255,165,0], "POOR":[200,0,0]}
+        cur = pd.DataFrame([{
+            "lat": route_df.loc[st.session_state.t_idx,"lat"],
+            "lon": route_df.loc[st.session_state.t_idx,"lon"],
+            "quality": str(quality[st.session_state.t_idx]),
+            "icon_data": {
+                "url": "https://img.icons8.com/emoji/48/train-emoji.png",
+                "width": 128, "height": 128, "anchorY": 128
+            },
+            "color": qcol[quality[st.session_state.t_idx]],
+        }])
+        train_icon_layer = pdk.Layer(
+            "IconLayer",
+            data=cur,
+            get_position='[lon, lat]',
+            get_icon='icon_data',
+            get_size=4, size_scale=15,
+            pickable=False,
+        )
+        # colored halo for quality
+        halo_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=cur,
+            get_position='[lon, lat]',
+            get_fill_color='color',
+            get_radius=5000,  # bigger so it's obvious
+            stroked=True, get_line_color=[0,0,0], line_width_min_pixels=1
+        )
+
+        view_state = pdk.ViewState(latitude=60.7, longitude=17.5, zoom=6.2, pitch=0)
+        deck = pdk.Deck(
+            layers=[tile_layer, path_layer, bs_layer, halo_layer, train_icon_layer],
+            initial_view_state=view_state,
+            map_style=None,  # IMPORTANT: no Mapbox style; we supply our own OSM tiles
+            tooltip={"text":"{name}"}
+        )
+        st.pydeck_chart(deck)
+        st.caption("OpenStreetMap tiles. ▶ to animate. Train icon + colored halo shows link quality to nearest base station.")
+
+    # Animation loop
+    if st.session_state.playing:
+        next_t = st.session_state.t_idx + 1
+        if next_t >= SECS:
+            st.session_state.playing = False
+        else:
+            st.session_state.t_idx = next_t
+            time.sleep(0.08)  # ~12.5 fps feel
+            st.experimental_rerun()
+
+with tab_packets:
+    st.subheader("Packet Inspector")
+    example_t = min(SECS-1, max(0, SECS//3))
+    # Lane A
+    def laneA_adhesion_state(f):
+        mu=max(0.0,min(0.6,0.6-0.5*f.slip_ratio))
+        return {"mu_q7_9":int(mu*(1<<9)),"conf_pct":int(max(0,min(100,100-120*abs(0.2-f.slip_ratio)))),
+                "slip":int(f.slip_ratio>=0.18),"wsp":int(min(255,f.wsp_count)),"valid_ms":500}
+    pktA = laneA_adhesion_state(features[example_t]); bA = enc_laneA(pktA, 123)
+    st.markdown("**Lane A (safety) adhesion_state**"); st.code(json.dumps(pktA, indent=2))
+    st.write(f"Encoded size: {len(bA)} bytes (CBOR + CRC32)")
+    # Lane B
+    ev = next((e for e in events if e.t >= example_t), None)
+    if ev is None: ev = Event(example_t,"ride_degradation",{"segment":features[example_t].segment,"rms":0.41,"dwell_s":160})
+    bB_json = enc_laneB(ev, tokens[example_t], labels[tokens[example_t]], use_cbor=False)
+    bB_cbor = enc_laneB(ev, tokens[example_t], labels[tokens[example_t]], use_cbor=True)
+    st.markdown("**Lane B (ops) example event**")
+    st.code(json.dumps({"i":ev.intent,"ts":ev.t,"s":ev.slots,"z":int(tokens[example_t]),"zl":labels[tokens[example_t]]}, indent=2))
+    st.write(f"JSON size: {len(bB_json)} bytes • CBOR size: {len(bB_cbor)} bytes (both include CRC32)")
+
+with tab_metrics:
+    st.subheader("Link & Semantics Metrics")
+    df_time = pd.DataFrame({
+        "t": np.arange(SECS),
+        "LaneA_bits": laneA_bits,
+        "LaneB_bits": laneB_bits,
+        "Capacity_bits": cap_bits,
+    })
+    st.line_chart(df_time.set_index("t")[["Capacity_bits","LaneA_bits","LaneB_bits"]])
+    raw_total = raw_bits * SECS
+    actual_total = int(laneA_bits.sum() + laneB_bits.sum())
+    saved = 1.0 - (actual_total / max(raw_total,1))
+    c1,c2,c3 = st.columns(3)
+    with c1: st.metric("Raw if streamed (MB)", f"{raw_total/(8*1024*1024):.2f}")
+    with c2: st.metric("Actual sent (MB)", f"{actual_total/(8*1024*1024):.2f}")
+    with c3: st.metric("Saved vs Raw", f"{100*saved:.1f}%")
+
+st.markdown("---")
+st.caption("Tiles © OpenStreetMap contributors. Railway path is an approximation for demo purposes.")
