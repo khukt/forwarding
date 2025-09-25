@@ -1,4 +1,5 @@
-# ENSURE-6G • TMS Rail Demo — Live Telemetry + Sensor Inspector + Per-segment Risk Coloring + Fixed Temp Injection
+# ENSURE-6G • TMS Rail Demo — Integrated Telemetry + Sensor Inspector + Optimized UI
+# (No CSVs; per-sensor time series generated live)
 
 import math, numpy as np, pandas as pd, streamlit as st, pydeck as pdk
 from shapely.geometry import LineString, Point
@@ -133,7 +134,6 @@ with st.sidebar:
     demo_force_issues = st.checkbox("Inject summer hotspots", True)
     summer_severity = st.slider("Summer severity (°C boost)",0.0,20.0,12.0,1.0)
     always_show_tsr = st.checkbox("Always show TSR polygons for injected issues", True)
-    show_hotspot_rings = st.checkbox("Show hotspot rings", True)
     st.markdown("---")
     c1,c2,c3 = st.columns(3)
     with c1:
@@ -268,10 +268,7 @@ def sensor_model_step(sid, idx_t, env, p, summer_boost_C):
     solar_load=0.22*irr/100.0
     rail_no=airC+solar_load+p["bias"]+np.random.normal(0,0.25)
     last=p.get("_rail_prev",rail_no); rail=0.92*last+0.08*rail_no; p["_rail_prev"]=rail
-
-    # ---- PATCH B: blended summer boost for visible effect even with low sun ----
-    if p["hotspot"]:
-        rail += summer_severity * (0.45 + 0.55 * (sun**2.2))
+    if p["hotspot"]: rail += (sun**2.2)*summer_boost_C
 
     strain=max(0.0, 0.5*(rail-32)+np.random.normal(0,0.35))
     showers=(np.random.random()<0.004); ballast=float(np.clip(0.25+0.25*max(0,-clouds)/1.5+0.15*(1.0 if showers else 0.0)+np.random.normal(0,0.04),0,1))
@@ -280,7 +277,7 @@ def sensor_model_step(sid, idx_t, env, p, summer_boost_C):
     V=float(np.clip(V+charge-drain+np.random.normal(0,0.002),10.8,13.0)); p["batt_V"]=V
 
     risk=1/(1+np.exp(-(0.20*(rail-35)+0.35*(strain-8)+0.9*(ballast-0.6)))); risk=float(np.clip(risk,0,1))
-    flags=[]
+    flags=[]; 
     if rail>=38.0: flags.append("temp")
     if strain>=10.0: flags.append("strain")
     if risk>=0.85: flags.append("risk")
@@ -303,9 +300,11 @@ if "sensor_hist" not in st.session_state:
 
 # -------------------- Cache static map layers --------------------
 @st.cache_data(show_spinner=False)
-def static_layers(SECS,route_df,use_tiles, show_hotspot_rings):
+def static_layers(SECS,route_df,use_tiles):
     step=max(1,SECS//300)
     path_coords=[[route_df.lon.iloc[i],route_df.lat.iloc[i]] for i in range(0,SECS,step)]
+    path_df=pd.DataFrame([{"path":path_coords,"name":"Sundsvall→Stockholm"}])
+    path_layer=pdk.Layer("PathLayer",data=path_df,get_path="path",get_color=[60,60,160,180],width_scale=4,width_min_pixels=3)
     bs_df=pd.DataFrame(BASE_STATIONS,columns=["name","lat","lon","r_m"])
     rings=[]
     for r in bs_df.itertuples():
@@ -317,19 +316,10 @@ def static_layers(SECS,route_df,use_tiles, show_hotspot_rings):
     rings_df=pd.DataFrame(rings)
     bs_rings=pdk.Layer("ScatterplotLayer",data=rings_df,get_position="[lon,lat]",get_radius="radius",
                        get_fill_color="color",stroked=True,get_line_color=[0,0,0,60],line_width_min_pixels=1)
-
     tile_layer=None
     if use_tiles:
         tile_layer=pdk.Layer("TileLayer",data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",min_zoom=0,max_zoom=19,tile_size=256)
-
-    hot_layer=None
-    if show_hotspot_rings:
-        hot_df=pd.DataFrame(HOTSPOTS)
-        hot_layer=pdk.Layer("ScatterplotLayer",data=hot_df,get_position='[lon,lat]',
-                            get_radius='radius_m',get_fill_color=[255,0,0,28],
-                            stroked=True,get_line_color=[200,0,0,120],line_width_min_pixels=1.5,pickable=True)
-
-    return tile_layer, bs_rings, path_coords, hot_layer
+    return tile_layer, path_layer, bs_rings, path_coords
 
 # -------------------- Tabs --------------------
 tab_map, tab_flow, tab_ops = st.tabs(["Map & KPIs","Comm Flow","Ops"])
@@ -400,7 +390,7 @@ with tab_map:
 
     with colL:
         st.subheader("Live Maps — Real World vs TMS View")
-        tile_layer, static_bs_rings, static_path_coords, hot_layer = static_layers(SECS,route_df,use_tiles, show_hotspot_rings)
+        tile_layer, static_path_layer, static_bs_rings, static_path_coords = static_layers(SECS,route_df,use_tiles)
 
         # ------ Compute frame physics/comm & sensors ------
         t=st.session_state.t_idx
@@ -410,19 +400,6 @@ with tab_map:
 
         frame=st.session_state._frame
         sensors_base = frame["sensors"][["sid","lat","lon"]].copy()
-
-        # ---- PATCH A: geographically mark sensors inside HOTSPOTS as hotspot=True ----
-        if demo_force_issues and len(sensors_base):
-            latv = sensors_base["lat"].to_numpy()
-            lonv = sensors_base["lon"].to_numpy()
-            in_any = np.zeros(len(sensors_base), dtype=bool)
-            for h in HOTSPOTS:
-                dist = haversine_vec(latv, lonv, float(h["lat"]), float(h["lon"]))
-                in_any |= (dist <= float(h["radius_m"]))
-            for i, r in enumerate(sensors_base.itertuples()):
-                sid = str(r.sid)
-                if sid in st.session_state.sensor_params:
-                    st.session_state.sensor_params[sid]["hotspot"] = bool(in_any[i])
 
         # PHY at train
         bsA,dA=serving_bs(*trainA); envA=env_class(*trainA); shadow=st.session_state.shadow
@@ -454,7 +431,7 @@ with tab_map:
         def sensor_row(r):
             sid=str(r["sid"]); idx_t=int(st.session_state.t_idx)
             env=st.session_state.env_ts; p=st.session_state.sensor_params[sid]
-            telem=sensor_model_step(sid,idx_t,env,p,summer_boost_C=summer_severity)  # summer_severity from sidebar
+            telem=sensor_model_step(sid,idx_t,env,p,summer_boost_C=summer_severity)
             score=float(telem["risk_score"])
             label="high" if score>0.75 else ("medium" if score>0.4 else "low")
             _,_,qualS=nearest_bs_quality(r.lat,r.lon); capS,lossS=cap_loss(qualS,idx_t)
@@ -585,7 +562,7 @@ with tab_map:
         badge={"GOOD":("chip-good","🟢"),"PATCHY":("chip-mid","🟠"),"POOR":("chip-bad","🔴")}[quality]
         chip_html=f"""
           <span class="kpi-chip {badge[0]}">{badge[1]} {quality}</span>
-          <span class="kpi-chip">Bearer: {st.session_state.bearer}</span>
+          <span class="kpi-chip">Bearer: {bearer}</span>
           <span class="kpi-chip">Cap: {int(cap_bps_train/1000)} kbps</span>
           <span class="kpi-chip">Lane-A succ: {laneA_success*100:.0f}%</span>
           <span class="kpi-chip">Latency: {int(lat_ms)} ms</span>
@@ -594,34 +571,21 @@ with tab_map:
         """
         with kpi_holder: st.markdown(chip_html, unsafe_allow_html=True)
 
-        # -------------------- Dynamic map layers (incl. bold per-segment heat) --------------------
+        # Build dynamic map layers
         def dynamic_layers(tsr_list,train_pos,sensors_df,quality_macro):
-            # ---- Heat: color each small path segment by nearest sensor risk (bold & opaque) ----
-            seg_rows = []
-            if isinstance(sensors_df, pd.DataFrame) and not sensors_df.empty and "label" in sensors_df.columns:
-                latv = sensors_df["lat"].to_numpy()
-                lonv = sensors_df["lon"].to_numpy()
-                path_np = np.array(static_path_coords)  # [[lon, lat], ...]
-                d2 = (path_np[:,1][:,None] - latv[None,:])**2 + (path_np[:,0][:,None] - lonv[None,:])**2
-                nearest_idx = np.argmin(d2, axis=1)
-                labels = sensors_df["label"].to_numpy()
-                col_map = {
-                    "low":    CBL["green"] + [255],
-                    "medium": CBL["orange"] + [255],
-                    "high":   CBL["red"] + [255],
-                }
-                for i in range(len(static_path_coords) - 1):
-                    lbl = str(labels[nearest_idx[i]])
-                    color = col_map.get(lbl, CBL["green"] + [255])
-                    seg_rows.append({"path":[static_path_coords[i], static_path_coords[i+1]], "color":color})
-            else:
-                for i in range(len(static_path_coords) - 1):
-                    seg_rows.append({"path":[static_path_coords[i], static_path_coords[i+1]], "color":CBL["green"]+[255]})
-            heat_df = pd.DataFrame(seg_rows)
-            heat_layer = pdk.Layer("PathLayer", data=heat_df, get_path="path", get_color="color",
-                                   width_scale=8, width_min_pixels=8, pickable=False)
+            # heat: nearest sensor risk label → color
+            if isinstance(sensors_df,pd.DataFrame) and not sensors_df.empty and "label" in sensors_df.columns:
+                latv=sensors_df["lat"].values; lonv=sensors_df["lon"].values
+                path_np=np.array(static_path_coords)
+                d2=((path_np[:,1][:,None]-latv[None,:])**2 + (path_np[:,0][:,None]-lonv[None,:])**2)
+                j=np.argmin(d2,axis=1); labels=sensors_df["label"].values[j]
+                col_map={"low":CBL["green"]+[180],"medium":CBL["orange"]+[200],"high":CBL["red"]+[220]}
+                heat=[col_map.get(lbl,CBL["green"]+[180]) for lbl in labels]
+            else: heat=[CBL["green"]+[180] for _ in static_path_coords]
+            heat_df=pd.DataFrame([{"path":static_path_coords,"colors":heat}])
+            heat_layer=pdk.Layer("PathLayer",data=heat_df,get_path="path",get_color="colors",width_scale=4,width_min_pixels=3)
 
-            # Sensors dots / labels
+            # Sensors
             vis=[]
             if isinstance(sensors_df,pd.DataFrame) and not sensors_df.empty:
                 for r in sensors_df.itertuples():
@@ -642,7 +606,7 @@ with tab_map:
                 data=[{"polygon":p["polygon"],"tooltip":f"TSR {p['speed']} km/h"} for p in tsr_list],
                 get_polygon="polygon",get_fill_color=CBL["gold"]+[80],get_line_color=CBL["gold"],line_width_min_pixels=1,pickable=True)
 
-            # Train marker + halo by macro QoS
+            # Train
             halo={"GOOD":CBL["green"]+[210],"PATCHY":CBL["orange"]+[210],"POOR":CBL["red"]+[230]}.get(quality_macro,CBL["green"]+[210])
             cur=pd.DataFrame([{"lat":train_pos[0],"lon":train_pos[1],
                                "icon_data":{"url":"https://img.icons8.com/emoji/48/train-emoji.png","width":128,"height":128,"anchorY":128}}])
@@ -652,7 +616,7 @@ with tab_map:
             return [heat_layer,sens_layer,text_layer,tsr_layer,halo_layer,icon_layer]
 
         def deck_map(tsr_list,train_pos,sensors_df,quality_macro,use_tiles):
-            base_layers=[l for l in [tile_layer, static_bs_rings, hot_layer] if l is not None]
+            base_layers=[l for l in [tile_layer,static_path_layer,static_bs_rings] if l is not None]
             dyn=dynamic_layers(tsr_list,train_pos,sensors_df,quality_macro)
             vs=pdk.ViewState(latitude=60.7, longitude=17.5, zoom=6.2)
             return pdk.Deck(layers=base_layers+dyn, initial_view_state=vs,
@@ -753,6 +717,7 @@ with tab_map:
 
     sensors = st.session_state._frame["sensors"]
     if not sensors.empty:
+        # choose default
         sid_risk=sensors.sort_values("score",ascending=False)["sid"].iloc[0]
         lat_t,lon_t=st.session_state._frame["trainA"]
         d2=((sensors["lat"]-lat_t)**2+(sensors["lon"]-lon_t)**2); sid_near=sensors.loc[d2.idxmin(),"sid"]
