@@ -1,7 +1,7 @@
-# ENSURE-6G • TMS Rail Demo — Robust per-frame builder + Sensor uplink QoS + Track heat + TSR/STOP/CRASH + Maintenance
-# Fixes: centralized _frame build BEFORE columns (no KeyError on first render), graceful fallbacks.
-# Map: deck.gl (pydeck) with optional OSM tiles; playback with frame-accurate slider.
-# Radio: PHY (SNR→PER, TTT, HO gap) + Macro capacity/loss at train *and* per-sensor uplink.
+# ENSURE-6G • TMS Rail Demo — Full (Robust + Timeline + Sensor Inspector + Legend)
+# Map: pydeck with optional OSM tiles (no flashing), robust frame builder, playback UI.
+# Comms: PHY (SNR→PER, TTT, HO gap) + Macro capacity/loss at train & per-sensor uplink.
+# Ops: Track heat, TSR/STOP/CRASH, Maintenance work orders, Per-frame arrays, Timelines, Sensor Inspector.
 
 import math, time
 import numpy as np
@@ -12,7 +12,7 @@ from shapely.geometry import LineString, Point
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="ENSURE-6G • TMS Rail (Ops-Realistic, Robust)", layout="wide")
+st.set_page_config(page_title="ENSURE-6G • TMS Rail (Full Demo)", layout="wide")
 st.title("🚆 ENSURE-6G: Raw vs Semantic vs Hybrid — Control Center (TMS)")
 
 # -------------------- Geography --------------------
@@ -218,14 +218,17 @@ with tab_map:
     if "_frame" not in st.session_state:
         st.session_state._frame = build_frame(t0)
     else:
-        # keep it roughly in sync even before right column updates it
         if st.session_state._frame.get("t") != t0:
             st.session_state._frame = build_frame(t0)
+
+    # Per-sensor history store
+    if "sensor_hist" not in st.session_state:
+        st.session_state.sensor_hist = {}  # sid -> dict of arrays (temp, strain, ballast, score, qual)
 
     # ---------------- Layout columns ----------------
     colR, colL = st.columns([1.0,2.2])
 
-    # ---------- Right: Playback & KPIs ----------
+    # ---------- Right: Playback, KPIs, Timeline, Sensor Inspector ----------
     with colR:
         st.subheader("Playback")
         c1,c2=st.columns(2)
@@ -339,8 +342,10 @@ with tab_map:
                                    ballast_hotspots=int((sensors.ballast>0.6).sum()),
                                    alerts=len(laneA_alerts), window=f"t={t}s"))
 
-        laneA_bps_uplink = len(laneA_alerts)*BYTES_ALERT
-        laneB_bps_uplink = len(laneB_msgs)*BYTES_SUM
+        laneA_bps = len(laneA_alerts)*BYTES_ALERT * (2 if (enable_dc and secondary) else 1)
+        laneB_bps = len(laneB_msgs)*BYTES_SUM
+        raw_bps = raw_bps_delivered
+        bps_total = laneA_bps + laneB_bps + raw_bps
 
         # TMS decisions: TSR / STOP & downlink
         def tsr_poly(center_lat,center_lon,length_m=1500,half_w=18):
@@ -377,6 +382,7 @@ with tab_map:
         # Downlink to Train
         _,_,qual_down = nearest_bs_quality(*trainA)
         _, rand_down = cap_loss(qual_down, t)
+        in_gap = (t < st.session_state.handover_gap_until)
         loss_down = min(0.95, rand_down + (0.30 if in_gap else 0.0))
         down_ok = (np.random.random() < (1.0 - loss_down))
         if down_ok:
@@ -398,11 +404,7 @@ with tab_map:
             if p["critical"] and (not p["ack_train"]) and point_in_poly(trainA[0],trainA[1],p["polygon"]):
                 crash=True; break
 
-        # Throughputs and latency (display)
-        laneA_bps = len(laneA_alerts)*BYTES_ALERT * (2 if (enable_dc and secondary) else 1)
-        laneB_bps = len(laneB_msgs)*BYTES_SUM
-        raw_bps = raw_bps_delivered
-        bps_total = laneA_bps + laneB_bps + raw_bps
+        # E2E latency (simple)
         lat_ms = TECH[bearer]["base_lat"] + (bps_total/1000.0)
         if bps_total>cap_bps_train: lat_ms *= min(4.0, 1.0 + 0.35*(bps_total/cap_bps_train - 1))
         if in_gap: lat_ms += 80
@@ -428,6 +430,25 @@ with tab_map:
             st.session_state.qual[t]=quality
             st.session_state.seg[t]=seg
 
+        # ---- Record per-sensor histories for this frame t ----
+        hist = st.session_state.sensor_hist
+        for r in sensors.itertuples():
+            sid = r.sid
+            if sid not in hist:
+                hist[sid] = {
+                    "temp":   np.full(SECS, np.nan),
+                    "strain": np.full(SECS, np.nan),
+                    "ballast":np.full(SECS, np.nan),
+                    "score":  np.full(SECS, np.nan),
+                    "qual":   np.array([""]*SECS, dtype=object),
+                }
+            if math.isnan(hist[sid]["temp"][t]):
+                hist[sid]["temp"][t]    = r.temp
+                hist[sid]["strain"][t]  = r.strain
+                hist[sid]["ballast"][t] = r.ballast
+                hist[sid]["score"][t]   = r.score
+                hist[sid]["qual"][t]    = r.qualS
+
         # KPI cards
         badge={"GOOD":"🟢","PATCHY":"🟠","POOR":"🔴"}[quality]
         st.metric("Segment", seg)
@@ -449,12 +470,104 @@ with tab_map:
             "enforce_stop": enforce_stop, "crash": crash, "sensors": sensors
         })
 
+        # ---------- Timeline (frame arrays) ----------
+        st.markdown("---")
+        st.subheader("Timeline (frame-synchronous)")
+        arr = st.session_state.arr
+        x = np.arange(SECS); t_cur = t
+        def series(k):
+            a = arr[k]; return [None if (isinstance(v, float) and math.isnan(v)) else v for v in a]
+
+        fig_tp = go.Figure()
+        fig_tp.add_scatter(x=x, y=series("raw_bits"),   name="RAW (bps)", mode="lines")
+        fig_tp.add_scatter(x=x, y=series("laneA_bits"), name="Lane A (bps)", mode="lines")
+        fig_tp.add_scatter(x=x, y=series("laneB_bits"), name="Lane B (bps)", mode="lines")
+        fig_tp.add_scatter(x=x, y=series("cap_bits"),   name="Capacity (bps)", mode="lines")
+        fig_tp.add_vline(x=t_cur, line_width=2, line_dash="dash", line_color="gray")
+        fig_tp.update_layout(height=260, margin=dict(l=10,r=10,t=10,b=10),
+                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+        st.plotly_chart(fig_tp, use_container_width=True, config={"displayModeBar": False})
+
+        fig_lat = go.Figure()
+        fig_lat.add_scatter(x=x, y=series("lat_ms"), name="Latency (ms)", mode="lines")
+        fig_lat.add_vline(x=t_cur, line_width=2, line_dash="dash", line_color="gray")
+        fig_lat.update_layout(height=220, margin=dict(l=10,r=10,t=10,b=10), yaxis_title="ms")
+        st.plotly_chart(fig_lat, use_container_width=True, config={"displayModeBar": False})
+
+        snr = series("snr_db")
+        succ_pct = [None if v is None else (float(v)*100.0) for v in series("laneA_succ")]
+        fig_radio = go.Figure()
+        fig_radio.add_scatter(x=x, y=snr, name="SNR (dB)", mode="lines", yaxis="y1")
+        fig_radio.add_scatter(x=x, y=succ_pct, name="Lane-A success (%)", mode="lines", yaxis="y2")
+        fig_radio.add_vline(x=t_cur, line_width=2, line_dash="dash", line_color="gray")
+        fig_radio.update_layout(height=240, margin=dict(l=10,r=10,t=10,b=10),
+                                yaxis=dict(title="SNR (dB)"),
+                                yaxis2=dict(title="Success (%)", overlaying="y", side="right",
+                                            rangemode="tozero", range=[0, 100]),
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+        st.plotly_chart(fig_radio, use_container_width=True, config={"displayModeBar": False})
+
+        # ---------- Sensor Inspector ----------
+        st.markdown("---")
+        st.subheader("Sensor Inspector")
+        sensor_choices = [r.sid for r in sensors.itertuples()]
+        if "sensor_selected" not in st.session_state and sensor_choices:
+            st.session_state.sensor_selected = sensor_choices[0]
+        col_si1, col_si2 = st.columns([2,1])
+        selected = col_si1.selectbox("Select a sensor", sensor_choices,
+                                     index=sensor_choices.index(st.session_state.sensor_selected) if sensor_choices else 0)
+        def nearest_sensor_to(lat, lon):
+            if len(sensors)==0: return None
+            d = ((sensors.lat-lat)**2 + (sensors.lon-lon)**2)**0.5
+            j = int(np.argmin(d)); return sensors.iloc[j].sid
+        if col_si2.button("📍 Nearest to train"):
+            nsid = nearest_sensor_to(trainA[0], trainA[1])
+            if nsid: selected = nsid
+        st.session_state.sensor_selected = selected
+
+        # Per-sensor plots
+        sh = st.session_state.sensor_hist; sid = st.session_state.sensor_selected
+        if sid not in sh:
+            st.info("No samples recorded yet — press ▶ Simulate.")
+        else:
+            def clean(a): return [None if (isinstance(v,float) and math.isnan(v)) else v for v in a]
+            def last_valid(arr, upto):
+                for i in range(upto, -1, -1):
+                    v = arr[i]
+                    if isinstance(v,float) and math.isnan(v): continue
+                    return v
+                return None
+            cur_temp   = last_valid(sh[sid]["temp"], t)
+            cur_strain = last_valid(sh[sid]["strain"], t)
+            cur_ball   = last_valid(sh[sid]["ballast"], t)
+            cur_score  = last_valid(sh[sid]["score"], t)
+            cur_qual   = last_valid(sh[sid]["qual"], t) or "?"
+            cols = st.columns(3)
+            cols[0].metric(f"{sid} temp (°C)",   f"{cur_temp if cur_temp is not None else '–'}")
+            cols[1].metric(f"{sid} strain (kN)", f"{cur_strain if cur_strain is not None else '–'}")
+            cols[2].metric(f"{sid} ballast idx", f"{cur_ball if cur_ball is not None else '–'}")
+            st.caption(f"Uplink quality: **{cur_qual}** | Risk score: **{cur_score if cur_score is not None else '–'}**")
+
+            x = np.arange(SECS)
+            fig_ts = go.Figure()
+            fig_ts.add_scatter(x=x, y=clean(sh[sid]["temp"]),   name="temp (°C)", mode="lines")
+            fig_ts.add_scatter(x=x, y=clean(sh[sid]["strain"]), name="strain (kN)", mode="lines")
+            fig_ts.add_vline(x=t, line_width=2, line_dash="dash", line_color="gray")
+            fig_ts.update_layout(height=240, margin=dict(l=10,r=10,t=10,b=10), legend=dict(orientation="h", y=1.02))
+            st.plotly_chart(fig_ts, use_container_width=True, config={"displayModeBar": False})
+
+            fig_br = go.Figure()
+            fig_br.add_scatter(x=x, y=clean(sh[sid]["ballast"]), name="ballast idx", mode="lines")
+            fig_br.add_scatter(x=x, y=clean(sh[sid]["score"]),   name="risk score", mode="lines")
+            fig_br.add_vline(x=t, line_width=2, line_dash="dash", line_color="gray")
+            fig_br.update_layout(height=220, margin=dict(l=10,r=10,t=10,b=10), legend=dict(orientation="h", y=1.02))
+            st.plotly_chart(fig_br, use_container_width=True, config={"displayModeBar": False})
+
     # ---------------- Left: Map panel ----------------
     with colL:
         st.subheader("Live Map (heat, TSR, QoS)")
         f = st.session_state.get("_frame")
         if not f or "t" not in f:
-            # final fallback (shouldn't trigger now, but keeps things bulletproof)
             t = st.session_state.get("t_idx", 0)
             trainA = (float(route_df.lat.iloc[t]), float(route_df.lon.iloc[t]))
             sensors = pd.DataFrame([{"lat":trainA[0], "lon":trainA[1], "label":"low", "qualS":"GOOD"}])
@@ -463,7 +576,7 @@ with tab_map:
             t = f["t"]; trainA = f["trainA"]; sensors = f["sensors"]
             enforce_stop=f["enforce_stop"]; crash=f["crash"]; quality=f["quality"]
 
-        # Track heat by risk (nearest sensor)
+        # Track heat by nearest-sensor risk
         step = max(1, SECS//300)
         path_coords = [[route_df.lon.iloc[i], route_df.lat.iloc[i]] for i in range(0, SECS, step)]
         def near_sensor_risk(lat,lon):
@@ -489,11 +602,11 @@ with tab_map:
         sens_df = []
         if "qualS" in sensors.columns:
             for r in sensors.itertuples():
-                sens_df.append({"lon":r.lon, "lat":r.lat,
+                sens_df.append({"sid":r.sid, "lon":r.lon, "lat":r.lat,
                                 "color": qcol.get(r.qualS, [150,150,150,200]),
                                 "tooltip": f"{getattr(r,'sid','S?')} • {getattr(r,'label','low')} • uplink {getattr(r,'qualS','?')}"})
         else:
-            sens_df.append({"lon":trainA[1], "lat":trainA[0], "color":[0,170,0,230], "tooltip":"sensor"})
+            sens_df.append({"sid":"S00","lon":trainA[1], "lat":trainA[0], "color":[0,170,0,230], "tooltip":"sensor"})
         sens_df = pd.DataFrame(sens_df)
         sens_layer = pdk.Layer("ScatterplotLayer", data=sens_df, get_position='[lon, lat]',
                                get_fill_color='color', get_radius=2000, pickable=True)
@@ -517,8 +630,19 @@ with tab_map:
         train_icon_layer = pdk.Layer("IconLayer", data=cur, get_position='[lon, lat]',
                                      get_icon='icon_data', get_size=4, size_scale=15)
 
+        # Highlight selected sensor on map
+        sid_sel = st.session_state.get("sensor_selected", None)
+        sel_layer = None
+        if sid_sel and "sid" in sens_df.columns and len(sens_df[sens_df["sid"]==sid_sel])>0:
+            sel = sens_df[sens_df["sid"]==sid_sel].iloc[0]
+            sel_pt = pd.DataFrame([{"lon": float(sel["lon"]), "lat": float(sel["lat"])}])
+            sel_layer = pdk.Layer("ScatterplotLayer", data=sel_pt, get_position='[lon, lat]',
+                                  get_fill_color=[0,0,0,0], get_radius=4500,
+                                  stroked=True, get_line_color=[0,0,0], line_width_min_pixels=2)
+
         # OSM tiles (optional)
         layers=[path_layer, bs_cov_layer, bs_dot_layer, sens_layer, tsr_layer, halo_layer, train_icon_layer]
+        if sel_layer: layers.append(sel_layer)
         if use_tiles:
             tile_layer = pdk.Layer("TileLayer", data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
                                    min_zoom=0, max_zoom=19, tile_size=256)
@@ -528,6 +652,35 @@ with tab_map:
                         map_style=None if not use_tiles else "light", layers=layers,
                         tooltip={"html":"<b>{tooltip}</b>","style":{"color":"white"}})
         st.pydeck_chart(deck, use_container_width=True, height=560)
+
+        # ---- Mini legend ----------------------------------------------------
+        st.markdown(
+            """
+            <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-top:6px;">
+              <div><span style="display:inline-block;width:12px;height:12px;background:#00AA00;border-radius:2px;margin-right:6px;"></span>
+                   Track risk: <b>Low</b></div>
+              <div><span style="display:inline-block;width:12px;height:12px;background:#FFA500;border-radius:2px;margin-right:6px;"></span>
+                   Track risk: <b>Medium</b></div>
+              <div><span style="display:inline-block;width:12px;height:12px;background:#DC0000;border-radius:2px;margin-right:6px;"></span>
+                   Track risk: <b>High</b></div>
+              <div style="margin-left:12px;"><span style="display:inline-block;width:12px;height:12px;background:#00960066;border:1px solid #009600;margin-right:6px;"></span>
+                   BS coverage: <b>GOOD</b> radius</div>
+              <div><span style="display:inline-block;width:12px;height:12px;background:#00AA00;border-radius:50%;margin-right:6px;"></span>
+                   Sensor uplink: <b>GOOD</b></div>
+              <div><span style="display:inline-block;width:12px;height:12px;background:#FFA500;border-radius:50%;margin-right:6px;"></span>
+                   Sensor uplink: <b>PATCHY</b></div>
+              <div><span style="display:inline-block;width:12px;height:12px;background:#C80000;border-radius:50%;margin-right:6px;"></span>
+                   Sensor uplink: <b>POOR</b></div>
+              <div><span style="display:inline-block;width:12px;height:12px;background:#FFD70066;border:1px solid #FFD700;margin-right:6px;"></span>
+                   <b>TSR</b> polygon</div>
+              <div><span style="display:inline-block;width:12px;height:12px;background:#999;border-radius:50%;margin-right:6px;"></span>
+                   Train halo: <b>STOP</b></div>
+              <div><span style="display:inline-block;width:12px;height:12px;background:#C00;border-radius:50%;margin-right:6px;"></span>
+                   Train halo: <b>CRASH risk</b></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.caption("Track heat shows risk (green→OK, orange/red→summer hotspots). Sensor pins show **uplink** quality. Yellow=TSR. Halo gray=STOP, red=CRASH risk.")
 
 # ---------------- Comm Flow tab ----------------
