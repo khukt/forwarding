@@ -294,17 +294,14 @@ with tab_map:
         bsA, dA = serving_bs(*trainA)
         envA = env_class(*trainA)
         shadow = st.session_state.shadow
-        TECH_ORDER = ["5G","LTE","3G","GSMR"]
-        TECH_SPEC = {k:TECH[k] for k in TECH_ORDER}
-        def noise_dbm(bw_hz): return -174 + 10*np.log10(bw_hz) + 5
         snr_table={}
-        for b in TECH_ORDER:
+        for b in ["5G","LTE","3G","GSMR"]:
             if b in bsA["tech"]:
-                pl = pathloss_db(TECH_SPEC[b]["freq"], dA, envA)
+                pl = pathloss_db(TECH[b]["freq"], dA, envA)
                 sh = shadow.sample(s_along)
                 fad = rician_db(8) if envA=="RMa" else rayleigh_db()
                 rx = P_TX - pl + sh + fad
-                snr_table[b] = rx - noise_dbm(TECH_SPEC[b]["bw"])
+                snr_table[b] = rx - noise_dbm(TECH[b]["bw"])
 
         cand, valid = pick_bearer(snr_table, bsA["tech"], st.session_state.bearer)
         if valid and cand != st.session_state.bearer:
@@ -359,6 +356,10 @@ with tab_map:
         S = S.drop(columns=["lat","lon"], errors="ignore")   # avoid duplicate names
         sensors = pd.concat([sensors, S], axis=1)
 
+        # (Optional) quick sanity check for duplicate columns
+        # dups = sensors.columns[sensors.columns.duplicated()]
+        # assert len(dups)==0, f"Duplicate columns: {list(dups)}"
+
         # Segment tags for sensors
         seg_list=[]; seg_idx=[]
         for r in sensors.itertuples():
@@ -367,11 +368,14 @@ with tab_map:
         sensors["segment"] = seg_list
         sensors["_seg_idx"]= seg_idx
 
-        # Modality decision
+        # --- Modality decision (SAFE: scalarize to avoid ambiguous truth values) ---
         def choose_modality(r):
-            if r.qualS == "POOR" or r.capS < 100_000:  # <100 kbps
+            qual  = str(r["qualS"])
+            cap   = float(r["capS"])
+            score = float(r["score"])
+            if (qual == "POOR") or (cap < 100_000):          # <100 kbps
                 return "SEMANTIC"
-            if r.qualS == "GOOD" and r.score < 0.4 and r.capS > 400_000:
+            if (qual == "GOOD") and (score < 0.4) and (cap > 400_000):
                 return "RAW"
             return "HYBRID"
         sensors["modality"] = sensors.apply(choose_modality, axis=1)
@@ -475,7 +479,7 @@ with tab_map:
         for p in st.session_state.tsr_polys_tms:
             if point_in_poly(trainA[0], trainA[1], p["polygon"]):
                 tsr_kmh_here = p["speed"] if tsr_kmh_here is None else min(tsr_kmh_here, p["speed"])
-        v_target = 0.0 if enforce_stop else (tsr_kmh_here/3.6 if tsr_kmh_here is not None else 200/3.6)
+        v_target = 0.0 if enforce_stop else (tsr_kmh_here/3.6 if tsr_kmh_here is not None else V_MAX_MS)
 
         # Kinematics
         v_cur = st.session_state.train_v_ms
