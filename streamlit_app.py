@@ -119,6 +119,10 @@ if "route_secs" not in st.session_state or st.session_state.route_secs != SECS:
     st.session_state.route_df = interpolate_polyline(RAIL_WAYPOINTS, SECS)
     st.session_state.seg_labels = label_segments(SECS)
     st.session_state.route_secs = SECS
+    # PATCH #1: clear frame + sensor history when SECS changes
+    st.session_state.pop("_frame", None)
+    st.session_state.pop("sensor_hist", None)
+
 if "t_idx" not in st.session_state: st.session_state.t_idx = 0
 if "playing" not in st.session_state: st.session_state.playing = False
 
@@ -213,13 +217,15 @@ with tab_map:
                     quality=quality, cap_bps=cap_bps, rand_loss=rand_loss,
                     enforce_stop=False, crash=False, sensors=sensors)
 
-    # Make sure _frame exists before columns render
+    # PATCH #2: Make sure _frame exists and has sensors before columns render
     t0 = st.session_state.get("t_idx", 0)
-    if "_frame" not in st.session_state:
+    frame_ok = ("_frame" in st.session_state
+                and isinstance(st.session_state._frame, dict)
+                and st.session_state._frame.get("t") == t0
+                and isinstance(st.session_state._frame.get("sensors"), pd.DataFrame)
+                and not st.session_state._frame["sensors"].empty)
+    if not frame_ok:
         st.session_state._frame = build_frame(t0)
-    else:
-        if st.session_state._frame.get("t") != t0:
-            st.session_state._frame = build_frame(t0)
 
     # Per-sensor history store
     if "sensor_hist" not in st.session_state:
@@ -250,8 +256,18 @@ with tab_map:
         t_nb=(len(route_df)-1-t)%len(route_df); trainB=(float(route_df.lat.iloc[t_nb]), float(route_df.lon.iloc[t_nb]))
         seg = seg_labels[t]; s_along=float(route_df.s_m.iloc[t])
 
-        # Sensor grid (22 along route)
-        sensors = st.session_state._frame["sensors"].copy()
+        # PATCH #3: Defensive sensors access with fallback
+        frame = st.session_state.get("_frame", {})
+        if isinstance(frame.get("sensors"), pd.DataFrame) and not frame["sensors"].empty:
+            sensors = frame["sensors"].copy()
+        else:
+            N_SENS = 22
+            sidx = np.linspace(0, len(route_df)-1, N_SENS).astype(int)
+            sensors = pd.DataFrame([{
+                "sid": f"S{i:02d}",
+                "lat": float(route_df.lat.iloc[j]),
+                "lon": float(route_df.lon.iloc[j]),
+            } for i, j in enumerate(sidx)])
 
         # PHY at train
         bsA, dA = serving_bs(*trainA)
@@ -280,8 +296,6 @@ with tab_map:
         bearer = st.session_state.bearer
         snr_use = snr_table.get(bearer,-20.0)
         per_single = per_from_snr(snr_use)
-        lat_ms_phy = TECH[bearer]["base_lat"]
-
         secondary = pick_secondary(bearer, snr_table, dc_min_snr_delta) if enable_dc else None
         per_secondary = per_from_snr(snr_table.get(secondary,-20.0)) if secondary else None
         laneA_success_phy = ((1-per_single)**laneA_reps) if not secondary else 1-((1-(1-per_single)**laneA_reps)*(1-(1-per_secondary)**laneA_reps))
@@ -290,7 +304,6 @@ with tab_map:
         bs_macro_name, bs_macro_dist, quality = nearest_bs_quality(*trainA)
         cap_bps_train, rand_loss = cap_loss(quality, t)
         in_gap = (t < st.session_state.handover_gap_until)
-        gap_loss = 0.30 if in_gap else 0.0
 
         # Sensors: risk + uplink QoS
         def sensor_row(r):
@@ -382,7 +395,6 @@ with tab_map:
         # Downlink to Train
         _,_,qual_down = nearest_bs_quality(*trainA)
         _, rand_down = cap_loss(qual_down, t)
-        in_gap = (t < st.session_state.handover_gap_until)
         loss_down = min(0.95, rand_down + (0.30 if in_gap else 0.0))
         down_ok = (np.random.random() < (1.0 - loss_down))
         if down_ok:
@@ -430,7 +442,7 @@ with tab_map:
             st.session_state.qual[t]=quality
             st.session_state.seg[t]=seg
 
-        # ---- Record per-sensor histories for this frame t ----
+        # Per-sensor histories for this frame t
         hist = st.session_state.sensor_hist
         for r in sensors.itertuples():
             sid = r.sid
@@ -461,16 +473,16 @@ with tab_map:
         st.metric("LaneA success (PHY/DC) %", f"{(laneA_success*100):.1f}")
         st.metric("E2E latency (ms)", int(lat_ms))
         if enforce_stop: st.error("STOP enforced")
-        if crash: st.error("🚨 CRASH: critical TSR entered without alert delivery!")
+        if crash: st.error("🚨 CRASH: critical TSR entered without receiving alert. **CRASH** triggered.")
 
-        # ---- Update shared frame so the map ALWAYS has complete data ----
+        # Update _frame for the map
         st.session_state._frame.update({
             "t": t, "trainA": trainA, "trainB": trainB, "segment": seg,
             "quality": quality, "cap_bps": cap_bps_train, "rand_loss": rand_loss,
             "enforce_stop": enforce_stop, "crash": crash, "sensors": sensors
         })
 
-        # ---------- Timeline (frame arrays) ----------
+        # ---------- Timeline ----------
         st.markdown("---")
         st.subheader("Timeline (frame-synchronous)")
         arr = st.session_state.arr
