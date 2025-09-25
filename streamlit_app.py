@@ -1,4 +1,5 @@
-# ENSURE-6G • TMS Rail Demo — Full (Issues + Modality + Kinematics)
+# ENSURE-6G • TMS Rail Demo — Full (Vectorized Hotspots + Issues + Modality + Kinematics)
+# - Vectorized hotspot distance (fixes TypeError from pandas apply)
 # - Sensors visible (size, outline, labels)
 # - Adaptive uplink: RAW/HYBRID/SEMANTIC per sensor
 # - Demo hotspots + forced TSR so issues always show
@@ -28,6 +29,15 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(lat1*p)*math.cos(lat2*p)*math.sin(dlon/2)**2
     return 2*R_EARTH*math.asin(min(1.0, math.sqrt(a)))
 
+def haversine_vec(lat1, lon1, lat2, lon2):
+    """Vectorized haversine: lat1, lon1 arrays; lat2, lon2 scalars."""
+    lat1 = np.asarray(lat1, dtype=float); lon1 = np.asarray(lon1, dtype=float)
+    p = np.pi / 180.0
+    dlat = (lat2 - lat1) * p
+    dlon = (lon2 - lon1) * p
+    a = np.sin(dlat/2)**2 + np.cos(lat1*p) * np.cos(lat2*p) * np.sin(dlon/2)**2
+    return 2 * R_EARTH * np.arcsin(np.minimum(1.0, np.sqrt(a)))
+
 RAIL_WAYPOINTS = [
     (62.3930,17.3070),(62.1200,17.1500),(61.8600,17.1400),(61.7300,17.1100),
     (61.5600,17.0800),(61.3900,17.0700),(61.3000,17.0600),(61.0700,17.1000),
@@ -49,8 +59,8 @@ BASE_STATIONS = [
 
 # Fixed demo hotspots to ensure visible issues
 HOTSPOTS = [
-    dict(name="Hudiksvall cut", lat=61.728,  lon=17.103, radius_m=12000),
-    dict(name="Gävle marsh",    lat=60.675,  lon=17.141, radius_m=15000),
+    dict(name="Hudiksvall cut", lat=61.728,  lon=17.103,  radius_m=12000),
+    dict(name="Gävle marsh",    lat=60.675,  lon=17.141,  radius_m=15000),
     dict(name="Uppsala bend",   lat=59.8586, lon=17.6389, radius_m=12000),
 ]
 
@@ -141,7 +151,6 @@ if "route_secs" not in st.session_state or st.session_state.route_secs != SECS:
     st.session_state.route_df = interpolate_polyline(RAIL_WAYPOINTS, SECS)
     st.session_state.seg_labels = label_segments(SECS)
     st.session_state.route_secs = SECS
-    # clear frame + sensor history when SECS changes
     st.session_state.pop("_frame", None)
     st.session_state.pop("sensor_hist", None)
 
@@ -447,15 +456,20 @@ with tab_map:
             st.session_state.work_orders.append(dict(polygon=p["polygon"], created_idx=t,
                                                      status="Dispatched", eta_done_idx=t+repair_time_s))
 
-        # --- Demo: force TSRs from hotspots even if alerts/downlink fail ---
-        if demo_force_issues and always_show_tsr:
+        # --- Demo: force TSRs from hotspots even if alerts/downlink fail (vectorized) ---
+        if demo_force_issues and always_show_tsr and len(sensors) > 0:
+            latv = sensors["lat"].astype(float).values
+            lonv = sensors["lon"].astype(float).values
             for h in HOTSPOTS:
-                in_hot = sensors.apply(lambda r: haversine_m(r.lat, r.lon, h["lat"], h["lon"]) <= h["radius_m"], axis=1)
-                if in_hot.any():
-                    s_hot = sensors[in_hot].sort_values("score", ascending=False).iloc[0]
+                dist_m = haversine_vec(latv, lonv, float(h["lat"]), float(h["lon"]))
+                in_hot = dist_m <= float(h["radius_m"])
+                if np.any(in_hot):
+                    s_hot = sensors.loc[in_hot].sort_values("score", ascending=False).iloc[0]
                     poly = tsr_poly(float(s_hot.lat), float(s_hot.lon))
-                    st.session_state.tsr_polys.append(dict(polygon=poly, speed=tsr_speed_kmh, created_idx=t,
-                                                           critical=True, ack_train=True, stop=(s_hot.score > 0.92)))
+                    st.session_state.tsr_polys.append(dict(
+                        polygon=poly, speed=tsr_speed_kmh, created_idx=t,
+                        critical=True, ack_train=True, stop=(s_hot.score > 0.92)
+                    ))
 
         # Downlink to Train (ack TSRs)
         _,_,qual_down = nearest_bs_quality(*trainA)
