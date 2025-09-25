@@ -1,5 +1,4 @@
-# ENSURE-6G • TMS Rail Demo — Integrated Telemetry + Sensor Inspector + Optimized UI
-# (No CSVs; per-sensor time series generated live)
+# ENSURE-6G • TMS Rail Demo — Live Telemetry + Sensor Inspector + Per-segment Risk Coloring
 
 import math, numpy as np, pandas as pd, streamlit as st, pydeck as pdk
 from shapely.geometry import LineString, Point
@@ -571,21 +570,34 @@ with tab_map:
         """
         with kpi_holder: st.markdown(chip_html, unsafe_allow_html=True)
 
-        # Build dynamic map layers
+        # -------------------- Dynamic map layers (includes per-segment heat) --------------------
         def dynamic_layers(tsr_list,train_pos,sensors_df,quality_macro):
-            # heat: nearest sensor risk label → color
-            if isinstance(sensors_df,pd.DataFrame) and not sensors_df.empty and "label" in sensors_df.columns:
-                latv=sensors_df["lat"].values; lonv=sensors_df["lon"].values
-                path_np=np.array(static_path_coords)
-                d2=((path_np[:,1][:,None]-latv[None,:])**2 + (path_np[:,0][:,None]-lonv[None,:])**2)
-                j=np.argmin(d2,axis=1); labels=sensors_df["label"].values[j]
-                col_map={"low":CBL["green"]+[180],"medium":CBL["orange"]+[200],"high":CBL["red"]+[220]}
-                heat=[col_map.get(lbl,CBL["green"]+[180]) for lbl in labels]
-            else: heat=[CBL["green"]+[180] for _ in static_path_coords]
-            heat_df=pd.DataFrame([{"path":static_path_coords,"colors":heat}])
-            heat_layer=pdk.Layer("PathLayer",data=heat_df,get_path="path",get_color="colors",width_scale=4,width_min_pixels=3)
+            # ---- Heat: color each small path segment by nearest sensor risk ----
+            seg_rows = []
+            if isinstance(sensors_df, pd.DataFrame) and not sensors_df.empty and "label" in sensors_df.columns:
+                latv = sensors_df["lat"].to_numpy()
+                lonv = sensors_df["lon"].to_numpy()
+                path_np = np.array(static_path_coords)  # [[lon, lat], ...]
+                d2 = (path_np[:,1][:,None] - latv[None,:])**2 + (path_np[:,0][:,None] - lonv[None,:])**2
+                nearest_idx = np.argmin(d2, axis=1)
+                labels = sensors_df["label"].to_numpy()
+                col_map = {
+                    "low":    CBL["green"] + [200],
+                    "medium": CBL["orange"] + [220],
+                    "high":   CBL["red"] + [240],
+                }
+                for i in range(len(static_path_coords) - 1):
+                    lbl = str(labels[nearest_idx[i]])
+                    color = col_map.get(lbl, CBL["green"] + [200])
+                    seg_rows.append({"path":[static_path_coords[i], static_path_coords[i+1]], "color":color})
+            else:
+                for i in range(len(static_path_coords) - 1):
+                    seg_rows.append({"path":[static_path_coords[i], static_path_coords[i+1]], "color":CBL["green"]+[180]})
+            heat_df = pd.DataFrame(seg_rows)
+            heat_layer = pdk.Layer("PathLayer", data=heat_df, get_path="path", get_color="color",
+                                   width_scale=6, width_min_pixels=6, pickable=False)
 
-            # Sensors
+            # Sensors dots / labels
             vis=[]
             if isinstance(sensors_df,pd.DataFrame) and not sensors_df.empty:
                 for r in sensors_df.itertuples():
@@ -606,7 +618,7 @@ with tab_map:
                 data=[{"polygon":p["polygon"],"tooltip":f"TSR {p['speed']} km/h"} for p in tsr_list],
                 get_polygon="polygon",get_fill_color=CBL["gold"]+[80],get_line_color=CBL["gold"],line_width_min_pixels=1,pickable=True)
 
-            # Train
+            # Train marker + halo by macro QoS
             halo={"GOOD":CBL["green"]+[210],"PATCHY":CBL["orange"]+[210],"POOR":CBL["red"]+[230]}.get(quality_macro,CBL["green"]+[210])
             cur=pd.DataFrame([{"lat":train_pos[0],"lon":train_pos[1],
                                "icon_data":{"url":"https://img.icons8.com/emoji/48/train-emoji.png","width":128,"height":128,"anchorY":128}}])
@@ -616,7 +628,7 @@ with tab_map:
             return [heat_layer,sens_layer,text_layer,tsr_layer,halo_layer,icon_layer]
 
         def deck_map(tsr_list,train_pos,sensors_df,quality_macro,use_tiles):
-            base_layers=[l for l in [tile_layer,static_path_layer,static_bs_rings] if l is not None]
+            base_layers=[l for l in [tile_layer, static_bs_rings] if l is not None]  # (drop the old single-color path layer)
             dyn=dynamic_layers(tsr_list,train_pos,sensors_df,quality_macro)
             vs=pdk.ViewState(latitude=60.7, longitude=17.5, zoom=6.2)
             return pdk.Deck(layers=base_layers+dyn, initial_view_state=vs,
@@ -717,7 +729,6 @@ with tab_map:
 
     sensors = st.session_state._frame["sensors"]
     if not sensors.empty:
-        # choose default
         sid_risk=sensors.sort_values("score",ascending=False)["sid"].iloc[0]
         lat_t,lon_t=st.session_state._frame["trainA"]
         d2=((sensors["lat"]-lat_t)**2+(sensors["lon"]-lon_t)**2); sid_near=sensors.loc[d2.idxmin(),"sid"]
@@ -814,6 +825,7 @@ with tab_flow:
 with tab_ops:
     st.subheader("Maintenance & Incidents")
     t=st.session_state.t_idx
+    # Resolve completed work orders
     for w in st.session_state.work_orders:
         if w["status"]=="Dispatched" and t>=w["eta_done_idx"]: w["status"]="Resolved"
     resolved={tuple(map(tuple,w["polygon"])) for w in st.session_state.work_orders if w["status"]=="Resolved"}
