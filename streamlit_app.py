@@ -37,7 +37,7 @@ RAIL_WAYPOINTS = [
     (59.4200,18.0600),(59.3700,18.0700),(59.3293,18.0686),
 ]
 
-# name, lat, lon, radius_of_good_service_m
+# Macro BS grid: (name, lat, lon, radius_of_good_service_m)
 BASE_STATIONS = [
     ("BS-Sundsvall",62.386,17.325,16000),("BS-Njurunda",62.275,17.354,14000),
     ("BS-Harmånger",61.897,17.170,14000),("BS-Hudiksvall",61.728,17.103,15000),
@@ -48,25 +48,38 @@ BASE_STATIONS = [
 ]
 
 def interpolate_polyline(points, n_pts):
-    """Resample a polyline to n_pts evenly spaced by arc length."""
+    """
+    Resample a polyline to n_pts evenly spaced by arc length.
+    Returns DataFrame(lat, lon, s_m).
+    """
+    n_pts = max(2, int(n_pts))  # need at least 2 samples
     lat = np.array([p[0] for p in points], dtype=float)
     lon = np.array([p[1] for p in points], dtype=float)
-    seg = np.zeros(len(points), dtype=float)
+
+    # cumulative distances per vertex
+    cum = np.zeros(len(points), dtype=float)
     for i in range(1, len(points)):
-        seg[i] = haversine_m(lat[i-1], lon[i-1], lat[i], lon[i])
-    cum = np.cumsum(seg)
+        cum[i] = cum[i-1] + haversine_m(lat[i-1], lon[i-1], lat[i], lon[i])
+
     total = float(cum[-1])
     if total <= 0:
-        return pd.DataFrame({"lat":[lat[0]], "lon":[lon[0]], "s_m":[0.0]})
-    tgt = np.linspace(0.0, total, int(n_pts))
+        return pd.DataFrame({"lat":[lat[0]]*n_pts, "lon":[lon[0]]*n_pts, "s_m":np.linspace(0,0,n_pts)})
+
+    tgt = np.linspace(0.0, total, n_pts)
+
+    # search bins; clamp to [1, len(cum)-1] so i0>=0 and i1<=len(cum)-1
     idx = np.searchsorted(cum, tgt, side="right")
-    idx[idx==0] = 1
-    i0 = idx-1; i1 = idx
-    d0 = cum[i0]; d1 = cum[i1]
-    w = np.divide(tgt - d0, np.maximum(d1-d0, 1e-9))
-    latp = lat[i0] + (lat[i1]-lat[i0])*w
-    lonp = lon[i0] + (lon[i1]-lon[i0])*w
-    return pd.DataFrame({"lat":latp, "lon":lonp, "s_m":tgt})
+    idx = np.clip(idx, 1, len(cum)-1)
+
+    i0 = idx - 1
+    i1 = idx
+    d0 = cum[i0]
+    d1 = cum[i1]
+    w = (tgt - d0) / np.maximum(d1 - d0, 1e-9)  # avoid divide-by-zero
+
+    latp = lat[i0] + (lat[i1] - lat[i0]) * w
+    lonp = lon[i0] + (lon[i1] - lon[i0]) * w
+    return pd.DataFrame({"lat": latp, "lon": lonp, "s_m": tgt})
 
 def label_segments(route_len_sec):
     SEG_NAMES = ["Sundsvall→Hudiksvall","Hudiksvall→Söderhamn","Söderhamn→Gävle","Gävle→Uppsala","Uppsala→Stockholm"]
@@ -136,9 +149,9 @@ if "bearer" not in st.session_state: st.session_state.bearer = "5G"
 if "bearer_prev" not in st.session_state: st.session_state.bearer_prev = "5G"
 if "bearer_ttt" not in st.session_state: st.session_state.bearer_ttt = 0.0
 
-# Build route once (one sample per sim-second)
-if "route_df" not in st.session_state or st.session_state.get("route_secs") != int(sim_minutes_total*60):
-    SECS = int(sim_minutes_total * 60)
+# Build route once (one sample per sim-second) — with guard
+SECS = max(2, int(sim_minutes_total * 60))
+if ("route_df" not in st.session_state) or (st.session_state.get("route_secs") != SECS):
     st.session_state.route_df = interpolate_polyline(RAIL_WAYPOINTS, SECS)
     st.session_state.seg_labels = label_segments(SECS)
     st.session_state.route_secs = SECS
@@ -158,10 +171,16 @@ if st.session_state.t_sim > sim_minutes_total*60:
     st.session_state.t_sim = 0.0
 
 # =================== Train positions (from route_df) ===================
-idx = int(st.session_state.t_sim) % len(route_df)
-trainA = (float(route_df.lat.iloc[idx]), float(route_df.lon.iloc[idx]))
-idx_nb = (len(route_df) - idx) % len(route_df)
-trainB = (float(route_df.lat.iloc[idx_nb]), float(route_df.lon.iloc[idx_nb]))
+# Convert speed to index advance per second relative to route length (uniform sampling).
+# We already sampled evenly in arc-length: 1 index ≈ equal meters. We'll move 1 idx/sec at 1x baseline.
+# To reflect train_speed_kmh, scale step factor (baseline 140 km/h = 1 idx/sec).
+baseline_kmh = 140.0
+speed_factor = max(0.1, float(train_speed_kmh) / baseline_kmh)
+t_idx = int(st.session_state.t_sim * speed_factor) % len(route_df)
+
+trainA = (float(route_df.lat.iloc[t_idx]), float(route_df.lon.iloc[t_idx]))
+t_idx_nb = (len(route_df) - t_idx) % len(route_df)
+trainB = (float(route_df.lat.iloc[t_idx_nb]), float(route_df.lon.iloc[t_idx_nb]))
 segment_name = seg_labels[int(st.session_state.t_sim) % len(seg_labels)]
 
 # =================== PHY model (SNR→PER, handover) ===================
@@ -215,11 +234,10 @@ TECH = {
 P_TX = 43  # dBm
 
 def serving_bs(lat, lon):
-    # nearest site from hard-coded grid
+    # nearest site from hard-coded grid; assume all techs available
     dists = [haversine_m(lat, lon, b[1], b[2]) for b in BASE_STATIONS]
     i = int(np.argmin(dists))
-    # full capabilities everywhere for simplicity
-    caps = {"5G","LTE","3G","GSMR"} if BASE_STATIONS[i][0] != "BS-Mid-South" else {"LTE","3G","GSMR"}
+    caps = {"5G","LTE","3G","GSMR"}
     return dict(name=BASE_STATIONS[i][0], lat=BASE_STATIONS[i][1], lon=BASE_STATIONS[i][2], tech=caps), dists[i]
 
 def per_from_snr(snr_db):
@@ -241,8 +259,7 @@ def pick_bearer(snr_table, caps, curr_bearer):
 # SNR table at Train A
 bsA, dA = serving_bs(*trainA)
 envA = env_class(*trainA)
-# use route_df.s_m for correlated shadowing
-s_along = float(route_df.s_m.iloc[idx])
+s_along = float(route_df.s_m.iloc[t_idx])  # correlated shadowing by arc-length
 snr_table = {}
 for b in ["5G","LTE","3G","GSMR"]:
     if b in bsA["tech"]:
@@ -277,17 +294,15 @@ badge = {"GOOD":"🟢","PATCHY":"🟠","POOR":"🔴"}[quality]
 RAW_HZ, HYB_HZ = 2.0, 0.2
 BYTES_RAW, BYTES_ALERT, BYTES_SUM = 24, 280, 180
 
-# sensors (synthetic) and Lane A/B messages
 def synth_sensors(t_sec):
     base = 24 + 10*math.sin(2*math.pi*((t_sec/60)%1440)/1440)
     data = []
-    # place 22 sensors evenly along route_df
+    # 22 sensors placed along the route
     N_SENS = 22
     idxs = np.linspace(0, len(route_df)-1, N_SENS).astype(int)
     for i, j in enumerate(idxs):
         la, lo = float(route_df.lat.iloc[j]), float(route_df.lon.iloc[j])
-        # risk hotspot near Gävle
-        d_risk = haversine_m(la, lo, 60.6749, 17.1413)
+        d_risk = haversine_m(la, lo, 60.6749, 17.1413)  # hotspot near Gävle
         boost = max(0, 1 - d_risk/15000) * 14
         temp = base + np.random.normal(0,0.6) + boost
         strain = max(0.0, (temp-35)*0.8 + np.random.normal(0,0.5))
@@ -359,15 +374,16 @@ with col1:
 
     view_state = pdk.ViewState(latitude=60.1, longitude=17.7, zoom=6)
 
-    # Route Path
-    path_points = np.linspace(0, 1, 200)
-    route_ls = LineString([(lon, lat) for lat,lon in RAIL_WAYPOINTS])
-    route_len = float(np.sum([haversine_m(RAIL_WAYPOINTS[i][0],RAIL_WAYPOINTS[i][1],
-                                          RAIL_WAYPOINTS[i+1][0],RAIL_WAYPOINTS[i+1][1])
-                              for i in range(len(RAIL_WAYPOINTS)-1)]))
-    route_xy = [[route_ls.interpolate(f*route_len).x, route_ls.interpolate(f*route_len).y] for f in path_points]
-    route_layer = pdk.Layer("PathLayer", data=[{"path": route_xy}],
-                            get_path="path", get_color=[0,102,255,255], width_scale=1, width_min_pixels=4)
+    # Route Path: draw directly from waypoints (no unit mismatch)
+    route_path = [[lon, lat] for (lat, lon) in RAIL_WAYPOINTS]
+    route_layer = pdk.Layer(
+        "PathLayer",
+        data=[{"path": route_path}],
+        get_path="path",
+        get_color=[0,102,255,255],
+        width_scale=1,
+        width_min_pixels=4,
+    )
 
     # Risk circle around Gävle
     def circle_polygon(center, radius_m, n=100):
@@ -376,37 +392,67 @@ with col1:
         m2deg_lon = 1/(111111.0*math.cos(math.radians(lat0)))
         return [[lon0 + (radius_m*math.cos(th))*m2deg_lon,
                  lat0 + (radius_m*math.sin(th))*m2deg_lat] for th in np.linspace(0, 2*math.pi, n)]
-    risk_layer = pdk.Layer("PolygonLayer",
-                           data=[{"polygon": circle_polygon((60.6749, 17.1413), 15000)}],
-                           get_polygon="polygon", get_fill_color=[255,80,80,70],
-                           get_line_color=[255,80,80], line_width_min_pixels=1)
+    risk_layer = pdk.Layer(
+        "PolygonLayer",
+        data=[{"polygon": circle_polygon((60.6749, 17.1413), 15000)}],
+        get_polygon="polygon",
+        get_fill_color=[255,80,80,70],
+        get_line_color=[255,80,80],
+        line_width_min_pixels=1,
+    )
 
     # Sensors
     colors = {"low":[0,170,0,230], "medium":[255,160,0,230], "high":[230,0,0,255]}
     sens_df = pd.DataFrame({"lon": sdf["lon"], "lat": sdf["lat"],
                             "color": sdf["risk_label"].map(lambda x: colors[x])})
-    sensors_layer = pdk.Layer("ScatterplotLayer", data=sens_df,
-                              get_position='[lon, lat]', get_fill_color='color', get_radius=3000)
+    sensors_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=sens_df,
+        get_position='[lon, lat]',
+        get_fill_color='color',
+        get_radius=3000,
+    )
 
     # Base Stations
     bs_df = pd.DataFrame([{"lon": b[2], "lat": b[1], "name": b[0]} for b in BASE_STATIONS])
-    bs_layer = pdk.Layer("ScatterplotLayer", data=bs_df,
-                         get_position='[lon, lat]', get_fill_color=[30,144,255,255], get_radius=4000)
+    bs_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=bs_df,
+        get_position='[lon, lat]',
+        get_fill_color=[30,144,255,255],
+        get_radius=4000,
+    )
 
     # Trains (white dot + icon atlas)
     trains_df = pd.DataFrame([{"lon": trainA[1], "lat": trainA[0], "name": "Train A"},
                               {"lon": trainB[1], "lat": trainB[0], "name": "Train B"}])
-    train_dot = pdk.Layer("ScatterplotLayer", data=trains_df,
-                          get_position='[lon, lat]', get_fill_color=[255,255,255,255], get_radius=4500)
+    train_dot = pdk.Layer(
+        "ScatterplotLayer",
+        data=trains_df,
+        get_position='[lon, lat]',
+        get_fill_color=[255,255,255,255],
+        get_radius=4500,
+    )
     icon_atlas = "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas.png"
     icon_mapping = {"marker": {"x": 0, "y": 0, "width": 128, "height": 128, "anchorY": 128}}
     trains_df["icon"] = "marker"
-    train_icon = pdk.Layer("IconLayer", data=trains_df, get_icon="icon",
-                           icon_atlas=icon_atlas, icon_mapping=icon_mapping,
-                           get_position='[lon, lat]', size_scale=12, get_size=4)
+    train_icon = pdk.Layer(
+        "IconLayer",
+        data=trains_df,
+        get_icon="icon",
+        icon_atlas=icon_atlas,
+        icon_mapping=icon_mapping,
+        get_position='[lon, lat]',
+        size_scale=12,
+        get_size=4,
+    )
 
-    deck = pdk.Deck(initial_view_state=view_state, map_provider=None, map_style=None,
-                    layers=[route_layer, risk_layer, sensors_layer, bs_layer, train_dot, train_icon])
+    deck = pdk.Deck(
+        initial_view_state=view_state,
+        map_provider=None,  # <- no tiles required
+        map_style=None,
+        layers=[route_layer, risk_layer, sensors_layer, bs_layer, train_dot, train_icon],
+    )
     st.pydeck_chart(deck, use_container_width=True, height=540)
     st.caption("Route (blue), risk (red), sensors (green/orange/red), BS (blue), trains (white + icon). No map tiles needed.")
 
