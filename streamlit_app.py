@@ -1,22 +1,26 @@
-# ENSURE-6G • Rail Safety TMS Demo
-# OSM map + BS coverage + sensors + dual trains + TSR line buffers
-# PHY (SNR→PER, handover) + Macro capacity (GOOD/PATCHY/POOR) + DC + handover gaps
-# Tabs: Map • Console • Flow (Sankey) • Legacy (no tiles)
+# ENSURE-6G • TMS Rail Demo — PHY + Macro + Handover Gaps + Dual Connectivity + TSR overlays
+# Raw vs Semantic vs Hybrid • Dynamic bearer (5G→LTE→3G→GSM-R)
+# PHY: path loss + shadowing + fading → SNR→PER
+# Macro: GOOD/PATCHY/POOR → capacity (bps) + random loss → overload queuing
+# Handover: outage window on confirmed switch
+# Dual Connectivity (Lane-A): duplicate over secondary bearer (if available)
+# TSR: polygons appear near high-confidence buckling alerts
+# Deck.gl map (no basemap dependency), Sankey flow, TMS metrics
 
 import math, time
 import numpy as np
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
-from shapely.geometry import LineString, Polygon
-from shapely.ops import unary_union
+from shapely.geometry import LineString, Point
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="ENSURE-6G • Rail Safety (TMS)", layout="wide")
-st.title("🚆 ENSURE-6G: Rail Safety Demo — TMS Control Center")
+st.set_page_config(page_title="ENSURE-6G • TMS Rail Demo (Advanced)", layout="wide")
+st.title("🚆 ENSURE-6G: Raw vs Semantic vs Hybrid — Control Center (TMS) Dashboard (Advanced)")
+st.caption("Sundsvall → Stockholm • PHY (SNR→PER, handover gaps) + Macro capacity (GOOD/PATCHY/POOR) + Dual Connectivity + TSR overlays • Deck.gl map (no tiles needed)")
 
-# --------------------------- Constants & helpers ---------------------------
+# =================== Geography & helpers ===================
 R_EARTH = 6371000.0
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -26,18 +30,7 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(lat1*p)*math.cos(lat2*p)*math.sin(dlon/2)**2
     return 2*R_EARTH*math.asin(min(1.0, math.sqrt(a)))
 
-def to_local_xy(lat, lon, lat0, lon0):
-    """Approx meters using equirectangular around (lat0,lon0)."""
-    x = (lon - lon0) * math.cos(math.radians(lat0)) * 111_111.0
-    y = (lat - lat0) * 111_111.0
-    return x, y
-
-def from_local_xy(x, y, lat0, lon0):
-    lat = y/111_111.0 + lat0
-    lon = x/(math.cos(math.radians(lat0))*111_111.0) + lon0
-    return lat, lon
-
-# Rail polyline (lat, lon)
+# Sundsvall -> Stockholm with intermediate bends (lat, lon)
 RAIL_WAYPOINTS = [
     (62.3930,17.3070),(62.1200,17.1500),(61.8600,17.1400),(61.7300,17.1100),
     (61.5600,17.0800),(61.3900,17.0700),(61.3000,17.0600),(61.0700,17.1000),
@@ -46,6 +39,7 @@ RAIL_WAYPOINTS = [
     (59.6600,17.9400),(59.6100,17.9900),(59.5500,18.0300),(59.4800,18.0400),
     (59.4200,18.0600),(59.3700,18.0700),(59.3293,18.0686),
 ]
+ROUTE_LS = LineString([(lon, lat) for lat, lon in RAIL_WAYPOINTS])  # for TSR geometry ops
 
 # Macro BS grid: (name, lat, lon, radius_of_good_service_m)
 BASE_STATIONS = [
@@ -57,37 +51,157 @@ BASE_STATIONS = [
     ("BS-Märsta",59.620,17.860,15000),("BS-Stockholm",59.330,18.070,18000),
 ]
 
-SEG_NAMES = ["Sundsvall→Hudiksvall","Hudiksvall→Söderhamn","Söderhamn→Gävle","Gävle→Uppsala","Uppsala→Stockholm"]
-
 def interpolate_polyline(points, n_pts):
-    n_pts = max(2, int(n_pts))
+    """
+    Resample a polyline to n_pts evenly spaced by arc length.
+    Returns DataFrame(lat, lon, s_m).
+    """
+    n_pts = max(2, int(n_pts))  # need at least 2 samples
     lat = np.array([p[0] for p in points], dtype=float)
     lon = np.array([p[1] for p in points], dtype=float)
+
+    # cumulative distances per vertex
     cum = np.zeros(len(points), dtype=float)
     for i in range(1, len(points)):
         cum[i] = cum[i-1] + haversine_m(lat[i-1], lon[i-1], lat[i], lon[i])
+
     total = float(cum[-1])
     if total <= 0:
         return pd.DataFrame({"lat":[lat[0]]*n_pts, "lon":[lon[0]]*n_pts, "s_m":np.linspace(0,0,n_pts)})
+
     tgt = np.linspace(0.0, total, n_pts)
+
+    # search bins; clamp to [1, len(cum)-1] so i0>=0 and i1<=len(cum)-1
     idx = np.searchsorted(cum, tgt, side="right")
     idx = np.clip(idx, 1, len(cum)-1)
-    i0 = idx-1; i1 = idx
-    d0 = cum[i0]; d1 = cum[i1]
-    w = (tgt - d0) / np.maximum(d1 - d0, 1e-9)
+
+    i0 = idx - 1
+    i1 = idx
+    d0 = cum[i0]
+    d1 = cum[i1]
+    w = (tgt - d0) / np.maximum(d1 - d0, 1e-9)  # avoid divide-by-zero
+
     latp = lat[i0] + (lat[i1] - lat[i0]) * w
     lonp = lon[i0] + (lon[i1] - lon[i0]) * w
     return pd.DataFrame({"lat": latp, "lon": lonp, "s_m": tgt})
 
-def segment_labels(n):
-    bounds = np.linspace(0, n, len(SEG_NAMES)+1).astype(int)
-    lab = np.empty(n, dtype=object)
+def label_segments(route_len_sec):
+    SEG_NAMES = ["Sundsvall→Hudiksvall","Hudiksvall→Söderhamn","Söderhamn→Gävle","Gävle→Uppsala","Uppsala→Stockholm"]
+    bounds = np.linspace(0, route_len_sec, len(SEG_NAMES)+1).astype(int)
+    labels = np.empty(route_len_sec, dtype=object)
     for i in range(len(SEG_NAMES)):
-        lab[bounds[i]:bounds[i+1]] = SEG_NAMES[i]
-    return lab
+        labels[bounds[i]:bounds[i+1]] = SEG_NAMES[i]
+    return labels
 
-# --------------------------- PHY & Capacity models ---------------------------
+def nearest_bs_quality(lat, lon):
+    """
+    Return (bs_name, distance_m, quality) with a simple 3-bin metric:
+    GOOD (<=R), PATCHY (<=2.2R), POOR (>2.2R)
+    """
+    best = None
+    for name, blat, blon, R in BASE_STATIONS:
+        d = haversine_m(lat, lon, blat, blon)
+        if d <= R:
+            q = "GOOD"
+        elif d <= 2.2*R:
+            q = "PATCHY"
+        else:
+            q = "POOR"
+        rank = {"GOOD":0, "PATCHY":1, "POOR":2}[q]
+        if best is None or rank < best[3]:
+            best = (name, d, q, rank)
+    return best[0], best[1], best[2]
+
+def cap_loss(quality, t_sec, base_capacity_kbps=800, burst_factor=1.4,
+             good_loss_pct=0.5, bad_loss_pct=10.0):
+    """Map quality to capacity (bps) & random loss (best-effort)."""
+    cap_bps = int(base_capacity_kbps * 1000)
+    if quality == "GOOD":
+        cap_bps = int(cap_bps * burst_factor)
+        loss = good_loss_pct / 100.0
+    elif quality == "PATCHY":
+        wobble = 0.6 + 0.2 * math.sin(2*math.pi * (t_sec % 30) / 30.0)
+        cap_bps = max(int(cap_bps * wobble * 0.9), 1)
+        loss = min(0.4, (bad_loss_pct * 0.5) / 100.0)
+    else:
+        cap_bps = int(cap_bps * 0.25)
+        loss = bad_loss_pct / 100.0
+    return max(1, cap_bps), float(loss)
+
+# =================== Sidebar (controls) ===================
+with st.sidebar:
+    st.header("Scenario Controls (TMS)")
+    mode = st.radio("Communication Mode", ["RAW","SEMANTIC","HYBRID"], index=2)
+    train_speed_kmh = st.slider("Train Speed (km/h)", 60, 200, 140, 10)
+    anim_fps = st.slider("Animation FPS", 1, 20, 6, 1)
+    sim_minutes_total = st.number_input("Sim Length (minutes)", 5, 180, 30, 5)
+
+    st.markdown("---")
+    st.subheader("Safety Lane (Lane-A)")
+    laneA_reps = st.slider("Repetitions (reliability)", 1, 3, 2, 1)
+    enable_dc = st.checkbox("Dual Connectivity (duplicate Lane-A over secondary bearer)", True)
+    dc_min_snr_delta = st.slider("DC: min SNR delta to use secondary (dB)", 0.0, 10.0, 2.0, 0.5)
+
+    st.markdown("---")
+    st.subheader("Handover")
+    TTT_MS = st.slider("Time-To-Trigger (ms)", 200, 3000, 1200, 100)
+    HO_GAP_MS = st.slider("Handover outage (ms)", 0, 1500, 350, 50)
+
+    st.markdown("---")
+    st.subheader("TSR policy")
+    tsr_conf_threshold = st.slider("Trigger TSR if alert confidence ≥", 0.50, 0.95, 0.80, 0.01)
+    tsr_speed_kmh = st.slider("TSR speed (km/h)", 30, 100, 60, 5)
+    tsr_len_m = st.slider("TSR length along track (m)", 500, 5000, 1500, 100)
+
+    st.markdown("---")
+    show_sankey = st.checkbox("Show Communication Flow (Sankey)", True)
+    c1, c2 = st.columns(2)
+    if c1.button("⏯ Play/Pause"): st.session_state.playing = not st.session_state.get("playing", True)
+    if c2.button("⏮ Reset"): st.session_state.t_sim = 0.0
+
+# =================== Simulation state ===================
+if "playing" not in st.session_state: st.session_state.playing = True
+if "t_sim" not in st.session_state: st.session_state.t_sim = 0.0
+if "last_tick" not in st.session_state: st.session_state.last_tick = time.time()
+if "bearer" not in st.session_state: st.session_state.bearer = "5G"
+if "bearer_prev" not in st.session_state: st.session_state.bearer_prev = "5G"
+if "bearer_ttt" not in st.session_state: st.session_state.bearer_ttt = 0.0
+if "handover_gap_until" not in st.session_state: st.session_state.handover_gap_until = 0.0
+if "route_df" not in st.session_state or st.session_state.get("route_secs") != int(sim_minutes_total*60):
+    SECS = max(2, int(sim_minutes_total * 60))
+    st.session_state.route_df = interpolate_polyline(RAIL_WAYPOINTS, SECS)
+    st.session_state.seg_labels = label_segments(SECS)
+    st.session_state.route_secs = SECS
+if "tsr_polys" not in st.session_state:
+    st.session_state.tsr_polys = []  # list of dicts: {polygon: [[lon,lat]...], speed: int, ttl_s: int, created_t: float}
+
+route_df = st.session_state.route_df
+seg_labels = st.session_state.seg_labels
+
+# Animation tick
+if st.session_state.playing and anim_fps>0:
+    st_autorefresh(interval=int(1000/anim_fps), key="tick", limit=None)
+now = time.time()
+elapsed = now - st.session_state.last_tick
+if st.session_state.playing and anim_fps>0:
+    st.session_state.t_sim += elapsed
+st.session_state.last_tick = now
+if st.session_state.t_sim > sim_minutes_total*60:
+    st.session_state.t_sim = 0.0
+
+# =================== Train positions (from route_df, speed-scaled) ===================
+baseline_kmh = 140.0
+speed_factor = max(0.1, float(train_speed_kmh) / baseline_kmh)
+t_idx = int(st.session_state.t_sim * speed_factor) % len(route_df)
+
+trainA = (float(route_df.lat.iloc[t_idx]), float(route_df.lon.iloc[t_idx]))
+t_idx_nb = (len(route_df) - t_idx) % len(route_df)
+trainB = (float(route_df.lat.iloc[t_idx_nb]), float(route_df.lon.iloc[t_idx_nb]))
+segment_name = seg_labels[int(st.session_state.t_sim) % len(seg_labels)]
+
+# =================== PHY model (SNR→PER, handover) ===================
 def env_class(lat, lon):
+    # city proximity → UMa else RMa
     cities = [(62.3913,17.3063),(60.6749,17.1413),(59.8586,17.6389),(59.3293,18.0686)]
     for c in cities:
         if haversine_m(lat,lon,c[0],c[1]) < 15000: return "UMa"
@@ -110,6 +224,7 @@ class ShadowingTrack:
         self.curr = rho*self.curr + math.sqrt(max(1e-9,1-rho**2))*self.rng.normal(0,self.sigma)
         self.last_s = s_m
         return self.curr
+
 shadow = ShadowingTrack()
 
 def rician_db(K_dB=8):
@@ -117,11 +232,14 @@ def rician_db(K_dB=8):
     h = math.sqrt(K/(K+1)) + (np.random.normal(0,1/np.sqrt(2))+1j*np.random.normal(0,1/np.sqrt(2)))
     p = (abs(h)**2)/(K+1)
     return 10*np.log10(max(p, 1e-6))
+
 def rayleigh_db():
     h = np.random.normal(0,1/np.sqrt(2))+1j*np.random.normal(0,1/np.sqrt(2))
     p = abs(h)**2
     return 10*np.log10(max(p, 1e-6))
-def noise_dbm(bw_hz): return -174 + 10*np.log10(bw_hz) + 5
+
+def noise_dbm(bw_hz):
+    return -174 + 10*np.log10(bw_hz) + 5
 
 TECH = {
     "5G":  dict(freq=3.5,  bw=5e6,   base_lat=20,  snr_ok=3,  snr_hold=1),
@@ -131,435 +249,399 @@ TECH = {
 }
 P_TX = 43  # dBm
 
-def nearest_sites(lat, lon, k=2):
+def serving_bs(lat, lon):
+    # nearest site from hard-coded grid; assume all techs available
     dists = [haversine_m(lat, lon, b[1], b[2]) for b in BASE_STATIONS]
-    order = np.argsort(dists)
-    return [(BASE_STATIONS[i], dists[i]) for i in order[:k]]
-
-def bearer_snr(lat, lon, s_m, site, env):
-    name, blat, blon, _ = site
-    d = haversine_m(lat, lon, blat, blon)
-    snr = {}
-    for b in ["5G","LTE","3G","GSMR"]:
-        pl = pathloss_db(TECH[b]["freq"], d, env)
-        sh = shadow.sample(s_m)
-        fad = rician_db(8) if env=="RMa" else rayleigh_db()
-        rx = P_TX - pl + sh + fad
-        snr[b] = rx - noise_dbm(TECH[b]["bw"])
-    return d, snr
-
-def pick_bearer(snr_table, curr):
-    order = ["5G","LTE","3G","GSMR"]
-    for b in order:
-        if snr_table.get(b, -99) >= TECH[b]["snr_ok"]:
-            return b
-    return max(order, key=lambda b: snr_table.get(b, -99))
+    i = int(np.argmin(dists))
+    caps = {"5G","LTE","3G","GSMR"}
+    return dict(name=BASE_STATIONS[i][0], lat=BASE_STATIONS[i][1], lon=BASE_STATIONS[i][2], tech=caps), dists[i]
 
 def per_from_snr(snr_db):
     x0, k = 2.0, -1.1
     per = 1/(1+math.exp(k*(snr_db-x0)))
     return max(1e-5, min(0.99, per))
 
-def macro_quality(lat, lon):
-    # GOOD (<=R), PATCHY (<=2.2R), POOR (>2.2R)
-    best = None
-    for name, blat, blon, R in BASE_STATIONS:
-        d = haversine_m(lat, lon, blat, blon)
-        q = "GOOD" if d<=R else ("PATCHY" if d<=2.2*R else "POOR")
-        rank = {"GOOD":0, "PATCHY":1, "POOR":2}[q]
-        if best is None or rank < best[3]:
-            best = (name, d, q, rank, R)
-    return best[0], best[1], best[2], best[4]
+def pick_bearer(snr_table, caps, curr_bearer):
+    order = ["5G","LTE","3G","GSMR"]
+    avail = [b for b in order if b in caps]
+    for b in avail:
+        if snr_table.get(b,-99) >= TECH[b]["snr_ok"]:
+            return b, True
+    if avail:
+        best = max(avail, key=lambda x: snr_table.get(x,-99))
+        return best, True
+    return curr_bearer, False
 
-def cap_loss(quality, t_sec, base_capacity_kbps=800, burst_factor=1.4,
-             good_loss_pct=0.5, bad_loss_pct=10.0):
-    cap_bps = int(base_capacity_kbps * 1000)
-    if quality == "GOOD":
-        cap_bps = int(cap_bps * burst_factor)
-        loss = good_loss_pct / 100.0
-    elif quality == "PATCHY":
-        wobble = 0.6 + 0.2 * math.sin(2*math.pi * (t_sec % 30) / 30.0)
-        cap_bps = max(int(cap_bps * wobble * 0.9), 1)
-        loss = min(0.4, (bad_loss_pct * 0.5) / 100.0)
-    else:
-        cap_bps = int(cap_bps * 0.25)
-        loss = bad_loss_pct / 100.0
-    return max(1, cap_bps), float(loss)
+# Build SNR table at Train A; also keep per-bearer PER for DC
+bsA, dA = serving_bs(*trainA)
+envA = env_class(*trainA)
+s_along = float(route_df.s_m.iloc[t_idx])  # correlated shadowing by arc-length
+snr_table, per_table = {}, {}
+for b in ["5G","LTE","3G","GSMR"]:
+    if b in bsA["tech"]:
+        pl = pathloss_db(TECH[b]["freq"], dA, envA)
+        sh = shadow.sample(s_along)
+        fad = rician_db(8) if envA=="RMa" else rayleigh_db()
+        rx = P_TX - pl + sh + fad
+        snr = rx - noise_dbm(TECH[b]["bw"])
+        snr_table[b] = snr
+        per_table[b] = per_from_snr(snr)
 
-# --------------------------- Sidebar controls ---------------------------
-with st.sidebar:
-    st.header("Scenario Controls")
-    strategy = st.radio("Communication Strategy", ["RAW","SEMANTIC","HYBRID"], index=2)
-    duration_min = st.slider("Scenario Duration (min)", 2, 60, 10, 2)
-    laneA_reps = st.slider("Lane-A Repetitions", 1, 3, 2, 1)
-    enable_dc = st.checkbox("Enable Dual Connectivity in PATCHY", True)
-    enable_handover_gaps = st.checkbox("Enable Handover Gaps", True)
-    tsr_threshold = st.slider("TSR Trigger Threshold (risk score)", 0.50, 0.95, 0.75, 0.05)
-    tiles_on = st.checkbox("Use OSM Tiles on Map tab", True)
-    st.caption("TSR draws buffered track polygons when risk ≥ threshold. Legacy tab shows no-tiles map for robustness.")
+# Handover state machine with TTT and gap injection
+cand, valid = pick_bearer(snr_table, bsA["tech"], st.session_state.bearer)
+if valid and cand != st.session_state.bearer:
+    st.session_state.bearer_ttt += elapsed*1000
+    if st.session_state.bearer_ttt >= TTT_MS:
+        st.session_state.bearer_prev = st.session_state.bearer
+        st.session_state.bearer = cand
+        st.session_state.bearer_ttt = 0.0
+        # start outage window
+        st.session_state.handover_gap_until = st.session_state.t_sim + HO_GAP_MS/1000.0
+else:
+    st.session_state.bearer_ttt = 0.0
 
-# --------------------------- Build route & sensors ---------------------------
-SECS = max(2, int(duration_min*60))
-if ("route_df" not in st.session_state) or (st.session_state.get("route_secs") != SECS):
-    route_df = interpolate_polyline(RAIL_WAYPOINTS, SECS)
-    route_df["segment"] = segment_labels(SECS)
-    # Sensors along the line
-    SENS_IDX = np.linspace(0, SECS-1, 24).astype(int)
-    sensors_df = route_df.loc[SENS_IDX, ["lat","lon"]].copy()
-    sensors_df["id"] = [f"S{i:02d}" for i in range(len(sensors_df))]
-    st.session_state.route_df = route_df.reset_index(drop=True)
-    st.session_state.sensors_df = sensors_df.reset_index(drop=True)
-    st.session_state.route_secs = SECS
-route_df = st.session_state.route_df
-sensors_df = st.session_state.sensors_df
+bearer = st.session_state.bearer
+snr_use = snr_table.get(bearer, -20)
+per_single = per_table.get(bearer, 0.5)  # default conservative
+lat_ms_phy = TECH[bearer]["base_lat"]
 
-# Playback state
-if "t_idx" not in st.session_state: st.session_state.t_idx = 0
-if "playing" not in st.session_state: st.session_state.playing = False
+# Secondary bearer choice for DC (best alternative different from primary)
+def pick_secondary(primary, snr_table, min_delta_db=2.0):
+    alts = [(b, s) for b, s in snr_table.items() if b != primary]
+    if not alts: return None
+    b2, s2 = max(alts, key=lambda x: x[1])
+    if s2 + 1e-9 >= snr_table[primary] - min_delta_db:  # permit if within delta down from primary
+        return b2
+    return None
 
-# --------------------------- Risk field ---------------------------
-def instant_risk(lat, lon, t_sec):
-    d = haversine_m(lat, lon, 60.6749, 17.1413)  # hotspot near Gävle
-    base = 0.25 + 0.15*math.sin(2*math.pi*(t_sec%300)/300)
-    hotspot = max(0, 1 - d/15000) * 0.6
-    noise = np.random.default_rng(int(t_sec)).normal(0, 0.04)
-    return max(0.0, min(1.0, base + hotspot + noise))
+secondary = pick_secondary(bearer, snr_table, dc_min_snr_delta) if enable_dc else None
+per_secondary = per_table.get(secondary, None) if secondary else None
 
-# --------------------------- Vectorized precompute ---------------------------
+# Lane-A PHY reliability with/without dual connectivity
+if secondary and per_secondary is not None:
+    # duplicate across two bearers, each with 'laneA_reps' repetitions
+    p_succ_primary = (1 - per_single) ** laneA_reps
+    p_succ_secondary = (1 - per_secondary) ** laneA_reps
+    laneA_success_phy = 1 - (1 - p_succ_primary) * (1 - p_succ_secondary)
+else:
+    laneA_success_phy = (1 - per_single) ** laneA_reps
+
+# =================== Macro capacity/loss layer ===================
+bs_macro_name, bs_macro_dist, quality = nearest_bs_quality(*trainA)
+cap_bps, rand_loss = cap_loss(quality, int(st.session_state.t_sim))
+badge = {"GOOD":"🟢","PATCHY":"🟠","POOR":"🔴"}[quality]
+
+# =================== Traffic & semantics ===================
 RAW_HZ, HYB_HZ = 2.0, 0.2
 BYTES_RAW, BYTES_ALERT, BYTES_SUM = 24, 280, 180
 
-def precompute_all():
-    N = SECS
-    res = dict(
-        lat = route_df["lat"].to_numpy(),
-        lon = route_df["lon"].to_numpy(),
-        segment = route_df["segment"].to_numpy(),
-        near_bs = np.empty(N, dtype=object),
-        quality = np.empty(N, dtype=object),
-        cap_bits = np.zeros(N, dtype=np.int64),
-        snr = np.zeros(N, dtype=float),
-        bearer = np.empty(N, dtype=object),
-        laneA_bits = np.zeros(N, dtype=np.int64),
-        laneB_bits = np.zeros(N, dtype=np.int64),
-        raw_bits   = np.zeros(N, dtype=np.int64),
-        risk = np.zeros(N, dtype=float),
-        tsr_active = np.zeros(N, dtype=bool),
-        gap = np.zeros(N, dtype=bool),
+def synth_sensors(t_sec):
+    base = 24 + 10*math.sin(2*math.pi*((t_sec/60)%1440)/1440)
+    data = []
+    # 22 sensors placed along the route
+    N_SENS = 22
+    idxs = np.linspace(0, len(route_df)-1, N_SENS).astype(int)
+    for i, j in enumerate(idxs):
+        la, lo = float(route_df.lat.iloc[j]), float(route_df.lon.iloc[j])
+        d_risk = haversine_m(la, lo, 60.6749, 17.1413)  # hotspot near Gävle
+        boost = max(0, 1 - d_risk/15000) * 14
+        temp = base + np.random.normal(0,0.6) + boost
+        strain = max(0.0, (temp-35)*0.8 + np.random.normal(0,0.5))
+        ballast = max(0.0, np.random.normal(0.3,0.1) + 0.02*boost)
+        exceeded = []
+        if temp >= 38: exceeded.append("temp>38")
+        if strain >= 10: exceeded.append("strain>10")
+        score = min(1.0, 0.01*(temp-30)**2 + 0.04*max(0, strain-8))
+        label = "high" if score>0.75 else ("medium" if score>0.4 else "low")
+        data.append(dict(id=f"S{i:02d}", lat=la, lon=lo,
+                         rail_temp_C=round(temp,1), strain_kN=round(strain,1),
+                         ballast_idx=round(ballast,2), risk_score=round(score,2),
+                         risk_label=label, exceeded=exceeded))
+    return pd.DataFrame(data)
+
+sdf = synth_sensors(st.session_state.t_sim)
+
+raw_points = 0
+laneA_alerts, laneB_msgs = [], []
+for _, row in sdf.iterrows():
+    if mode in ("RAW","HYBRID"):
+        raw_points += int(RAW_HZ if mode=="RAW" else HYB_HZ)
+    if row["risk_label"] in ("medium","high") and (("temp>38" in row["exceeded"]) or ("strain>10" in row["exceeded"])):
+        conf = round(0.6+0.4*row["risk_score"],2)
+        laneA_alerts.append(dict(
+            event="buckling_risk", sensor=row["id"],
+            location=dict(lat=row["lat"], lon=row["lon"]),
+            severity=row["risk_label"],
+            confidence=conf,
+            evidence=dict(rail_temp_C=row["rail_temp_C"], strain_kN=row["strain_kN"],
+                          ballast_idx=row["ballast_idx"], exceeded=row["exceeded"]),
+            recommendation=dict(tsr_kmh=tsr_speed_kmh), ttl_s=900
+        ))
+if mode in ("SEMANTIC","HYBRID"):
+    laneB_msgs.append(dict(type="maintenance_summary",
+                           ballast_hotspots=int((sdf.ballast_idx>0.6).sum()),
+                           window=f"t={int(st.session_state.t_sim)}s"))
+
+# =================== TSR overlays from high-confidence alerts ===================
+def polyline_offset_polygon(center_lat, center_lon, length_m=1500, half_width_m=15, samples=40):
+    # project to local meters via simple lat/lon scaling (ok for small patches)
+    lat0, lon0 = center_lat, center_lon
+    m2deg_lat = 1/111111.0
+    m2deg_lon = 1/(111111.0*math.cos(math.radians(lat0)))
+    # snap to nearest point on route
+    nearest = ROUTE_LS.interpolate(ROUTE_LS.project(Point(lon0, lat0)))
+    # build a local segment centered here along the route
+    # march forward/backward in small steps to approximate length_m
+    seg_pts = [nearest]
+    step_m = length_m / (samples//2)
+    for dir_sign in (+1, -1):
+        acc = 0.0
+        while acc < length_m/2:
+            acc += step_m
+            s = ROUTE_LS.project(nearest) + dir_sign * acc
+            s = max(0, min(s, ROUTE_LS.length))
+            seg_pts.append(ROUTE_LS.interpolate(s))
+    seg_pts = sorted(seg_pts, key=lambda p: ROUTE_LS.project(p))
+    # build a simple rectangle around this local segment in lon/lat
+    # use first & last
+    p0, p1 = seg_pts[0], seg_pts[-1]
+    lat0, lon0 = p0.y, p0.x
+    lat1, lon1 = p1.y, p1.x
+    # perpendicular offset vector in degrees
+    dx = lon1 - lon0
+    dy = lat1 - lat0
+    L = math.hypot(dx, dy) + 1e-12
+    nx, ny = -dy/L, dx/L  # unit normal
+    off_lon = (half_width_m * m2deg_lon) * nx
+    off_lat = (half_width_m * m2deg_lat) * ny
+    poly = [
+        [lon0 - off_lon, lat0 - off_lat],
+        [lon0 + off_lon, lat0 + off_lat],
+        [lon1 + off_lon, lat1 + off_lat],
+        [lon1 - off_lon, lat1 - off_lat],
+    ]
+    return poly
+
+# create TSRs for new high-confidence alerts
+for a in laneA_alerts:
+    if a["confidence"] >= tsr_conf_threshold:
+        poly = polyline_offset_polygon(a["location"]["lat"], a["location"]["lon"], length_m=tsr_len_m, half_width_m=18)
+        st.session_state.tsr_polys.append(dict(
+            polygon=poly, speed=tsr_speed_kmh, ttl_s=900, created_t=st.session_state.t_sim
+        ))
+# expire old TSRs
+st.session_state.tsr_polys = [p for p in st.session_state.tsr_polys
+                              if (st.session_state.t_sim - p["created_t"]) < p["ttl_s"]]
+
+# =================== Stream budgets ===================
+BYTES_RAW, BYTES_ALERT, BYTES_SUM = 24, 280, 180
+raw_bps = raw_points*BYTES_RAW
+laneA_bps = len(laneA_alerts)*BYTES_ALERT
+# DC duplicates Lane-A over secondary — cost doubles Lane-A bytes
+if secondary:
+    laneA_bps *= 2
+laneB_bps = len(laneB_msgs)*BYTES_SUM
+bps_total = raw_bps + laneA_bps + laneB_bps
+
+# =================== Fuse PHY + Macro + Handover into E2E ===================
+# Base latency from PHY bearer + light load jitter
+lat_ms = lat_ms_phy + (bps_total/1000)
+
+# Capacity pressure → queueing penalty and best-effort drops
+if bps_total > cap_bps:
+    overload = bps_total / cap_bps
+    lat_ms *= min(4.0, 1.0 + 0.35*(overload-1))  # extra queueing
+    overflow_drop = min(0.5, 0.10*(overload-1))
+else:
+    overflow_drop = 0.0
+
+# Handover outage window (affects everything; DC helps Lane-A)
+in_gap = st.session_state.t_sim < st.session_state.handover_gap_until
+gap_loss = 0.0
+if in_gap:
+    # add an extra 30% loss budget to best-effort traffic, and add 80 ms latency
+    gap_loss = 0.30
+    lat_ms += 80
+
+# Random loss applies to best-effort streams (RAW, Lane B); Lane A uses repetition/DC on PHY
+loss_be = max(0.0, min(0.9, rand_loss + overflow_drop + gap_loss))
+effective_raw_bps   = int(raw_bps   * (1.0 - loss_be))
+effective_laneB_bps = int(laneB_bps * (1.0 - loss_be))
+effective_total_bps = effective_raw_bps + laneA_bps + effective_laneB_bps
+
+# Lane-A end-to-end success probability (PHY) + gap mitigation via DC
+laneA_success = laneA_success_phy
+if in_gap and not secondary:
+    # if no DC during gap, degrade success by 15% relative (bounded)
+    laneA_success = max(0.0, laneA_success * 0.85)
+
+# =================== UI: Map (Deck.gl, no tiles) ===================
+col1, col2 = st.columns([2.2, 1.8])
+
+with col1:
+    st.subheader("Live Map • Deck.gl (no basemap dependency)")
+
+    view_state = pdk.ViewState(latitude=60.1, longitude=17.7, zoom=6)
+
+    # Route Path
+    route_path = [[lon, lat] for (lat, lon) in RAIL_WAYPOINTS]
+    route_layer = pdk.Layer(
+        "PathLayer",
+        data=[{"path": route_path}],
+        get_path="path",
+        get_color=[0,102,255,255],
+        width_scale=1,
+        width_min_pixels=4,
     )
-    bearer_state = "5G"
-    ttt_acc_ms = 0.0
-    GAP_MS = 1200
-    gap_timer_ms = 0.0
 
-    for t in range(N):
-        lat, lon = res["lat"][t], res["lon"][t]
-        env = env_class(lat, lon)
-        sites = nearest_sites(lat, lon, k=2)
-        s_m = float(route_df["s_m"].iloc[t])
+    # Risk circle around Gävle
+    def circle_polygon(center, radius_m, n=100):
+        lat0, lon0 = center
+        m2deg_lat = 1/111111.0
+        m2deg_lon = 1/(111111.0*math.cos(math.radians(lat0)))
+        return [[lon0 + (radius_m*math.cos(th))*m2deg_lon,
+                 lat0 + (radius_m*math.sin(th))*m2deg_lat] for th in np.linspace(0, 2*math.pi, n)]
+    risk_layer = pdk.Layer(
+        "PolygonLayer",
+        data=[{"polygon": circle_polygon((60.6749, 17.1413), 15000)}],
+        get_polygon="polygon",
+        get_fill_color=[255,80,80,70],
+        get_line_color=[255,80,80],
+        line_width_min_pixels=1,
+    )
 
-        # primary site
-        (site0, d0) = sites[0]
-        d0, snr0 = bearer_snr(lat, lon, s_m, site0[0:4], env)
-        cand = pick_bearer(snr0, bearer_state)
+    # TSR polygons (yellow)
+    tsr_layer = pdk.Layer(
+        "PolygonLayer",
+        data=[{"polygon": p["polygon"], "speed": p["speed"]} for p in st.session_state.tsr_polys],
+        get_polygon="polygon",
+        get_fill_color=[255, 215, 0, 80],
+        get_line_color=[255, 215, 0],
+        line_width_min_pixels=1,
+        pickable=True,
+    )
 
-        # TTT + optional HO gaps
-        if cand != bearer_state:
-            ttt_acc_ms += 1000
-            if ttt_acc_ms >= 1200:
-                if enable_handover_gaps:
-                    gap_timer_ms = GAP_MS
-                bearer_state = cand
-                ttt_acc_ms = 0.0
-        else:
-            ttt_acc_ms = max(0.0, ttt_acc_ms - 500)
+    # Sensors
+    colors = {"low":[0,170,0,230], "medium":[255,160,0,230], "high":[230,0,0,255]}
+    sdf = sdf  # already computed
+    sens_df = pd.DataFrame({"lon": sdf["lon"], "lat": sdf["lat"],
+                            "tooltip": [f"{r.id} • {r.rail_temp_C}°C • {r.strain_kN}kN • {r.risk_label}"
+                                        for r in sdf.itertuples()],
+                            "color": sdf["risk_label"].map(lambda x: colors[x])})
+    sensors_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=sens_df,
+        get_position='[lon, lat]',
+        get_fill_color='color',
+        get_radius=3000,
+        pickable=True,
+    )
 
-        in_gap = False
-        if gap_timer_ms > 0:
-            in_gap = True
-            gap_timer_ms = max(0.0, gap_timer_ms - 1000)
+    # Base Stations
+    bs_df = pd.DataFrame([{"lon": b[2], "lat": b[1], "name": b[0]} for b in BASE_STATIONS])
+    bs_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=bs_df,
+        get_position='[lon, lat]',
+        get_fill_color=[30,144,255,255],
+        get_radius=4000,
+        pickable=True,
+    )
 
-        # PER on primary
-        per_single = per_from_snr(snr0[bearer_state])
-        per_eff = per_single**laneA_reps
+    # Trains (white dot + icon atlas; primary bearer affects icon size; gap → gray dot)
+    trains_df = pd.DataFrame([{"lon": trainA[1], "lat": trainA[0], "name": "Train A"},
+                              {"lon": trainB[1], "lat": trainB[0], "name": "Train B"}])
+    train_color = [220,220,220,255] if in_gap else [255,255,255,255]
+    train_dot = pdk.Layer(
+        "ScatterplotLayer",
+        data=trains_df,
+        get_position='[lon, lat]',
+        get_fill_color=train_color,
+        get_radius=4500,
+    )
+    icon_atlas = "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas.png"
+    icon_mapping = {"marker": {"x": 0, "y": 0, "width": 128, "height": 128, "anchorY": 128}}
+    trains_df["icon"] = "marker"
+    size_scale = 12 if bearer in ("LTE","3G","GSMR") else 14  # tiny visual hint
+    train_icon = pdk.Layer(
+        "IconLayer",
+        data=trains_df,
+        get_icon="icon",
+        icon_atlas=icon_atlas,
+        icon_mapping=icon_mapping,
+        get_position='[lon, lat]',
+        size_scale=size_scale,
+        get_size=4,
+    )
 
-        # Macro capacity & DC
-        bs_name_macro, dist_macro, q, R_cell = macro_quality(lat, lon)
-        cap_bps, rand_loss = cap_loss(q, t)
-        if enable_dc and q == "PATCHY" and len(sites) > 1:
-            (site1, d1) = sites[1]
-            d1, snr1 = bearer_snr(lat, lon, s_m, site1[0:4], env)
-            per2 = per_from_snr(snr1[bearer_state])
-            per_eff = per_eff * (per2**laneA_reps)  # independent diversity
-            cap_bps = int(cap_bps * 1.8)           # DC throughput gain
+    deck = pdk.Deck(
+        initial_view_state=view_state,
+        map_provider=None,  # <- no tiles required
+        map_style=None,
+        layers=[route_layer, risk_layer, tsr_layer, sensors_layer, bs_layer, train_dot, train_icon],
+        tooltip={"html": "<b>{name}</b><br/>{tooltip}", "style": {"color":"white"}}
+    )
+    st.pydeck_chart(deck, use_container_width=True, height=560)
+    st.caption("Route (blue), risk (red), TSRs (yellow), sensors (green/orange/red), BS (blue), trains (white; gray during handover gap). No map tiles needed.")
 
-        # Traffic
-        n_sensors = len(sensors_df)
-        raw_points = int((RAW_HZ if strategy=="RAW" else (HYB_HZ if strategy=="HYBRID" else 0)) * n_sensors)
-        raw_bits   = raw_points * BYTES_RAW * 8
-        laneB_bits = (BYTES_SUM * 8) if strategy in ("SEMANTIC","HYBRID") else 0
-
-        rk = instant_risk(lat, lon, t)
-        laneA_bits = (BYTES_ALERT * 8) if rk >= 0.55 else 0
-        tsr_flag = rk >= tsr_threshold
-
-        # Losses & overload
-        be_loss = rand_loss
-        if in_gap:
-            be_loss = min(0.95, be_loss + 0.6)
-            laneA_bits = int(laneA_bits * 0.8)
-
-        total_req = raw_bits + laneA_bits + laneB_bits
-        if total_req > cap_bps:
-            overload = total_req / max(cap_bps,1)
-            be_loss = min(0.95, be_loss + 0.10*(overload-1))
-
-        raw_bits_eff   = int(raw_bits   * (1.0 - be_loss))
-        laneB_bits_eff = int(laneB_bits * (1.0 - be_loss))
-
-        res["near_bs"][t] = site0[0][0]
-        res["quality"][t] = q
-        res["cap_bits"][t] = cap_bps
-        res["snr"][t] = float(snr0[bearer_state])
-        res["bearer"][t] = bearer_state
-        res["laneA_bits"][t] = laneA_bits
-        res["laneB_bits"][t] = laneB_bits_eff
-        res["raw_bits"][t]   = raw_bits_eff
-        res["risk"][t] = rk
-        res["tsr_active"][t] = bool(tsr_flag)
-        res["gap"][t] = in_gap
-
-    return res
-
-if ("res_map" not in st.session_state or
-    st.session_state.get("res_secs") != SECS or
-    st.session_state.get("res_strategy") != strategy or
-    st.session_state.get("res_dc") != enable_dc or
-    st.session_state.get("res_gap") != enable_handover_gaps or
-    st.session_state.get("res_tsr") != tsr_threshold or
-    st.session_state.get("res_reps") != laneA_reps):
-    st.session_state.res_map = precompute_all()
-    st.session_state.res_secs = SECS
-    st.session_state.res_strategy = strategy
-    st.session_state.res_dc = enable_dc
-    st.session_state.res_gap = enable_handover_gaps
-    st.session_state.res_tsr = tsr_threshold
-    st.session_state.res_reps = laneA_reps
-
-res_map = st.session_state.res_map
-
-# --------------------------- Tabs ---------------------------
-tab_map, tab_console, tab_flow, tab_legacy = st.tabs(["🗺️ Map", "📊 Console", "🔀 Flow", "🧰 Legacy (no tiles)"])
-
-# =================== MAP (OSM tiles) ===================
-with tab_map:
-    colL, colR = st.columns([2,1])
-
-    with colR:
-        st.subheader("Playback")
-        c1, c2 = st.columns(2)
-        if c1.button("▶ Simulate", use_container_width=True): st.session_state.playing=True
-        if c2.button("⏸ Pause", use_container_width=True):   st.session_state.playing=False
-
-        if st.session_state.playing:
-            st_autorefresh(interval=700, key="autoplay_tick_fixed")
-            st.session_state.t_idx = min(st.session_state.t_idx + 1, SECS-1)
-            if st.session_state.t_idx >= SECS-1: st.session_state.playing=False
-            st.slider("Time (s)", 0, SECS-1, value=st.session_state.t_idx, key="time_slider", disabled=True)
-        else:
-            t_idx = st.slider("Time (s)", 0, SECS-1, value=st.session_state.t_idx, key="time_slider", disabled=False)
-            st.session_state.t_idx = t_idx
-
-        t_idx = st.session_state.t_idx
-        st.metric("Strategy (map)", strategy)
-        st.metric("Segment", str(route_df.loc[t_idx,"segment"]))
-        st.metric("Nearest BS", str(res_map["near_bs"][t_idx]))
-        st.metric("Link quality", str(res_map["quality"][t_idx]))
-        st.metric("Lane A bits this second", int(res_map["laneA_bits"][t_idx]))
-        st.metric("Lane B bits this second", int(res_map["laneB_bits"][t_idx]))
-        st.metric("Raw bits this second",   int(res_map["raw_bits"][t_idx]))
-        st.metric("Capacity (kbps)", int(res_map["cap_bits"][t_idx]/1000))
-        if res_map["gap"][t_idx]:
-            st.warning("Handover gap (best-effort throttled)")
-
-    with colL:
-        layers = []
-
-        if tiles_on:
-            layers.append(pdk.Layer("TileLayer",
-                                    data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                                    min_zoom=0, max_zoom=19, tile_size=256))
-
-        # Route path (downsample for perf)
-        step = max(1, SECS//300)
-        path_coords = [[route_df.loc[i,"lon"], route_df.loc[i,"lat"]] for i in range(0, SECS, step)]
-        layers.append(pdk.Layer("PathLayer", data=[{"path": path_coords, "name":"Sundsvall→Stockholm"}],
-                                get_color=[60,60,160], width_scale=4, width_min_pixels=2))
-
-        # BS coverage discs
-        bs_df = pd.DataFrame(BASE_STATIONS, columns=["name","lat","lon","r_m"])
-        layers.append(pdk.Layer("ScatterplotLayer", data=bs_df,
-                                get_position="[lon, lat]", get_radius="r_m",
-                                get_fill_color="[0,150,0,40]",
-                                stroked=True, get_line_color=[0,150,0],
-                                line_width_min_pixels=1, pickable=True))
-
-        # Sensors (simple)
-        sens_plot = sensors_df.copy()
-        sens_plot["r_m"] = 1200
-        layers.append(pdk.Layer("ScatterplotLayer", data=sens_plot,
-                                get_position="[lon, lat]", get_radius="r_m",
-                                get_fill_color=[255,140,0,120],
-                                stroked=True, get_line_color=[180,90,0],
-                                line_width_min_pixels=1, pickable=True))
-
-        # Dual trains (A southbound, B northbound)
-        qcol = {"GOOD":[0,170,0], "PATCHY":[255,165,0], "POOR":[200,0,0]}
-        t_a = st.session_state.t_idx
-        t_b = (SECS-1 - st.session_state.t_idx)
-        trains_now = pd.DataFrame([
-            {"lat": route_df.loc[t_a,"lat"], "lon": route_df.loc[t_a,"lon"],
-             "quality": res_map["quality"][t_a], "name":"Train A"},
-            {"lat": route_df.loc[t_b,"lat"], "lon": route_df.loc[t_b,"lon"],
-             "quality": res_map["quality"][t_b], "name":"Train B"},
-        ])
-        trains_now["icon_data"] = [{
-            "url":"https://img.icons8.com/emoji/48/train-emoji.png","width":128,"height":128,"anchorY":128
-        } for _ in range(len(trains_now))]
-        trains_now["halo_color"] = [qcol[q] for q in trains_now["quality"]]
-
-        layers.append(pdk.Layer("IconLayer", data=trains_now,
-                                get_position='[lon, lat]', get_icon='icon_data',
-                                get_size=4, size_scale=15))
-        layers.append(pdk.Layer("ScatterplotLayer", data=trains_now,
-                                get_position='[lon, lat]', get_fill_color='halo_color',
-                                get_radius=5000, stroked=True,
-                                get_line_color=[0,0,0], line_width_min_pixels=1))
-
-        # TSR as line-buffer polygons (last 10s window with risk ≥ threshold)
-        def buffered_track_polys(indices, radius_m=5000):
-            if not indices:
-                return []
-            pts = [(route_df.loc[i,"lat"], route_df.loc[i,"lon"]) for i in indices]
-            lat0, lon0 = pts[len(pts)//2]
-            xy = [to_local_xy(lat, lon, lat0, lon0) for lat,lon in pts]
-            line = LineString(xy)
-            poly = line.buffer(radius_m, cap_style=2, join_style=2)  # meters in local frame
-            polys = [poly] if isinstance(poly, Polygon) else list(poly.geoms)
-            decks = []
-            for p in polys:
-                coords = list(p.exterior.coords)
-                lonlat = [[from_local_xy(x,y,lat0,lon0)[1], from_local_xy(x,y,lat0,lon0)[0]] for x,y in coords]
-                decks.append({"polygon": lonlat})
-            return decks
-
-        idxs = [i for i in range(max(0, t_a-10), t_a+1) if res_map["tsr_active"][i]]
-        tsr_polys = buffered_track_polys(idxs, radius_m=5000)
-        if tsr_polys:
-            layers.append(pdk.Layer("PolygonLayer", data=tsr_polys,
-                                    get_polygon="polygon",
-                                    get_fill_color=[255,0,0,60],
-                                    get_line_color=[180,0,0],
-                                    line_width_min_pixels=1))
-
-        view_state = pdk.ViewState(latitude=60.7, longitude=17.5, zoom=6.2, pitch=0)
-        deck = pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip={"text":"{name}"})
-        st.pydeck_chart(deck, use_container_width=True)
-        st.caption("OSM tiles (toggleable). Green discs: BS coverage. Orange: sensors. "
-                   "Two trains with quality halos. TSR = buffered track polygon in translucent red.")
-
-# =================== CONSOLE ===================
-with tab_console:
-    st.subheader("Comms Console")
-    t_idx = st.session_state.t_idx
-    lat, lon = route_df.loc[t_idx,"lat"], route_df.loc[t_idx,"lon"]
-    near = res_map["near_bs"][t_idx]
-    q = res_map["quality"][t_idx]
-    cap = res_map["cap_bits"][t_idx]
-    b_raw, b_la, b_lb = res_map["raw_bits"][t_idx], res_map["laneA_bits"][t_idx], res_map["laneB_bits"][t_idx]
-    gap = res_map["gap"][t_idx]
-    risk = res_map["risk"][t_idx]
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Nearest BS", str(near))
-    c2.metric("Quality", str(q))
-    c3.metric("Cap (kbps)", int(cap/1000))
-    c4.metric("Risk", f"{risk:.2f}")
-    if gap: st.warning("Handover gap: best-effort suppressed; Lane-A lightly penalized")
-
-    st.markdown("**Per-second Traffic (effective delivered):**")
-    st.write({
-        "RAW bits": int(b_raw),
-        "Lane-A bits (alerts)": int(b_la),
-        "Lane-B bits (semantic)": int(b_lb),
-        "Total (kb)": round((b_raw + b_la + b_lb)/8/1000, 2)
-    })
-
+with col2:
+    st.subheader("Comms, Channel & Safety Status")
+    dc_txt = f"ON (secondary: {secondary})" if secondary else "OFF"
+    gap_txt = "YES" if in_gap else "no"
+    st.markdown(
+        f"**Segment:** {segment_name}  \n"
+        f"**Serving BS (PHY):** {bsA['name']} • env **{envA}** • dist **{int(dA/1000)} km**  \n"
+        f"**Bearer:** {bearer} (prev: {st.session_state.bearer_prev}, TTT: {int(st.session_state.bearer_ttt)} ms)  \n"
+        f"**Handover gap active?** {gap_txt} • gap ends at t≈{st.session_state.handover_gap_until:.1f}s  \n"
+        f"**Dual Connectivity:** {dc_txt}  \n"
+        f"**SNR:** {snr_use:.1f} dB | **PER(single):** {per_single:.2%} | **Lane-A success (PHY/DC):** {(laneA_success*100):.1f}%  \n"
+        f"**PHY base latency:** ~{int(TECH[bearer]['base_lat'])} ms  \n"
+        f"**Macro BS:** {bs_macro_name} • dist **{int(bs_macro_dist/1000)} km** • quality {badge} **{quality}**  \n"
+        f"**Capacity budget:** ~{cap_bps/1000:.0f} kbps | **Random loss (best-effort):** {rand_loss*100:.1f}%"
+    )
     st.markdown("---")
-    st.markdown("**Model notes**")
-    st.markdown("""
-- **PHY:** FSPL + shadowing + Rayleigh/Rician → SNR → PER → Lane-A repetition.  
-- **Handover:** TTT=1.2s; optional **gap** throttles best-effort for ~1.2s.  
-- **DC:** In **PATCHY**, second site adds diversity (PER↓) and capacity gain.  
-- **Capacity:** GOOD/PATCHY/POOR cap + random loss; overload raises best-effort loss.  
-- **TSR:** When risk ≥ threshold, draw buffered polygon along recent track.
-""")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("RAW (bps)", f"{raw_bps:,.0f}")
+    c2.metric("Lane A (bps)", f"{laneA_bps:,.0f}")
+    c3.metric("Lane B (bps)", f"{laneB_bps:,.0f}")
+    c4.metric("Total (bps)", f"{bps_total:,.0f}")
+    st.markdown(
+        f"**Effective best-effort (after loss):** {effective_raw_bps + effective_laneB_bps:,.0f} bps  \n"
+        f"**E2E Lane-A success:** {(laneA_success*100):.1f}%  \n"
+        f"**E2E latency (PHY + capacity + gap):** ~{int(lat_ms)} ms"
+    )
+    st.markdown("---")
+    st.markdown("**Lane A (Safety Alerts)**")
+    st.json(laneA_alerts[:6] if laneA_alerts else [])
+    st.markdown("**Lane B (Ops/Maintenance)**")
+    st.json(laneB_msgs if laneB_msgs else [])
 
-# =================== FLOW (Sankey) ===================
-with tab_flow:
-    st.subheader("Communication Flow (current second)")
-    t = st.session_state.t_idx
-    bearer = "NR/LTE/3G/GSM-R"  # conceptual; we choose per-tick internally
-    sensors_to_bs = max(1, int(res_map["raw_bits"][t] + res_map["laneA_bits"][t] + res_map["laneB_bits"][t]))
+# =================== Sankey Communication Flow ===================
+if show_sankey:
+    st.markdown("---")
+    st.subheader("Communication Flow (This Tick)")
+    sensors_to_bs = max(1, raw_bps + laneA_bps + laneB_bps)
     bs_to_net = sensors_to_bs
-    net_to_tms = sensors_to_bs
-    tms_to_train = max(1, 100 * (1 if res_map["laneA_bits"][t] > 0 else 0))
-    tms_to_maint = max(1, 100 * (1 if res_map["laneB_bits"][t] > 0 else 0))
-    nodes = ["Sensors","BS/Edge",f"Network ({bearer})","TMS","Train A","Train B","Maintenance"]
+    net_to_tms = laneA_bps + laneB_bps + (raw_bps if mode!="SEMANTIC" else 0)
+    tms_to_train = max(1, len(laneA_alerts)*100)
+    tms_to_maint = max(1, len(laneB_msgs)*100)
+
+    nodes = ["Sensors","BS/Edge",f"Network ({bearer})","TMS","Train DAS","Maintenance"]
     idx = {n:i for i,n in enumerate(nodes)}
     sankey = go.Figure(data=[go.Sankey(
         node=dict(label=nodes),
         link=dict(
             source=[idx["Sensors"], idx["BS/Edge"], idx[f"Network ({bearer})"], idx["TMS"], idx["TMS"]],
-            target=[idx["BS/Edge"], idx[f"Network ({bearer})"], idx["TMS"], idx["Train A"], idx["Maintenance"]],
+            target=[idx["BS/Edge"], idx[f"Network ({bearer})"], idx["TMS"], idx["Train DAS"], idx["Maintenance"]],
             value=[sensors_to_bs, bs_to_net, net_to_tms, tms_to_train, tms_to_maint],
             label=["telemetry/alerts","uplink","ctrl+data","advisories","work orders"],
         )
     )])
-    sankey.update_layout(height=420, margin=dict(l=10,r=10,t=10,b=10))
+    sankey.update_layout(height=360, margin=dict(l=10,r=10,t=10,b=10))
     st.plotly_chart(sankey, use_container_width=True, config={"displayModeBar": False})
 
-# =================== LEGACY (no tiles) ===================
-with tab_legacy:
-    st.subheader("Legacy Map (no basemap tiles; robust & flicker-free)")
-    # Simple no-tiles view with same layers (minus TileLayer)
-    view_state = pdk.ViewState(latitude=60.7, longitude=17.5, zoom=6.2, pitch=0)
-    step = max(1, SECS//300)
-    path_coords = [[route_df.loc[i,"lon"], route_df.loc[i,"lat"]] for i in range(0, SECS, step)]
-    route_layer = pdk.Layer("PathLayer", data=[{"path": path_coords}],
-                            get_color=[0,102,255,255], width_scale=4, width_min_pixels=2)
-    bs_df = pd.DataFrame(BASE_STATIONS, columns=["name","lat","lon","r_m"])
-    bs_layer = pdk.Layer("ScatterplotLayer", data=bs_df, get_position="[lon, lat]",
-                         get_radius="r_m", get_fill_color="[0,150,0,40]",
-                         stroked=True, get_line_color=[0,150,0], line_width_min_pixels=1)
-    sens_plot = sensors_df.copy(); sens_plot["r_m"] = 1200
-    sens_layer = pdk.Layer("ScatterplotLayer", data=sens_plot, get_position='[lon, lat]',
-                           get_radius="r_m", get_fill_color=[255,140,0,120],
-                           stroked=True, get_line_color=[180,90,0], line_width_min_pixels=1)
-    # Trains (same as Map tab)
-    qcol = {"GOOD":[0,170,0], "PATCHY":[255,165,0], "POOR":[200,0,0]}
-    t_a = st.session_state.t_idx; t_b = (SECS-1 - st.session_state.t_idx)
-    trains_now = pd.DataFrame([
-        {"lat": route_df.loc[t_a,"lat"], "lon": route_df.loc[t_a,"lon"], "quality": res_map["quality"][t_a]},
-        {"lat": route_df.loc[t_b,"lat"], "lon": route_df.loc[t_b,"lon"], "quality": res_map["quality"][t_b]},
-    ])
-    trains_now["icon_data"] = [{"url":"https://img.icons8.com/emoji/48/train-emoji.png","width":128,"height":128,"anchorY":128} for _ in range(len(trains_now))]
-    trains_now["halo_color"] = [qcol[q] for q in trains_now["quality"]]
-    train_icon_layer = pdk.Layer("IconLayer", data=trains_now, get_position='[lon, lat]', get_icon='icon_data', get_size=4, size_scale=15)
-    halo_layer = pdk.Layer("ScatterplotLayer", data=trains_now, get_position='[lon, lat]', get_fill_color='halo_color',
-                           get_radius=5000, stroked=True, get_line_color=[0,0,0], line_width_min_pixels=1)
-
-    deck = pdk.Deck(layers=[route_layer, bs_layer, sens_layer, halo_layer, train_icon_layer],
-                    initial_view_state=view_state, map_provider=None, map_style=None)
-    st.pydeck_chart(deck, use_container_width=True)
-    st.caption("Use this if tiles flicker or are blocked. All objects render on a blank canvas.")
+# =================== Footnote ===================
+st.caption(
+    "Added: handover outage window (gray train dot), Dual Connectivity for Lane-A (duplicate over secondary bearer), and TSR polygons when high-confidence alerts fire. "
+    "Hybrid model remains: PHY (FSPL+shadowing+Rayleigh/Rician) → SNR→PER; Macro capacity (GOOD/PATCHY/POOR) gates throughput with random loss & queueing under overload."
+)
