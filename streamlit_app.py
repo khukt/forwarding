@@ -1,7 +1,8 @@
-# ENSURE-6G • Optimized TMS Rail Demo — Real vs TMS + UX Polish
+# ENSURE-6G • Optimized TMS Rail Demo — Real vs TMS + UX Polish First demo
 # - Performance: cache static pydeck layers; vectorized track heat; clean sensor DF each frame
 # - UX: headers, presets, play rate, skip buttons, legend, alerts feed, color-blind palette
 # - Features preserved: RAW/SEMANTIC/HYBRID, Lane-A/B, DC, TTT/HO, TSR/STOP/CRASH, maintenance, Sankey, timelines
+
 
 import math, numpy as np, pandas as pd, streamlit as st, pydeck as pdk
 from shapely.geometry import LineString, Point
