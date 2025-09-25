@@ -1,11 +1,12 @@
 # ENSURE-6G • TMS Rail Demo — Real vs TMS Views + Affected Sensors + Coverage Rings
+# - Clean per-frame sensors DF (no duplicate columns)
+# - Scalar-safe modality selection (no Series→float errors)
+# - Reset Simulation State button
 # - Two synchronized maps (Real World vs TMS View)
 # - BS coverage rings: GOOD / PATCHY / POOR (no "no coverage")
 # - Affected-sensors table with route segment
-# - Vectorized hotspot distance (no pandas .apply TypeError)
-# - Sensors visible + RAW/HYBRID/SEMANTIC
-# - TSR/STOP/CRASH + maintenance work orders
 # - PHY/channel model (SNR→PER), bearer selection (TTT), HO gap, Dual Connectivity
+# - TSR/STOP/CRASH + maintenance work orders
 # - Auto speed ≤200 km/h, TSR-aware
 
 import math
@@ -144,6 +145,19 @@ with st.sidebar:
     demo_force_issues = st.checkbox("Inject visible issues (summer hotspots)", True)
     summer_severity = st.slider("Summer severity (°C boost)", 0.0, 20.0, 12.0, 1.0)
     always_show_tsr = st.checkbox("Always show TSR polygons for injected issues", True)
+    st.markdown("---")
+    if st.button("🔄 Reset simulation state", use_container_width=True):
+        for k in ["_frame","sensor_hist","arr","_times","qual","seg",
+                  "tsr_polys_real","tsr_polys_tms","work_orders"]:
+            st.session_state.pop(k, None)
+        st.session_state.t_idx = 0
+        st.session_state.train_s_m = 0.0
+        st.session_state.train_v_ms = 0.0
+        st.session_state.bearer = "5G"
+        st.session_state.bearer_prev = "5G"
+        st.session_state.bearer_ttt = 0
+        st.session_state.handover_gap_until = -1
+        st.success("Simulation state cleared. Press ▶ Simulate.")
 
 # -------------------- Session init --------------------
 SECS = max(2, int(sim_minutes_total*60))
@@ -288,7 +302,9 @@ with tab_map:
         seg = seg_labels[idx_s]; s_along=float(route_df.s_m.iloc[idx_s])
 
         frame = st.session_state._frame
-        sensors = frame["sensors"].copy()
+
+        # --- CLEAN per-frame sensors base (sid, lat, lon) ---
+        sensors_base = frame["sensors"][["sid","lat","lon"]].copy()
 
         # PHY at train
         bsA, dA = serving_bs(*trainA)
@@ -326,7 +342,7 @@ with tab_map:
         cap_bps_train, rand_loss = cap_loss(quality, t)
         in_gap = (t < st.session_state.handover_gap_until)
 
-        # Sensors → risk & uplink QoS
+        # Sensors → risk & uplink QoS (compute on CLEAN base)
         def sensor_row(r):
             base = 24 + 10*math.sin(2*math.pi*((t/60)%1440)/1440)
             hotspot_boost = 0.0; nearest_hot=None
@@ -343,32 +359,27 @@ with tab_map:
             ballast = max(0.0, np.random.normal(0.3, 0.1) + 0.015 * hotspot_boost)
             score = min(1.0, 0.01 * (temp - 30) ** 2 + 0.04 * max(0, strain - 8) + 0.2 * (hotspot_boost > 6))
             label = "high" if score > 0.75 else ("medium" if score > 0.4 else "low")
-            exceeded=[]; 
+            exceeded=[]
             if temp>=38: exceeded.append("temp>38")
             if strain>=10: exceeded.append("strain>10")
             _,_,qualS = nearest_bs_quality(r.lat, r.lon)
             capS, lossS = cap_loss(qualS, t)
-            return dict(lat=r.lat, lon=r.lon, score=score, label=label, exceeded=exceeded,
+            return dict(score=score, label=label, exceeded=exceeded,
                         temp=round(temp,1), strain=round(strain,1), ballast=round(ballast,2),
                         qualS=qualS, capS=capS, lossS=lossS, hotspot=(nearest_hot or ""))
 
-        S = sensors.apply(sensor_row, axis=1, result_type="expand")
-        S = S.drop(columns=["lat","lon"], errors="ignore")   # avoid duplicate names
-        sensors = pd.concat([sensors, S], axis=1)
+        S = sensors_base.apply(sensor_row, axis=1, result_type="expand")
+        sensors = pd.concat([sensors_base, S], axis=1)  # composed per-frame DF
 
-        # (Optional) quick sanity check for duplicate columns
-        # dups = sensors.columns[sensors.columns.duplicated()]
-        # assert len(dups)==0, f"Duplicate columns: {list(dups)}"
-
-        # Segment tags for sensors
+        # Segment tags (on this clean per-frame DF)
         seg_list=[]; seg_idx=[]
         for r in sensors.itertuples():
             sname, idxp = segment_of_point(r.lat, r.lon, route_df, seg_labels)
             seg_list.append(sname); seg_idx.append(idxp)
-        sensors["segment"] = seg_list
-        sensors["_seg_idx"]= seg_idx
+        sensors["segment"]  = seg_list
+        sensors["_seg_idx"] = seg_idx
 
-        # --- Modality decision (SAFE: scalarize to avoid ambiguous truth values) ---
+        # --- Modality decision (scalarized; no ambiguous truth values) ---
         def choose_modality(r):
             qual  = str(r["qualS"])
             cap   = float(r["capS"])
@@ -380,6 +391,7 @@ with tab_map:
             return "HYBRID"
         sensors["modality"] = sensors.apply(choose_modality, axis=1)
 
+        # Uplink load estimates
         RAW_HZ = {"RAW":2.0, "HYBRID":0.2, "SEMANTIC":0.0}
         BYTES_RAW = 24; BYTES_ALERT = 280; BYTES_SUMMARY = 180
         sensors["raw_hz"]  = sensors["modality"].map(RAW_HZ)
