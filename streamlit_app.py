@@ -1,7 +1,7 @@
-# ENSURE-6G • TMS Rail Demo — Full (Vectorized Hotspots + Issues + Modality + Kinematics)
-# - Vectorized hotspot distance (fixes TypeError from pandas apply)
+# ENSURE-6G • TMS Rail Demo — Full (Vectorized Hotspots + No Duplicate Coords)
+# - Vectorized hotspot distance (no pandas .apply TypeError)
 # - Sensors visible (size, outline, labels)
-# - Adaptive uplink: RAW/HYBRID/SEMANTIC per sensor
+# - Adaptive uplink: RAW / HYBRID / SEMANTIC per sensor
 # - Demo hotspots + forced TSR so issues always show
 # - Issue markers (⚠️), TSR/STOP/CRASH
 # - PHY (SNR→PER), bearer selection (TTT), HO gap, Dual Connectivity
@@ -278,7 +278,7 @@ with tab_map:
     # ---------------- Layout columns ----------------
     colR, colL = st.columns([1.0,2.3])
 
-    # ---------- Right: Playback, KPIs, Timeline, Sensor Inspector ----------
+    # ---------- Right: Playback, KPIs, Timeline ----------
     with colR:
         st.subheader("Playback")
         st.caption(f"t={st.session_state.t_idx}/{SECS-1} | playing={st.session_state.playing}")
@@ -376,7 +376,10 @@ with tab_map:
             return dict(lat=r.lat, lon=r.lon, score=score, label=label, exceeded=exceeded,
                         temp=round(temp,1), strain=round(strain,1), ballast=round(ballast,2),
                         qualS=qualS, capS=capS, lossS=lossS, hotspot=(nearest_hot or ""))
+
+        # ---------- Patch A: build S and drop duplicate coord columns ----------
         S = sensors.apply(sensor_row, axis=1, result_type="expand")
+        S = S.drop(columns=["lat", "lon"], errors="ignore")  # avoid duplicate columns
         sensors = pd.concat([sensors, S], axis=1)
 
         # ---------- Adaptive uplink modality per sensor ----------
@@ -456,7 +459,7 @@ with tab_map:
             st.session_state.work_orders.append(dict(polygon=p["polygon"], created_idx=t,
                                                      status="Dispatched", eta_done_idx=t+repair_time_s))
 
-        # --- Demo: force TSRs from hotspots even if alerts/downlink fail (vectorized) ---
+        # --- Patch B: force TSRs from hotspots (vectorized + explicit coord access) ---
         if demo_force_issues and always_show_tsr and len(sensors) > 0:
             latv = sensors["lat"].astype(float).values
             lonv = sensors["lon"].astype(float).values
@@ -465,10 +468,12 @@ with tab_map:
                 in_hot = dist_m <= float(h["radius_m"])
                 if np.any(in_hot):
                     s_hot = sensors.loc[in_hot].sort_values("score", ascending=False).iloc[0]
-                    poly = tsr_poly(float(s_hot.lat), float(s_hot.lon))
+                    lat_hot = float(s_hot["lat"])
+                    lon_hot = float(s_hot["lon"])
+                    poly = tsr_poly(lat_hot, lon_hot)
                     st.session_state.tsr_polys.append(dict(
                         polygon=poly, speed=tsr_speed_kmh, created_idx=t,
-                        critical=True, ack_train=True, stop=(s_hot.score > 0.92)
+                        critical=True, ack_train=True, stop=(float(s_hot["score"]) > 0.92)
                     ))
 
         # Downlink to Train (ack TSRs)
@@ -529,26 +534,6 @@ with tab_map:
             st.session_state.arr["lat_ms"][t]=lat_ms
             st.session_state.qual[t]=quality
             st.session_state.seg[t]=seg
-
-        # Per-sensor histories
-        if "sensor_hist" not in st.session_state: st.session_state.sensor_hist = {}
-        hist = st.session_state.sensor_hist
-        for r in sensors.itertuples():
-            sid = r.sid
-            if sid not in hist:
-                hist[sid] = {
-                    "temp":   np.full(SECS, np.nan),
-                    "strain": np.full(SECS, np.nan),
-                    "ballast":np.full(SECS, np.nan),
-                    "score":  np.full(SECS, np.nan),
-                    "qual":   np.array([""]*SECS, dtype=object),
-                }
-            if math.isnan(hist[sid]["temp"][t]):
-                hist[sid]["temp"][t]    = r.temp
-                hist[sid]["strain"][t]  = r.strain
-                hist[sid]["ballast"][t] = r.ballast
-                hist[sid]["score"][t]   = r.score
-                hist[sid]["qual"][t]    = r.qualS
 
         # KPIs
         badge={"GOOD":"🟢","PATCHY":"🟠","POOR":"🔴"}[quality]
